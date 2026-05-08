@@ -10,7 +10,8 @@ import logging
 import re
 from pathlib import Path
 
-from edu_agent.registry import registry, tool_result, tool_error
+from edu_agent.registry import registry, tool_error, tool_result
+from edu_agent.runtime_context import get_current_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -89,11 +90,9 @@ _SKILL_THREAT_PATTERNS = [
 # ---------------------------------------------------------------------------
 
 def _handle_list_skills(args: dict, **kw) -> str:
-    import os
-
     from edu_agent.skills_loader import load_skill_entries
 
-    skills_dir = os.environ.get("EDU_SKILLS_DIR", "skills")
+    skills_dir = get_current_runtime().paths.skills_dir
     entries = load_skill_entries(skills_dir)
     if not entries:
         return tool_result("暂无可用技能。")
@@ -109,15 +108,13 @@ def _handle_list_skills(args: dict, **kw) -> str:
 
 
 def _handle_view_skill(args: dict, **kw) -> str:
-    import os
-
     from edu_agent.skills_loader import load_skill_entries, read_skill_file
 
     name = args.get("name", "")
     if not name:
         return tool_error("缺少必要参数：name")
     file_path: str = args.get("file_path", "")
-    skills_dir = os.environ.get("EDU_SKILLS_DIR", "skills")
+    skills_dir = get_current_runtime().paths.skills_dir
     entries = {e.name: e for e in load_skill_entries(skills_dir)}
     if name not in entries:
         return tool_error(f"技能不存在: {name}")
@@ -134,8 +131,6 @@ def _handle_view_skill(args: dict, **kw) -> str:
 
 
 def _handle_manage_skill(args: dict, **kw) -> str:
-    import os
-
     from edu_agent.skills_loader import invalidate_cache
 
     action = args.get("action", "")
@@ -153,7 +148,7 @@ def _handle_manage_skill(args: dict, **kw) -> str:
                 f"内容包含不允许的代码模式（安全扫描失败）: {pat.pattern}"
             )
 
-    skills_dir = Path(os.environ.get("EDU_SKILLS_DIR", "skills"))
+    skills_dir = get_current_runtime().paths.skills_dir
     skill_dir = skills_dir / name
     if skill_dir.is_dir():
         target = skill_dir / "SKILL.md"

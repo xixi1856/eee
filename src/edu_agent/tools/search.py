@@ -11,7 +11,8 @@ import logging
 import urllib.parse
 from typing import Any
 
-from edu_agent.registry import registry, tool_result, tool_error
+from edu_agent.registry import registry, tool_error, tool_result
+from edu_agent.runtime_context import get_current_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -185,10 +186,8 @@ def _handle_web_search(args: dict, **kw) -> str:
 
     # Try Tavily first
     try:
-        import os
-
-        from rag_mvp.config import settings
-        tavily_key = settings.tavily_api_key or os.environ.get("TAVILY_API_KEY")
+        ctx = get_current_runtime()
+        tavily_key = (ctx.settings.tools.tavily_api_key or "").strip()
         if tavily_key:
             import httpx
             resp = httpx.post(
@@ -255,13 +254,12 @@ def _handle_web_fetch(args: dict, **kw) -> str:
 
 
 def _handle_ollama_web_search(args: dict, **kw) -> str:
-    import os
-
     query = args.get("query", "")
     if not query:
         return tool_error("缺少必要参数：query")
     max_results = max(1, min(int(args.get("max_results", 5)), 10))
-    api_key = os.environ.get("OLLAMA_API_KEY", "")
+    ctx = get_current_runtime()
+    api_key = (ctx.settings.tools.ollama_api_key or "").strip()
     if not api_key:
         return tool_error(
             "未设置 OLLAMA_API_KEY 环境变量，"
@@ -310,10 +308,11 @@ def _handle_wikipedia_search(args: dict, **kw) -> str:
     max_chars: int = int(args.get("max_chars", 500))
 
     import wikipediaapi
-    from rag_mvp.config import settings
+
+    ctx = get_current_runtime()
 
     def _build_wiki(language: str) -> Any:
-        proxy = settings.http_proxy or None
+        proxy = (ctx.settings.tools.http_proxy or "").strip() or None
         kwargs: dict[str, Any] = {
             "user_agent": "EduAgent/1.0",
             "language": language,

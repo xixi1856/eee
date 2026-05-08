@@ -16,6 +16,7 @@ import time
 import click
 
 from edu_agent.agent import EduAgent
+from edu_agent.config_loader import load_settings
 from edu_agent.types import AgentCallbacks, AgentConfig
 
 logger = logging.getLogger(__name__)
@@ -254,11 +255,9 @@ def cli(debug: bool) -> None:
 )
 def chat(user: str, skills: str, max_iter: int, progress: str, enable_cron: bool) -> None:
     """Start an interactive chat session with the educational agent."""
-    import os
-    os.environ["EDU_SKILLS_DIR"] = skills  # expose to tool handlers
-
+    settings = load_settings()
     config = AgentConfig(user_id=user, skills_dir=skills, max_iterations=max_iter)
-    agent = EduAgent(config)
+    agent = EduAgent(config, settings=settings)
     mode_state: list[str] = [progress]
 
     if enable_cron:

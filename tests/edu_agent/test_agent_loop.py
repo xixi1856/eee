@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from edu_agent.agent import EduAgent
+from edu_agent.config import EduSettings
 from edu_agent.types import AgentConfig, ToolResult
 
 
@@ -52,22 +53,20 @@ def _make_tool_call(call_id: str, name: str, arguments: str):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture()
-def agent(tmp_path):
+def agent(tmp_path, minimal_edu_settings: EduSettings):
     """EduAgent with minimal config pointing to empty tmp dirs."""
-    skills_dir = tmp_path / "skills"
+    skills_dir = tmp_path / "extra_skills"
     skills_dir.mkdir()
     config = AgentConfig(
         user_id="test_user",
+        workspace=str(minimal_edu_settings.agent.workspace),
         skills_dir=str(skills_dir),
-        profile_storage_dir=str(tmp_path / "profiles"),
-        session_storage_dir=str(tmp_path / "sessions"),
     )
 
-    # Patch settings so no real API key is needed during construction
-    with patch("edu_agent.agent.OpenAI") as mock_openai_cls:
+    with patch("edu_agent.providers.runtime.OpenAI") as mock_openai_cls:
         mock_client = MagicMock()
         mock_openai_cls.return_value = mock_client
-        a = EduAgent(config)
+        a = EduAgent(config, settings=minimal_edu_settings)
         a._client = mock_client  # make it accessible in tests
     return a
 
@@ -75,6 +74,18 @@ def agent(tmp_path):
 # ---------------------------------------------------------------------------
 # Single-turn tests (no tool calls)
 # ---------------------------------------------------------------------------
+
+class TestRuntimeContextLifecycle:
+    def test_runtime_context_cleared_after_run_turn(self, agent):
+        from edu_agent.runtime_context import get_current_runtime
+
+        agent._client.chat.completions.create.return_value = _make_response(
+            [_make_choice(content="done", finish_reason="stop")]
+        )
+        agent.run_turn("hello")
+        with pytest.raises(RuntimeError, match="No active"):
+            get_current_runtime()
+
 
 class TestRunTurnNoTools:
     def test_returns_assistant_reply(self, agent):
@@ -296,7 +307,7 @@ class TestSafetyIntegration:
         assert "无法提供" in reply or "抱歉" in reply
         assert reply != "危险内容"
 
-    def test_blocked_input_still_persisted_to_session(self, agent, tmp_path):
+    def test_blocked_input_still_persisted_to_session(self, agent):
         """Even blocked turns should be written to the session transcript."""
         with patch("edu_agent.agent.check_input") as mock_check:
             from edu_agent.safety import SafetyCheckResult
@@ -305,7 +316,7 @@ class TestSafetyIntegration:
             )
             agent.run_turn("违规内容")
 
-        sessions_dir = tmp_path / "sessions"
+        sessions_dir = agent._paths.sessions_dir
         jsonl_files = list(sessions_dir.glob("*.jsonl"))
         assert len(jsonl_files) == 1
         lines = jsonl_files[0].read_text(encoding="utf-8").splitlines()
@@ -317,27 +328,27 @@ class TestSafetyIntegration:
 # ---------------------------------------------------------------------------
 
 class TestSessionPersistence:
-    def test_turn_written_to_jsonl(self, agent, tmp_path):
+    def test_turn_written_to_jsonl(self, agent):
         """Each run_turn call must append 2 lines (user+assistant) to JSONL."""
         agent._client.chat.completions.create.return_value = _make_response(
             [_make_choice(content="回复")]
         )
         agent.run_turn("问题")
 
-        sessions_dir = tmp_path / "sessions"
+        sessions_dir = agent._paths.sessions_dir
         jsonl_files = list(sessions_dir.glob("*.jsonl"))
         assert len(jsonl_files) == 1
         lines = jsonl_files[0].read_text(encoding="utf-8").splitlines()
         assert len(lines) == 2
 
-    def test_multiple_turns_append(self, agent, tmp_path):
+    def test_multiple_turns_append(self, agent):
         agent._client.chat.completions.create.return_value = _make_response(
             [_make_choice(content="ok")]
         )
         agent.run_turn("turn 1")
         agent.run_turn("turn 2")
 
-        sessions_dir = tmp_path / "sessions"
+        sessions_dir = agent._paths.sessions_dir
         lines = list(sessions_dir.glob("*.jsonl"))[0].read_text(encoding="utf-8").splitlines()
         assert len(lines) == 4  # 2 turns × 2 roles
 

@@ -32,7 +32,6 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_STORAGE = Path("learner_profiles")
 _ISO_FMT = "%Y-%m-%dT%H:%M:%S"
 
 
@@ -53,7 +52,7 @@ import re  # noqa: E402 – placed after _profile_path to keep the docstring cle
 # Public API
 # ---------------------------------------------------------------------------
 
-def load_profile(user_id: str, storage_dir: str | Path = _DEFAULT_STORAGE) -> dict[str, Any]:
+def load_profile(user_id: str, *, storage_dir: str | Path) -> dict[str, Any]:
     """Load a learner profile from disk.
 
     Returns a fresh default profile dict if the file does not exist yet.
@@ -79,7 +78,8 @@ def load_profile(user_id: str, storage_dir: str | Path = _DEFAULT_STORAGE) -> di
 
 def save_profile(
     profile: dict[str, Any],
-    storage_dir: str | Path = _DEFAULT_STORAGE,
+    *,
+    storage_dir: str | Path,
 ) -> None:
     """Persist a learner profile to disk (atomic write via temp file).
 

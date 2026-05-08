@@ -1,0 +1,29 @@
+# Copy to repo root as `edu_agent.yaml` (or pass a path via load_settings in custom entrypoints).
+# Values can use ${ENV_VAR} placeholders; see config_loader.resolve_env_vars.
+
+agent:
+  workspace: .
+  provider: dashscope
+  model: qwen-plus-2025-04-28
+  temperature: 0.1
+  max_tokens: 4096
+  max_iterations: 20
+  skills_dir: skills
+
+providers:
+  dashscope:
+    api_key: ${LLM_API_KEY}
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  # ollama:
+  #   api_key: ollama
+  #   base_url: http://127.0.0.1:11434/v1
+
+tools:
+  tavily_api_key: ""
+  http_proxy: ""
+  ollama_api_key: ""
+
+runtime:
+  log_level: INFO
+  default_timezone: UTC
+  env: dev

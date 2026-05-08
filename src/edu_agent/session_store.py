@@ -17,7 +17,8 @@ Design choices
 * Append-only (no in-place edits) → crash-safe, easy to inspect.
 * One JSONL file per session → simple; readers can ``grep`` or stream.
 * Sessions are identified by ``session_id`` (12-char hex from ``EduAgent``).
-* Storage directory defaults to ``session_logs/``.
+* Callers must pass ``storage_dir`` (typically ``EduPaths.sessions_dir``); there is no
+  package-level default path to avoid silent writes outside the configured workspace.
 """
 
 from __future__ import annotations
@@ -42,7 +43,6 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_STORAGE = Path("session_logs")
 _ISO_FMT = "%Y-%m-%dT%H:%M:%S"
 
 
@@ -63,7 +63,8 @@ def append_turn(
     user_id: str,
     role: str,
     content: str,
-    storage_dir: str | Path = _DEFAULT_STORAGE,
+    *,
+    storage_dir: str | Path,
 ) -> None:
     """Append one turn to the session's JSONL transcript.
 
@@ -97,7 +98,8 @@ def append_turn(
 
 def load_session(
     session_id: str,
-    storage_dir: str | Path = _DEFAULT_STORAGE,
+    *,
+    storage_dir: str | Path,
 ) -> list[dict[str, Any]]:
     """Load all turns from a session JSONL file.
 
@@ -132,7 +134,8 @@ def append_message(
     session_id: str,
     user_id: str,
     message: dict[str, Any],
-    storage_dir: str | Path = _DEFAULT_STORAGE,
+    *,
+    storage_dir: str | Path,
 ) -> None:
     """Append one OpenAI-compatible message to the session's JSONL transcript.
 
@@ -174,7 +177,7 @@ def append_message(
         raise
 
 
-def list_sessions(storage_dir: str | Path = _DEFAULT_STORAGE) -> list[str]:
+def list_sessions(*, storage_dir: str | Path) -> list[str]:
     """Return sorted session IDs found in *storage_dir*.
 
     Args:

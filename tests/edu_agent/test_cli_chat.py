@@ -8,6 +8,47 @@ import pytest
 from click.testing import CliRunner
 
 from edu_agent.cli import cli
+from edu_agent.config import (
+    AgentDefaults,
+    EduSettings,
+    ProviderCredentials,
+    ProvidersSettings,
+    RuntimeSettings,
+    ToolsSettings,
+)
+
+
+def _cli_test_settings():
+    """Minimal settings so chat() can construct a real EduAgent when not patched."""
+    from pathlib import Path
+    import tempfile
+
+    root = Path(tempfile.mkdtemp())
+    (root / "skills").mkdir()
+    return EduSettings(
+        agent=AgentDefaults(
+            workspace=root,
+            model="m",
+            provider="dashscope",
+            skills_dir="skills",
+        ),
+        providers=ProvidersSettings(
+            entries={
+                "dashscope": ProviderCredentials(
+                    api_key="k",
+                    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                ),
+            },
+        ),
+        tools=ToolsSettings(),
+        runtime=RuntimeSettings(),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _patch_cli_load_settings():
+    with patch("edu_agent.cli.load_settings", return_value=_cli_test_settings()):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -80,10 +121,9 @@ class TestChatCommand:
         with patch("edu_agent.cli.EduAgent") as MockAgent:
             MockAgent.return_value = _make_agent_mock([])
             runner.invoke(cli, ["chat", "--user", "alice"], input="/quit\n")
-        _, kwargs = MockAgent.call_args
-        # EduAgent is called with a positional AgentConfig argument
         config_arg = MockAgent.call_args[0][0]
         assert config_arg.user_id == "alice"
+        assert MockAgent.call_args.kwargs.get("settings") is not None
 
     def test_session_id_displayed_on_start(self):
         runner = CliRunner()

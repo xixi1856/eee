@@ -59,22 +59,19 @@ class AgentCallbacks:
 
 @dataclass
 class AgentConfig:
-    """Runtime configuration passed to EduAgent."""
+    """Session-scoped overrides for EduAgent (not global settings).
 
-    # LLM model name; falls back to Settings.llm_model when empty.
-    model: str = ""
-    # Hard cap on LLM+tool iterations per user turn.
-    max_iterations: int = 20
-    # Identifier for the current user (used for session/profile storage).
+    Paths are derived from ``EduSettings`` + ``EduPaths``; only optional overrides
+    live here. Empty string means “use root settings / paths default”.
+    """
+
     user_id: str = "default"
-    # Explicit session ID; auto-generated when empty.
     session_id: str = ""
-    # Path to the skills directory (relative to CWD or absolute).
-    skills_dir: str = "skills"
-    # Directory for learner profile JSON files.
-    profile_storage_dir: str = "learner_profiles"
-    # Directory for session JSONL transcript files.
-    session_storage_dir: str = "session_logs"
+    model: str = ""
+    provider: str = ""
+    workspace: str = ""
+    skills_dir: str = ""
+    max_iterations: int = 20
 
 
 @dataclass

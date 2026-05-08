@@ -106,20 +106,22 @@ def _call_llm(prompt: str, system: str = "") -> str:
     Module-level so tests can patch via
     ``patch("edu_agent.tools.eval._call_llm", ...)``.
     """
-    from openai import OpenAI  # local import keeps startup fast
-    from rag_mvp.config import settings
+    from edu_agent.providers.runtime import build_openai_client, resolve_provider_runtime
+    from edu_agent.runtime_context import get_current_runtime
 
-    client = OpenAI(api_key=settings.llm_api_key, base_url=settings.llm_base_url)
+    ctx = get_current_runtime()
+    rt = resolve_provider_runtime(ctx.settings, None, "auxiliary")
+    client = build_openai_client(rt)
     messages: list[dict] = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
     resp = client.chat.completions.create(
-        model=settings.llm_model,
+        model=rt.model,
         messages=messages,  # type: ignore[arg-type]
-        temperature=settings.llm_temperature,
-        max_tokens=settings.llm_max_tokens,
+        temperature=rt.temperature,
+        max_tokens=rt.max_tokens,
     )
     return resp.choices[0].message.content or ""
 

@@ -103,15 +103,37 @@ uv run rag query "第一章讲了什么？" --mode naive
 
 ---
 
+## EduAgent（教学助手）
+
+EduAgent 使用独立配置，**不再**从 `rag_mvp.config` 读取 LLM 或工具密钥。入口（`edu chat`、定时任务等）通过 `edu_agent.config_loader.load_settings()` 装载配置。
+
+### 配置文件
+
+- 默认在**当前工作目录**查找 `edu_agent.yaml`；不存在时仍会从 `.env` 合并 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL` 等兼容字段。
+- 可将仓库中的 [`edu_agent.yaml.example`](edu_agent.yaml.example) 复制为 `edu_agent.yaml` 并按需修改 `agent.provider`（如 `dashscope`、`ollama`、`deepseek`、`openai`）及 `providers` 下对应条目的 `api_key` / `base_url`。
+
+### 启动对话
+
+```powershell
+uv sync
+uv run edu chat
+```
+
+常用选项：`--user`、`--skills`（技能目录）、`--max-iter`。用户数据路径（会话、画像、缓存等）由 `agent.workspace` 与 [`EduPaths`](src/edu_agent/paths.py) 推导，勿在业务代码中硬编码 `session_logs` 等目录名。
+
+---
+
 ## 目录结构
 
 ```
 .
 ├── src/rag_mvp/
-│   ├── config.py      # 配置（pydantic-settings，读取 .env）
+│   ├── config.py      # RAG Worker 配置（pydantic-settings，读取 .env）
 │   ├── llm.py         # Qwen LLM / Vision LLM / Embedding 函数
 │   ├── engine.py      # RAGAnything 初始化与 ingest/query 封装
 │   └── cli.py         # Click CLI 入口
+├── src/edu_agent/     # 教学 Agent（独立 edu_agent.yaml + providers 注册表）
+├── edu_agent.yaml.example  # EduAgent 配置模板
 ├── data/input/        # 放待处理文档（不提交到 git）
 ├── output/parsed/     # MinerU 解析输出（Markdown + JSON）
 ├── rag_storage/       # LightRAG 向量 + 知识图谱存储

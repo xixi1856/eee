@@ -18,9 +18,18 @@ from typing import Any, cast
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessage, ChatCompletionMessageToolCall
 
+from edu_agent.config import EduSettings
+from edu_agent.paths import build_paths
+from edu_agent.providers.runtime import build_openai_client, resolve_provider_runtime
 from edu_agent.registry import registry as _registry
+from edu_agent.runtime_context import (
+    TurnRuntimeContext,
+    get_current_runtime,
+    reset_current_runtime,
+    set_current_runtime,
+)
 from edu_agent.tools import TOOL_SCHEMAS
-from edu_agent.types import SubAgentConfig, SubTaskResult
+from edu_agent.types import AgentConfig, SubAgentConfig, SubTaskResult
 
 logger = logging.getLogger(__name__)
 
@@ -66,28 +75,33 @@ class SubAgent:
     parallel execution.
     """
 
-    def __init__(self, model: str = "", client: OpenAI | None = None) -> None:
+    def __init__(
+        self,
+        model: str = "",
+        client: OpenAI | None = None,
+        settings: EduSettings | None = None,
+    ) -> None:
         """Create a SubAgent.
 
         Args:
-            model:  LLM model identifier; falls back to settings when empty.
-            client: Pre-built OpenAI client (used by tests to inject mocks).
+            model: Default LLM model when ``SubAgentConfig.model`` is empty.
+            client: Pre-built OpenAI client (tests inject mocks).
+            settings: Root settings; when omitted, ``run()`` reads from
+                ``get_current_runtime()`` (e.g. inside ``delegate_task``).
         """
+        self._settings = settings
+        self._default_model = model
+        self._injected_client = client
         if client is not None:
             self._client = client
             self._model = model or "mock-model"
             self._temperature = 0.7
             self._max_tokens = 2048
         else:
-            from rag_mvp.config import settings
-
-            self._client = OpenAI(
-                api_key=settings.llm_api_key,
-                base_url=settings.llm_base_url,
-            )
-            self._model = model or settings.llm_model
-            self._temperature = settings.llm_temperature
-            self._max_tokens = settings.llm_max_tokens
+            self._client = None  # resolved in ``run()`` from settings + registry
+            self._model = ""
+            self._temperature = 0.7
+            self._max_tokens = 2048
 
     # ------------------------------------------------------------------
     # Public API
@@ -120,10 +134,66 @@ class SubAgent:
             )
         try:
             _subagent_active.active = True
-            return self._run_isolated(config)
+            return self._run_with_runtime(config)
         finally:
             _subagent_active.active = False
             _semaphore.release()
+
+    def _run_with_runtime(self, config: SubAgentConfig) -> SubTaskResult:
+        settings = self._settings
+        if settings is None:
+            try:
+                settings = get_current_runtime().settings
+            except RuntimeError:
+                settings = None
+
+        model_hint = (config.model or self._default_model or "").strip()
+        overrides = AgentConfig(model=model_hint) if model_hint else None
+
+        rt = resolve_provider_runtime(settings, overrides, "subagent") if settings is not None else None
+
+        if self._injected_client is None:
+            if settings is None or rt is None:
+                return SubTaskResult(
+                    success=False,
+                    summary="",
+                    error=(
+                        "SubAgent 缺少 EduSettings：请在入口传入 settings，"
+                        "或仅在已激活主 Agent runtime 的上下文内运行。"
+                    ),
+                    iterations=0,
+                )
+            self._client = build_openai_client(rt)
+            self._model = rt.model
+            self._temperature = rt.temperature
+            self._max_tokens = rt.max_tokens
+
+        if settings is not None and rt is not None:
+            # Prefer parent turn paths so session-level workspace/skills_dir overrides
+            # (AgentConfig → EduAgent._paths) are visible to SubAgent tools; otherwise
+            # build_paths(settings) would drop those overrides and diverge from the main agent.
+            try:
+                parent = get_current_runtime()
+                paths = parent.paths
+                uid, sid = parent.user_id, f"{parent.session_id}:sub"
+            except RuntimeError:
+                paths = build_paths(settings)
+                uid, sid = "subagent", "isolated"
+            sub_tok = set_current_runtime(
+                TurnRuntimeContext(
+                    settings=settings,
+                    paths=paths,
+                    provider_runtime=rt,
+                    user_id=uid,
+                    session_id=sid,
+                )
+            )
+            try:
+                return self._run_isolated(config)
+            finally:
+                reset_current_runtime(sub_tok)
+
+        return self._run_isolated(config)
 
     # ------------------------------------------------------------------
     # Internal helpers

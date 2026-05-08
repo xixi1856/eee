@@ -230,13 +230,14 @@ def _run_job(job: CronJob) -> str:
 
     try:
         from edu_agent.agent import EduAgent
+        from edu_agent.config_loader import load_settings
         from edu_agent.types import AgentConfig
 
         cfg = AgentConfig(
             session_id=f"cron_{job.id}_{int(time.time())}",
             max_iterations=15,
         )
-        agent = EduAgent(config=cfg)
+        agent = EduAgent(config=cfg, settings=load_settings())
         reply = agent.run_turn(job.prompt)
 
         # Save output

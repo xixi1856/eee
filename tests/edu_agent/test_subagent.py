@@ -250,8 +250,78 @@ class TestToolWhitelist:
 # ---------------------------------------------------------------------------
 
 
+class TestSubAgentRuntimeContext:
+    def test_subagent_sets_turn_runtime_with_parent_session_suffix(
+        self, minimal_edu_settings, with_turn_runtime, mocker
+    ):
+        """SubAgent.run must push its own ContextVar so tools see sub purpose paths."""
+        from edu_agent.runtime_context import set_current_runtime as set_turn_rt
+        from edu_agent.subagent import SubAgent
+
+        spy = mocker.patch("edu_agent.subagent.set_current_runtime", wraps=set_turn_rt)
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = _make_response(
+            [_make_choice(content="done", finish_reason="stop")]
+        )
+        agent = SubAgent(client=mock_client, settings=minimal_edu_settings)
+        agent.run(SubAgentConfig(task="t"))
+        spy.assert_called_once()
+        ctx = spy.call_args[0][0]
+        assert ctx.session_id.endswith(":sub")
+
+    def test_subagent_inherits_parent_paths_not_settings_defaults(
+        self, minimal_edu_settings, mocker
+    ):
+        """When nested under a turn, SubAgent must reuse parent.paths (session overrides)."""
+        from edu_agent.paths import build_paths
+        from edu_agent.providers.runtime import resolve_provider_runtime
+        from edu_agent.runtime_context import (
+            TurnRuntimeContext,
+            reset_current_runtime,
+            set_current_runtime,
+        )
+        from edu_agent.subagent import SubAgent
+
+        root = minimal_edu_settings.agent.workspace
+        override = root / "session_override"
+        override.mkdir(parents=True, exist_ok=True)
+        skills = override / "cli_skills"
+        skills.mkdir()
+        parent_paths = build_paths(
+            minimal_edu_settings,
+            workspace=str(override),
+            skills_dir=str(skills),
+        )
+        rt = resolve_provider_runtime(minimal_edu_settings, None, "main")
+        parent_ctx = TurnRuntimeContext(
+            settings=minimal_edu_settings,
+            paths=parent_paths,
+            provider_runtime=rt,
+            user_id="u",
+            session_id="parent",
+        )
+        tok = set_current_runtime(parent_ctx)
+        try:
+            wrong_paths = build_paths(minimal_edu_settings)
+            assert wrong_paths.skills_dir != parent_paths.skills_dir
+
+            spy = mocker.patch("edu_agent.subagent.set_current_runtime", wraps=set_current_runtime)
+            mock_client = MagicMock()
+            mock_client.chat.completions.create.return_value = _make_response(
+                [_make_choice(content="ok", finish_reason="stop")]
+            )
+            SubAgent(client=mock_client, settings=minimal_edu_settings).run(
+                SubAgentConfig(task="t")
+            )
+            sub_ctx = spy.call_args[0][0]
+            assert sub_ctx.paths == parent_paths
+            assert sub_ctx.paths.skills_dir == parent_paths.skills_dir
+        finally:
+            reset_current_runtime(tok)
+
+
 class TestDelegateTaskTool:
-    def test_success_returns_tool_result(self):
+    def test_success_returns_tool_result(self, with_turn_runtime):
         with patch("edu_agent.subagent.SubAgent") as MockSA:
             MockSA.return_value.run.return_value = SubTaskResult(
                 success=True, summary="子任务摘要"
@@ -260,7 +330,7 @@ class TestDelegateTaskTool:
         assert result.success is True
         assert result.summary == "子任务摘要"
 
-    def test_failure_passes_through_error(self):
+    def test_failure_passes_through_error(self, with_turn_runtime):
         with patch("edu_agent.subagent.SubAgent") as MockSA:
             MockSA.return_value.run.return_value = SubTaskResult(
                 success=False, summary="", error="迭代预算超限"
@@ -269,7 +339,7 @@ class TestDelegateTaskTool:
         assert result.success is False
         assert "迭代预算超限" in result.error
 
-    def test_max_iterations_clamped(self):
+    def test_max_iterations_clamped(self, with_turn_runtime):
         """max_iterations=99 should be silently clamped to 10."""
         captured: dict = {}
 

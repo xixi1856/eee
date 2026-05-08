@@ -59,6 +59,7 @@ def _handle_delegate_task(args: dict, **kw) -> str:
     allowed_tools: list[str] = list(args.get("allowed_tools") or [])
     max_iterations = max(1, min(int(args.get("max_iterations", 5)), 10))
 
+    from edu_agent.runtime_context import get_current_runtime
     from edu_agent.subagent import SubAgent
     from edu_agent.types import SubAgentConfig
 
@@ -68,7 +69,7 @@ def _handle_delegate_task(args: dict, **kw) -> str:
         max_iterations=max_iterations,
     )
     try:
-        result = SubAgent().run(cfg)
+        result = SubAgent(settings=get_current_runtime().settings).run(cfg)
         if result.success:
             return tool_result(result.summary, payload=result.payload)
         return tool_error(result.error or "子 Agent 执行失败")

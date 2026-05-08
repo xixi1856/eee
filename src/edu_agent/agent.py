@@ -20,12 +20,16 @@ import uuid
 from pathlib import Path
 from typing import Any, cast
 
-from openai import OpenAI
+from openai.types.chat import ChatCompletionMessage
 
+from edu_agent.config import EduSettings
+from edu_agent.paths import build_paths
+from edu_agent.providers.runtime import build_openai_client, resolve_provider_runtime
 from edu_agent.registry import registry as _registry
 from edu_agent.learner_profile import load_profile, profile_summary
 from edu_agent.prompt_builder import build_system_prompt
 from edu_agent.registry import discover_builtin_tools
+from edu_agent.runtime_context import TurnRuntimeContext, reset_current_runtime, set_current_runtime
 from edu_agent.safety import check_input, check_output
 from edu_agent.session_store import append_message
 from edu_agent.skill_tool_registry import discover_and_register
@@ -47,32 +51,37 @@ class EduAgent:
     a fresh conversation without creating a new instance.
     """
 
-    def __init__(self, config: AgentConfig | None = None) -> None:
+    def __init__(self, config: AgentConfig | None = None, settings: EduSettings | None = None) -> None:
+        if settings is None:
+            raise ValueError(
+                "EduAgent requires `settings=...` from edu_agent.config_loader.load_settings() "
+                "at the application entrypoint."
+            )
         discover_builtin_tools()
+        self._settings = settings
         self.config = config or AgentConfig()
         if not self.config.session_id:
             self.config.session_id = uuid.uuid4().hex[:12]
 
         self.messages: list[dict] = []
 
-        # Lazy-import settings here to avoid circular imports and to allow
-        # tests to patch the settings object before the agent is constructed.
-        from rag_mvp.config import settings as _settings
-
-        self._client = OpenAI(
-            api_key=_settings.llm_api_key,
-            base_url=_settings.llm_base_url,
+        self._paths = build_paths(
+            settings,
+            workspace=self.config.workspace or None,
+            skills_dir=self.config.skills_dir or None,
         )
-        self._model = self.config.model or _settings.llm_model
-        self._temperature = _settings.llm_temperature
-        self._max_tokens = _settings.llm_max_tokens
-        self._skills_dir: str | Path = self.config.skills_dir
+        self._main_runtime = resolve_provider_runtime(settings, self.config, "main")
+        self._client = build_openai_client(self._main_runtime)
+        self._model = self._main_runtime.model
+        self._temperature = self._main_runtime.temperature
+        self._max_tokens = self._main_runtime.max_tokens
+        self._skills_dir: Path = self._paths.skills_dir
         self._skill_entries = load_skill_entries(self._skills_dir)
 
         # Load learner profile and cache its summary for prompt injection.
         self._profile = load_profile(
             self.config.user_id,
-            storage_dir=self.config.profile_storage_dir,
+            storage_dir=self._paths.profiles_dir,
         )
         self._profile_summary: str = profile_summary(self._profile)
 
@@ -100,6 +109,20 @@ class EduAgent:
         Returns:
             The agent's final text response for this turn.
         """
+        ctx = TurnRuntimeContext(
+            settings=self._settings,
+            paths=self._paths,
+            provider_runtime=self._main_runtime,
+            user_id=self.config.user_id,
+            session_id=self.config.session_id,
+        )
+        token = set_current_runtime(ctx)
+        try:
+            return self._run_turn_inner(user_input)
+        finally:
+            reset_current_runtime(token)
+
+    def _run_turn_inner(self, user_input: str) -> str:
         # --- Input safety gate ---
         input_check = check_input(user_input)
         if not input_check.safe:
@@ -292,7 +315,7 @@ class EduAgent:
                 session_id=self.config.session_id,
                 user_id=self.config.user_id,
                 message=message,
-                storage_dir=self.config.session_storage_dir,
+                storage_dir=self._paths.sessions_dir,
             )
         except OSError as exc:
             logger.error("Failed to persist message: %s", exc)

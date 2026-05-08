@@ -1,0 +1,21 @@
+# Environment
+.env
+.venv/
+__pycache__/
+*.py[cod]
+
+# uv
+.python-version
+
+# Storage (large auto-generated data)
+rag_storage/
+output
+logs.txt
+# Data (user documents, do not commit)
+data/input/
+docs/
+mindmap_storage/
+session_logs/
+# OS
+.DS_Store
+Thumbs.db

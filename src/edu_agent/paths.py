@@ -18,7 +18,7 @@ class EduPaths:
     """All user-data and artefact paths derived from workspace + overrides."""
 
     workspace: Path
-    sessions_dir: Path
+    sessions_db: Path
     profiles_dir: Path
     memory_dir: Path
     skills_dir: Path
@@ -45,7 +45,7 @@ def build_paths(
 
     return EduPaths(
         workspace=root,
-        sessions_dir=root / "session_logs",
+        sessions_db=root / "sessions.db",
         profiles_dir=root / "learner_profiles",
         memory_dir=root / "memory",
         skills_dir=skills,

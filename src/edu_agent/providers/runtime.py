@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 
 from edu_agent.config import EduSettings
 from edu_agent.providers.registry import get_provider_spec, resolve_provider_id
@@ -92,3 +92,13 @@ def build_openai_client(rt: ResolvedProviderRuntime) -> OpenAI:
     if rt.base_url:
         kwargs["base_url"] = rt.base_url
     return OpenAI(**kwargs)
+
+
+def build_async_openai_client(rt: ResolvedProviderRuntime) -> AsyncOpenAI:
+    """Async OpenAI-compatible client (A4 auxiliary / future streaming)."""
+    if rt.client_kind != "openai":
+        raise ValueError(f"Unsupported client_kind: {rt.client_kind}")
+    kwargs: dict = {"api_key": rt.api_key}
+    if rt.base_url:
+        kwargs["base_url"] = rt.base_url
+    return AsyncOpenAI(**kwargs)

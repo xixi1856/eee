@@ -6,10 +6,14 @@ Tools: knowledge_query, generate_quiz, ingest_document, build_mindmap
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
-from edu_agent.registry import registry, tool_result, tool_error
+from edu_agent.runtime_context import get_current_runtime
+from edu_agent.tool_payloads import tool_error, tool_result
+from edu_agent.toolsets.models import ToolPermission, ToolSpec
+from edu_agent.toolsets.registry import toolset_registry
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +44,15 @@ _SCHEMA_KNOWLEDGE_QUERY = {
                     "global（全局主题推断）、"
                     "naive（纯向量检索）"
                 ),
+            },
+            "sources": {
+                "type": "string",
+                "enum": ["personal", "course", "all"],
+                "description": "personal=个人RAG | course=课程RAG(B2桩) | all=合并",
+            },
+            "course_id": {
+                "type": "string",
+                "description": "课程 ID（sources 含 course 时建议填写；B2 前为占位结果）",
             },
         },
         "required": ["question"],
@@ -120,28 +133,75 @@ _SCHEMA_BUILD_MINDMAP = {
 # Handlers
 # ---------------------------------------------------------------------------
 
-def _handle_knowledge_query(args: dict, **kw) -> str:
+async def _handle_knowledge_query(args: dict) -> str:
     question = args.get("question")
     if not question:
         return tool_error("缺少必要参数：question")
     mode = args.get("mode", "hybrid")
-    try:
-        from rag_mvp.engine import query  # lazy import
+    sources = (args.get("sources") or "all").strip().lower()
+    if sources not in ("personal", "course", "all"):
+        sources = "all"
+    course_id = (args.get("course_id") or "").strip()
+    if not course_id:
+        try:
+            ctx = get_current_runtime()
+            if ctx.course_id:
+                course_id = str(ctx.course_id).strip()
+        except RuntimeError:
+            pass
+    if sources == "all" and not course_id:
+        sources = "personal"
 
-        answer = query(question=question, mode=mode, with_refs=False)
-        if not answer:
-            return tool_result("知识库中暂无相关信息。")
-        if isinstance(answer, dict):
-            text = answer.get("answer", str(answer))
-        else:
-            text = str(answer)
-        return tool_result(text, payload=answer)
-    except Exception as exc:
-        logger.error("knowledge_query failed: %s", exc)
-        return tool_error(str(exc))
+    results: list[dict[str, Any]] = []
+    personal_text = ""
+
+    if sources in ("personal", "all"):
+        try:
+            from rag_mvp.engine import query
+
+            answer = query(question=question, mode=mode, with_refs=False)
+            if answer:
+                if isinstance(answer, dict):
+                    personal_text = str(answer.get("answer", answer))
+                else:
+                    personal_text = str(answer)
+                results.append(
+                    {
+                        "origin": "personal",
+                        "chunk_id": "rag-mvp",
+                        "text": personal_text[:8000],
+                        "document_title": None,
+                        "relevance_score": 1.0,
+                    }
+                )
+        except Exception as exc:
+            logger.error("knowledge_query personal leg failed: %s", exc)
+            return tool_error(str(exc))
+
+    if sources in ("course", "all"):
+        if not course_id and sources == "course":
+            return tool_error("sources=course 时必须提供 course_id")
+        if course_id:
+            results.append(
+                {
+                    "origin": "course",
+                    "chunk_id": "stub-course-chunk",
+                    "text": "[课程 RAG 占位：PostgreSQL 接入前由 B2 实现]",
+                    "course_id": course_id,
+                    "document_title": None,
+                    "relevance_score": 0.0,
+                }
+            )
+
+    if not results:
+        return tool_result("知识库中暂无相关信息。")
+
+    summary = json.dumps(results, ensure_ascii=False, indent=2)
+    display = personal_text or results[0].get("text", summary)
+    return tool_result(display[:12000], payload=results)
 
 
-def _handle_generate_quiz(args: dict, **kw) -> str:
+async def _handle_generate_quiz(args: dict) -> str:
     count = max(1, min(int(args.get("count", 5)), 20))
     question_type = args.get("question_type", "mixed")
     try:
@@ -189,7 +249,7 @@ def _handle_generate_quiz(args: dict, **kw) -> str:
         return tool_error(str(exc))
 
 
-def _handle_ingest_document(args: dict, **kw) -> str:
+async def _handle_ingest_document(args: dict) -> str:
     path = args.get("path", "")
     if not path:
         return tool_error("缺少必要参数：path")
@@ -211,7 +271,7 @@ def _handle_ingest_document(args: dict, **kw) -> str:
         return tool_error(str(exc))
 
 
-def _handle_build_mindmap(args: dict, **kw) -> str:
+async def _handle_build_mindmap(args: dict) -> str:
     source = args.get("source", "")
     if not source:
         return tool_error("缺少必要参数：source")
@@ -236,34 +296,47 @@ def _handle_build_mindmap(args: dict, **kw) -> str:
 # Registration
 # ---------------------------------------------------------------------------
 
-registry.register(
-    name="knowledge_query",
-    schema=_SCHEMA_KNOWLEDGE_QUERY,
-    handler=_handle_knowledge_query,
-    toolset="rag",
-    emoji="🔍",
+toolset_registry.register(
+    ToolSpec(
+        name=_SCHEMA_KNOWLEDGE_QUERY["name"],
+        description=_SCHEMA_KNOWLEDGE_QUERY["description"],
+        input_schema=_SCHEMA_KNOWLEDGE_QUERY["parameters"],
+        handler=_handle_knowledge_query,
+        toolset="rag",
+        permissions=[ToolPermission.READ],
+        emoji="🔍",
+    )
 )
-
-registry.register(
-    name="generate_quiz",
-    schema=_SCHEMA_GENERATE_QUIZ,
-    handler=_handle_generate_quiz,
-    toolset="rag",
-    emoji="📝",
+toolset_registry.register(
+    ToolSpec(
+        name=_SCHEMA_GENERATE_QUIZ["name"],
+        description=_SCHEMA_GENERATE_QUIZ["description"],
+        input_schema=_SCHEMA_GENERATE_QUIZ["parameters"],
+        handler=_handle_generate_quiz,
+        toolset="rag",
+        permissions=[ToolPermission.READ],
+        emoji="📝",
+    )
 )
-
-registry.register(
-    name="ingest_document",
-    schema=_SCHEMA_INGEST_DOCUMENT,
-    handler=_handle_ingest_document,
-    toolset="rag",
-    emoji="📥",
+toolset_registry.register(
+    ToolSpec(
+        name=_SCHEMA_INGEST_DOCUMENT["name"],
+        description=_SCHEMA_INGEST_DOCUMENT["description"],
+        input_schema=_SCHEMA_INGEST_DOCUMENT["parameters"],
+        handler=_handle_ingest_document,
+        toolset="rag",
+        permissions=[ToolPermission.READ, ToolPermission.EXTERNAL],
+        emoji="📥",
+    )
 )
-
-registry.register(
-    name="build_mindmap",
-    schema=_SCHEMA_BUILD_MINDMAP,
-    handler=_handle_build_mindmap,
-    toolset="rag",
-    emoji="🗺️",
+toolset_registry.register(
+    ToolSpec(
+        name=_SCHEMA_BUILD_MINDMAP["name"],
+        description=_SCHEMA_BUILD_MINDMAP["description"],
+        input_schema=_SCHEMA_BUILD_MINDMAP["parameters"],
+        handler=_handle_build_mindmap,
+        toolset="rag",
+        permissions=[ToolPermission.READ, ToolPermission.EXTERNAL],
+        emoji="🗺️",
+    )
 )

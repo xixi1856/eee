@@ -30,6 +30,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from edu_agent.memory.models import LearnerProfile
+
 logger = logging.getLogger(__name__)
 
 _ISO_FMT = "%Y-%m-%dT%H:%M:%S"
@@ -52,18 +54,79 @@ import re  # noqa: E402 – placed after _profile_path to keep the docstring cle
 # Public API
 # ---------------------------------------------------------------------------
 
-def load_profile(user_id: str, *, storage_dir: str | Path) -> dict[str, Any]:
+def _learner_profile_to_dict(
+    lp: LearnerProfile,
+    *,
+    concepts_store: Any | None = None,
+) -> dict[str, Any]:
+    """Map MemoryStore LearnerProfile → legacy dict shape for ``profile_summary``."""
+    mastery_by_id: dict[str, float] = {}
+    if concepts_store is not None:
+        try:
+            for c in concepts_store.list_concepts(lp.user_id):
+                mastery_by_id[c.id] = float(c.mastery_level)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("list_concepts failed for profile summary: %s", exc)
+
+    topics: dict[str, Any] = {}
+    for tid in lp.concepts_mastered_ids[:12]:
+        label = tid if len(tid) <= 24 else tid[-24:]
+        m = float(mastery_by_id.get(tid, 0.7))
+        topics[label] = {
+            "mastery": max(0.0, min(1.0, m)),
+            "attempts": 1,
+            "last_seen": lp.updated_at.date().isoformat() if lp.updated_at else _now_iso()[:10],
+        }
+    for tid in lp.concepts_struggling_ids[:10]:
+        label = tid if len(tid) <= 24 else tid[-24:]
+        m = float(mastery_by_id.get(tid, 0.35))
+        prev = topics.get(label, {"mastery": m, "attempts": 0, "last_seen": ""})
+        prev["mastery"] = min(float(prev.get("mastery", m)), max(0.0, min(1.0, m)))
+        prev["attempts"] = int(prev.get("attempts", 0)) + 1
+        topics[label] = prev
+    prefs: dict[str, str] = {}
+    if lp.learning_style:
+        prefs["learning_style"] = str(lp.learning_style)
+    if lp.pace_preference:
+        prefs["pace"] = str(lp.pace_preference)
+    created = lp.created_at.strftime(_ISO_FMT) if lp.created_at else _now_iso()
+    updated = lp.updated_at.strftime(_ISO_FMT) if lp.updated_at else _now_iso()
+    return {
+        "user_id": lp.user_id,
+        "created_at": created,
+        "updated_at": updated,
+        "topics": topics,
+        "preferences": prefs,
+        "memory_profile": True,
+        "recent_topics": list(lp.recent_topics),
+        "assistant_notes_preview": [n.text[:200] for n in lp.assistant_notes[-3:]],
+    }
+
+
+def load_profile(
+    user_id: str,
+    *,
+    storage_dir: str | Path,
+    memory_store: Any | None = None,
+    concepts_store: Any | None = None,
+) -> dict[str, Any]:
     """Load a learner profile from disk.
 
-    Returns a fresh default profile dict if the file does not exist yet.
-
-    Args:
-        user_id: Unique user identifier.
-        storage_dir: Directory where profile JSON files are stored.
+    When ``memory_store`` is set (A3), profiles are read from ``MemoryStore`` under
+    ``memory/profiles/``; otherwise legacy ``learner_profiles/*.json`` is used.
+    ``concepts_store`` (defaults to ``memory_store``) supplies ``Concept.mastery_level``
+    for accurate ``topics`` mastery in the legacy summary dict.
 
     Returns:
         The profile dict (always a valid dict with at least ``user_id`` set).
     """
+    if memory_store is not None:
+        cs = concepts_store if concepts_store is not None else memory_store
+        lp = memory_store.load_profile(user_id)
+        if lp is not None:
+            return _learner_profile_to_dict(lp, concepts_store=cs)
+        return _learner_profile_to_dict(memory_store.default_profile(user_id), concepts_store=cs)
+
     path = _profile_path(user_id, Path(storage_dir))
     if path.exists():
         try:
@@ -139,14 +202,22 @@ def profile_summary(profile: dict[str, Any]) -> str:
     Returns:
         A short human-readable description of the learner's current state.
     """
+    parts: list[str] = []
+    if profile.get("memory_profile"):
+        rt = profile.get("recent_topics") or []
+        if rt:
+            parts.append(f"最近学习主题：{', '.join(str(x) for x in rt[:6])}")
+        notes = profile.get("assistant_notes_preview") or []
+        if notes:
+            parts.append(f"备注摘要：{'；'.join(notes[:2])}")
+
     topics: dict[str, Any] = profile.get("topics", {})
-    if not topics:
+    if not topics and not parts:
         return "学习者尚未有任何学习记录。"
 
     strong = [t for t, v in topics.items() if v.get("mastery", 0) >= 0.7]
     weak = [t for t, v in topics.items() if v.get("mastery", 0) < 0.4]
 
-    parts: list[str] = []
     if strong:
         parts.append(f"掌握较好的知识点：{', '.join(strong[:5])}")
     if weak:
@@ -155,6 +226,8 @@ def profile_summary(profile: dict[str, Any]) -> str:
     prefs: dict[str, str] = profile.get("preferences", {})
     if prefs.get("question_type"):
         parts.append(f"偏好题型：{prefs['question_type']}")
+    if prefs.get("learning_style"):
+        parts.append(f"学习风格倾向：{prefs['learning_style']}")
 
     return "；".join(parts) + "。" if parts else "学习者尚无明显的强弱项分布。"
 

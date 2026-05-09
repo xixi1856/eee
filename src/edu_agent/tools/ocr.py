@@ -1,19 +1,14 @@
-"""OCR / document-parsing tool (MinerU pipeline).
-
-Toolset: ocr
-"""
+"""OCR / document-parsing tool (A4 async)."""
 
 from __future__ import annotations
 
 import logging
 
-from edu_agent.registry import registry, tool_result, tool_error
+from edu_agent.tool_payloads import tool_error, tool_result
+from edu_agent.toolsets.models import ToolPermission, ToolSpec
+from edu_agent.toolsets.registry import toolset_registry
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Schema (inner format — no outer "type":"function" wrapper)
-# ---------------------------------------------------------------------------
 
 SCHEMA = {
     "name": "parse_document",
@@ -34,18 +29,14 @@ SCHEMA = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Handler
-# ---------------------------------------------------------------------------
-
-def _handle_parse_document(args: dict, **kw) -> str:
+async def _handle_parse_document(args: dict) -> str:
     path = args.get("path", "")
     if not path:
         return tool_error("缺少必要参数：path")
     try:
         from pathlib import Path as _Path
 
-        from rag_mvp.engine import parse_file, parse_folder  # lazy import
+        from rag_mvp.engine import parse_file, parse_folder
 
         target = _Path(path)
         if target.is_dir():
@@ -60,14 +51,14 @@ def _handle_parse_document(args: dict, **kw) -> str:
         return tool_error(str(exc))
 
 
-# ---------------------------------------------------------------------------
-# Registration
-# ---------------------------------------------------------------------------
-
-registry.register(
-    name="parse_document",
-    schema=SCHEMA,
-    handler=_handle_parse_document,
-    toolset="ocr",
-    emoji="📄",
+toolset_registry.register(
+    ToolSpec(
+        name=SCHEMA["name"],
+        description=SCHEMA["description"],
+        input_schema=SCHEMA["parameters"],
+        handler=_handle_parse_document,
+        toolset="ocr",
+        permissions=[ToolPermission.READ, ToolPermission.EXTERNAL],
+        emoji="📄",
+    )
 )

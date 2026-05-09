@@ -10,7 +10,9 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from edu_agent.registry import registry, tool_result, tool_error
+from edu_agent.tool_payloads import tool_error, tool_result
+from edu_agent.toolsets.models import ToolPermission, ToolSpec
+from edu_agent.toolsets.registry import toolset_registry
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +81,7 @@ def _resolve_output_path(path: str, base: str = "output") -> tuple[Any, str | No
 # Handlers
 # ---------------------------------------------------------------------------
 
-def _handle_write_file(args: dict, **kw) -> str:
+async def _handle_write_file(args: dict) -> str:
     path = args.get("path", "")
     content = args.get("content", "")
     if not path:
@@ -103,7 +105,7 @@ def _handle_write_file(args: dict, **kw) -> str:
         return tool_error(str(exc))
 
 
-def _handle_read_file(args: dict, **kw) -> str:
+async def _handle_read_file(args: dict) -> str:
     path = args.get("path", "")
     if not path:
         return tool_error("缺少必要参数：path")
@@ -124,18 +126,26 @@ def _handle_read_file(args: dict, **kw) -> str:
 # Registration
 # ---------------------------------------------------------------------------
 
-registry.register(
-    name="write_file",
-    schema=_SCHEMA_WRITE_FILE,
-    handler=_handle_write_file,
-    toolset="files",
-    emoji="📝",
+toolset_registry.register(
+    ToolSpec(
+        name=_SCHEMA_WRITE_FILE["name"],
+        description=_SCHEMA_WRITE_FILE["description"],
+        input_schema=_SCHEMA_WRITE_FILE["parameters"],
+        handler=_handle_write_file,
+        toolset="files",
+        permissions=[ToolPermission.WRITE],
+        approval_required=True,
+        emoji="📝",
+    )
 )
-
-registry.register(
-    name="read_file",
-    schema=_SCHEMA_READ_FILE,
-    handler=_handle_read_file,
-    toolset="files",
-    emoji="📂",
+toolset_registry.register(
+    ToolSpec(
+        name=_SCHEMA_READ_FILE["name"],
+        description=_SCHEMA_READ_FILE["description"],
+        input_schema=_SCHEMA_READ_FILE["parameters"],
+        handler=_handle_read_file,
+        toolset="files",
+        permissions=[ToolPermission.READ],
+        emoji="📂",
+    )
 )

@@ -10,8 +10,10 @@ import logging
 import re
 from pathlib import Path
 
-from edu_agent.registry import registry, tool_error, tool_result
 from edu_agent.runtime_context import get_current_runtime
+from edu_agent.tool_payloads import tool_error, tool_result
+from edu_agent.toolsets.models import ToolPermission, ToolSpec
+from edu_agent.toolsets.registry import toolset_registry
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +91,7 @@ _SKILL_THREAT_PATTERNS = [
 # Handlers
 # ---------------------------------------------------------------------------
 
-def _handle_list_skills(args: dict, **kw) -> str:
+async def _handle_list_skills(args: dict) -> str:
     from edu_agent.skills_loader import load_skill_entries
 
     skills_dir = get_current_runtime().paths.skills_dir
@@ -107,7 +109,7 @@ def _handle_list_skills(args: dict, **kw) -> str:
     )
 
 
-def _handle_view_skill(args: dict, **kw) -> str:
+async def _handle_view_skill(args: dict) -> str:
     from edu_agent.skills_loader import load_skill_entries, read_skill_file
 
     name = args.get("name", "")
@@ -130,7 +132,7 @@ def _handle_view_skill(args: dict, **kw) -> str:
     )
 
 
-def _handle_manage_skill(args: dict, **kw) -> str:
+async def _handle_manage_skill(args: dict) -> str:
     from edu_agent.skills_loader import invalidate_cache
 
     action = args.get("action", "")
@@ -174,26 +176,37 @@ def _handle_manage_skill(args: dict, **kw) -> str:
 # Registration
 # ---------------------------------------------------------------------------
 
-registry.register(
-    name="list_skills",
-    schema=_SCHEMA_LIST_SKILLS,
-    handler=_handle_list_skills,
-    toolset="skills",
-    emoji="📚",
+toolset_registry.register(
+    ToolSpec(
+        name=_SCHEMA_LIST_SKILLS["name"],
+        description=_SCHEMA_LIST_SKILLS["description"],
+        input_schema=_SCHEMA_LIST_SKILLS["parameters"],
+        handler=_handle_list_skills,
+        toolset="skills",
+        permissions=[ToolPermission.READ],
+        emoji="📚",
+    )
 )
-
-registry.register(
-    name="view_skill",
-    schema=_SCHEMA_VIEW_SKILL,
-    handler=_handle_view_skill,
-    toolset="skills",
-    emoji="👁️",
+toolset_registry.register(
+    ToolSpec(
+        name=_SCHEMA_VIEW_SKILL["name"],
+        description=_SCHEMA_VIEW_SKILL["description"],
+        input_schema=_SCHEMA_VIEW_SKILL["parameters"],
+        handler=_handle_view_skill,
+        toolset="skills",
+        permissions=[ToolPermission.READ],
+        emoji="👁️",
+    )
 )
-
-registry.register(
-    name="manage_skill",
-    schema=_SCHEMA_MANAGE_SKILL,
-    handler=_handle_manage_skill,
-    toolset="skills",
-    emoji="✏️",
+toolset_registry.register(
+    ToolSpec(
+        name=_SCHEMA_MANAGE_SKILL["name"],
+        description=_SCHEMA_MANAGE_SKILL["description"],
+        input_schema=_SCHEMA_MANAGE_SKILL["parameters"],
+        handler=_handle_manage_skill,
+        toolset="skills",
+        permissions=[ToolPermission.WRITE],
+        approval_required=True,
+        emoji="✏️",
+    )
 )

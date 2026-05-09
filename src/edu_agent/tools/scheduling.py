@@ -1,20 +1,14 @@
-"""Cron scheduling tool.
-
-Toolset: scheduling
-Tools: cron_job
-"""
+"""Cron scheduling tool (A4 async)."""
 
 from __future__ import annotations
 
 import logging
 
-from edu_agent.registry import registry, tool_result, tool_error
+from edu_agent.tool_payloads import tool_error, tool_result
+from edu_agent.toolsets.models import ToolPermission, ToolSpec
+from edu_agent.toolsets.registry import toolset_registry
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Schema
-# ---------------------------------------------------------------------------
 
 SCHEMA = {
     "name": "cron_job",
@@ -49,11 +43,7 @@ SCHEMA = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Handler
-# ---------------------------------------------------------------------------
-
-def _handle_cron_job(args: dict, **kw) -> str:
+async def _handle_cron_job(args: dict) -> str:
     action = args.get("action", "")
     if not action:
         return tool_error("缺少必要参数：action")
@@ -101,14 +91,14 @@ def _handle_cron_job(args: dict, **kw) -> str:
     return tool_error(f"未知操作: {action}")
 
 
-# ---------------------------------------------------------------------------
-# Registration
-# ---------------------------------------------------------------------------
-
-registry.register(
-    name="cron_job",
-    schema=SCHEMA,
-    handler=_handle_cron_job,
-    toolset="scheduling",
-    emoji="⏰",
+toolset_registry.register(
+    ToolSpec(
+        name=SCHEMA["name"],
+        description=SCHEMA["description"],
+        input_schema=SCHEMA["parameters"],
+        handler=_handle_cron_job,
+        toolset="scheduling",
+        permissions=[ToolPermission.WRITE],
+        emoji="⏰",
+    )
 )

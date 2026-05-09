@@ -1,55 +1,112 @@
-"""Hermes-style tools package entrypoint.
-
-This package is the single import surface for tool schemas + dispatch:
-    - TOOL_SCHEMAS: live list consumed by model function-calling
-    - execute_tool(): central dispatch, returns ToolResult
-    - refresh_tool_schemas(): keep TOOL_SCHEMAS in sync with registry
-"""
+"""Built-in tools package — discovery and test helpers (A4)."""
 
 from __future__ import annotations
 
-import json
+import asyncio
+from pathlib import Path
+from typing import Any
 
-from edu_agent.registry import discover_builtin_tools, registry
+from edu_agent.config import (
+    AgentDefaults,
+    EduSettings,
+    ProviderCredentials,
+    ProvidersSettings,
+    RuntimeSettings,
+    ToolsSettings,
+)
+from edu_agent.llm_tools import tool_specs_to_openai_tools
+from edu_agent.paths import build_paths
+from edu_agent.providers.runtime import resolve_provider_runtime
+from edu_agent.runtime_context import TurnRuntimeContext
+from edu_agent.toolsets import (
+    PermissionChecker,
+    ToolRuntime,
+    discover_builtin_tools,
+    permissive_permission_policy,
+    toolset_registry,
+)
 from edu_agent.types import ToolResult
 
 TOOL_SCHEMAS: list[dict] = []
 
-
-def refresh_tool_schemas() -> None:
-    """Keep list object stable while syncing schemas from registry."""
-    TOOL_SCHEMAS[:] = registry.get_tool_definitions()
+_FALLBACK_TOOL_SETTINGS: EduSettings | None = None
 
 
-def execute_tool(name: str, args: dict) -> ToolResult:
-    """Dispatch through central registry, returning a ToolResult.
-
-    Parses the JSON string returned by registry.dispatch() and wraps it in a
-    ToolResult so callers can access ``.success``, ``.summary``, ``.error``.
-    """
-    result_str = registry.dispatch(name, args)
-    try:
-        data = json.loads(result_str)
-    except (json.JSONDecodeError, TypeError):
-        return ToolResult(tool_name=name, success=True, summary=result_str or "")
-    if "error" in data:
-        return ToolResult(
-            tool_name=name,
-            success=False,
-            summary="",
-            error=data["error"],
-        )
-    return ToolResult(
-        tool_name=name,
-        success=True,
-        summary=data.get("result", ""),
-        payload=data.get("payload"),
+def _fallback_settings_for_tool_tests() -> EduSettings:
+    """Isolated EduSettings with placeholder LLM key — used when ``settings`` is omitted (tests/REPL)."""
+    global _FALLBACK_TOOL_SETTINGS
+    if _FALLBACK_TOOL_SETTINGS is not None:
+        return _FALLBACK_TOOL_SETTINGS
+    root = Path.cwd() / ".edu_agent_tool_execute_ws"
+    root.mkdir(exist_ok=True)
+    skills = root / "skills"
+    skills.mkdir(exist_ok=True)
+    _FALLBACK_TOOL_SETTINGS = EduSettings(
+        agent=AgentDefaults(
+            workspace=root,
+            model="test-model",
+            provider="dashscope",
+            skills_dir="skills",
+        ),
+        providers=ProvidersSettings(
+            entries={
+                "dashscope": ProviderCredentials(
+                    api_key="sk-test-placeholder",
+                    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                ),
+            },
+        ),
+        tools=ToolsSettings(),
+        runtime=RuntimeSettings(),
     )
+    return _FALLBACK_TOOL_SETTINGS
 
 
-# Auto-discover and import all tool modules via AST scan.
+def refresh_tool_schemas(settings: EduSettings | None = None) -> None:
+    """Rebuild ``TOOL_SCHEMAS`` from the canonical registry (tests may call)."""
+    st = settings or _fallback_settings_for_tool_tests()
+    TOOL_SCHEMAS[:] = tool_specs_to_openai_tools(toolset_registry.list_specs(st))
+
+
+async def execute_tool_async(
+    name: str,
+    args: dict,
+    *,
+    settings: EduSettings | None = None,
+) -> ToolResult:
+    """Awaitable tool execution for tests (full ToolRuntime path)."""
+    st = settings or _fallback_settings_for_tool_tests()
+    rt = ToolRuntime(
+        toolset_registry,
+        st,
+        PermissionChecker(
+            permissive_permission_policy(),
+            approve_all=True,
+            interactive=False,
+        ),
+    )
+    paths = build_paths(st)
+    pr = resolve_provider_runtime(st, None, "main")
+    ctx = TurnRuntimeContext(
+        settings=st,
+        paths=paths,
+        provider_runtime=pr,
+        user_id="test",
+        session_id="test",
+        tool_runtime=rt,
+    )
+    _content, tr = await rt.execute(name, args, ctx)
+    return tr
+
+
+def execute_tool(name: str, args: dict, settings: EduSettings | None = None) -> ToolResult:
+    """Sync wrapper for tests without a running event loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(execute_tool_async(name, args, settings=settings))
+    raise RuntimeError("execute_tool() cannot be used inside async; await execute_tool_async()")
+
+
 discover_builtin_tools()
-
-# Initial sync after built-ins are imported.
 refresh_tool_schemas()
-

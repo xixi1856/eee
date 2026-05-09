@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from edu_agent.subagent import SubAgent, _MAX_CONCURRENT, _semaphore, _subagent_active
+import edu_agent.subagent as subagent_mod
+from edu_agent.config import EduSettings
+from edu_agent.subagent import SubAgent, _MAX_CONCURRENT
 from edu_agent.tools import execute_tool
 from edu_agent.types import SubAgentConfig, SubTaskResult
 
@@ -33,13 +34,17 @@ def _make_response(choices):
     return resp
 
 
-def _make_sub_agent(reply: str | None = "子任务完成") -> tuple[SubAgent, MagicMock]:
+def _make_sub_agent(
+    reply: str | None = "子任务完成",
+    *,
+    settings: EduSettings,
+) -> tuple[SubAgent, MagicMock]:
     """Return a SubAgent wired to a mock OpenAI client."""
     mock_client = MagicMock()
     mock_client.chat.completions.create.return_value = _make_response(
         [_make_choice(content=reply, finish_reason="stop")]
     )
-    agent = SubAgent(model="mock", client=mock_client)
+    agent = SubAgent(model="mock", client=mock_client, settings=settings)
     return agent, mock_client
 
 
@@ -84,21 +89,21 @@ class TestSubTaskResult:
 
 
 class TestSubAgentRun:
-    def test_no_tools_single_turn(self):
-        agent, _ = _make_sub_agent("任务完成摘要")
+    def test_no_tools_single_turn(self, minimal_edu_settings: EduSettings):
+        agent, _ = _make_sub_agent("任务完成摘要", settings=minimal_edu_settings)
         cfg = SubAgentConfig(task="概括一下TCP", allowed_tools=[])
         result = agent.run(cfg)
         assert result.success is True
         assert result.summary == "任务完成摘要"
         assert result.iterations == 1
 
-    def test_result_summary_matches_llm_reply(self):
-        agent, _ = _make_sub_agent("这是最终结果")
+    def test_result_summary_matches_llm_reply(self, minimal_edu_settings: EduSettings):
+        agent, _ = _make_sub_agent("这是最终结果", settings=minimal_edu_settings)
         result = agent.run(SubAgentConfig(task="t"))
         assert result.summary == "这是最终结果"
 
-    def test_custom_system_prompt_passed_to_llm(self):
-        agent, mock_client = _make_sub_agent("ok")
+    def test_custom_system_prompt_passed_to_llm(self, minimal_edu_settings: EduSettings):
+        agent, mock_client = _make_sub_agent("ok", settings=minimal_edu_settings)
         cfg = SubAgentConfig(task="t", system_prompt="自定义系统提示")
         agent.run(cfg)
         call_kwargs = mock_client.chat.completions.create.call_args[1]
@@ -106,12 +111,16 @@ class TestSubAgentRun:
         assert system_msg["role"] == "system"
         assert "自定义系统提示" in system_msg["content"]
 
-    def test_tool_call_then_final_answer(self):
+    def test_tool_call_then_final_answer(
+        self, minimal_edu_settings: EduSettings, with_turn_runtime
+    ):
         """Sub-agent handles one tool call round-trip."""
         from openai.types.chat.chat_completion_message_tool_call import (
             ChatCompletionMessageToolCall as TC,
             Function,
         )
+
+        from edu_agent.types import ToolResult
 
         tc = TC(id="tc1", type="function", function=Function(name="knowledge_query", arguments='{"question":"q"}'))
         mock_client = MagicMock()
@@ -119,9 +128,16 @@ class TestSubAgentRun:
             _make_response([_make_choice(tool_calls=[tc], finish_reason="tool_calls")]),
             _make_response([_make_choice(content="工具调用后的最终结果", finish_reason="stop")]),
         ]
-        agent = SubAgent(model="mock", client=mock_client)
+        agent = SubAgent(model="mock", client=mock_client, settings=minimal_edu_settings)
 
-        with patch("edu_agent.registry.registry.dispatch", return_value='{"result": "RAG 结果"}'):
+        with patch(
+            "edu_agent.toolsets.runtime.ToolRuntime.execute",
+            new_callable=AsyncMock,
+            return_value=(
+                '{"result": "RAG 结果"}',
+                ToolResult(tool_name="knowledge_query", success=True, summary="RAG 结果"),
+            ),
+        ):
             result = agent.run(
                 SubAgentConfig(task="q", allowed_tools=["knowledge_query"])
             )
@@ -130,10 +146,10 @@ class TestSubAgentRun:
         assert result.summary == "工具调用后的最终结果"
         assert mock_client.chat.completions.create.call_count == 2
 
-    def test_llm_error_returns_failure(self):
+    def test_llm_error_returns_failure(self, minimal_edu_settings: EduSettings):
         mock_client = MagicMock()
         mock_client.chat.completions.create.side_effect = RuntimeError("API down")
-        agent = SubAgent(model="mock", client=mock_client)
+        agent = SubAgent(model="mock", client=mock_client, settings=minimal_edu_settings)
         result = agent.run(SubAgentConfig(task="t"))
         assert result.success is False
         assert "API down" in result.error
@@ -145,7 +161,7 @@ class TestSubAgentRun:
 
 
 class TestSubAgentBudget:
-    def test_budget_exhaustion_returns_failure(self):
+    def test_budget_exhaustion_returns_failure(self, minimal_edu_settings: EduSettings):
         from openai.types.chat.chat_completion_message_tool_call import (
             ChatCompletionMessageToolCall as TC,
             Function,
@@ -155,13 +171,18 @@ class TestSubAgentBudget:
         mock_client.chat.completions.create.return_value = _make_response(
             [_make_choice(tool_calls=[tc], finish_reason="tool_calls")]
         )
-        agent = SubAgent(model="mock", client=mock_client)
+        agent = SubAgent(model="mock", client=mock_client, settings=minimal_edu_settings)
 
-        with patch("edu_agent.tools.execute_tool") as mock_exec:
-            from edu_agent.types import ToolResult
-            mock_exec.return_value = ToolResult(
-                tool_name="knowledge_query", success=True, summary="x"
-            )
+        from edu_agent.types import ToolResult
+
+        with patch(
+            "edu_agent.toolsets.runtime.ToolRuntime.execute",
+            new_callable=AsyncMock,
+            return_value=(
+                '{"result": "x"}',
+                ToolResult(tool_name="knowledge_query", success=True, summary="x"),
+            ),
+        ):
             result = agent.run(
                 SubAgentConfig(task="loop forever", allowed_tools=["knowledge_query"], max_iterations=2)
             )
@@ -175,28 +196,27 @@ class TestSubAgentBudget:
 
 
 class TestRecursionGuard:
-    def test_recursion_blocked_when_flag_set(self):
-        agent, _ = _make_sub_agent("ok")
-        _subagent_active.active = True
+    def test_recursion_blocked_when_depth_already_active(self, minimal_edu_settings: EduSettings):
+        agent, _ = _make_sub_agent("ok", settings=minimal_edu_settings)
+        tok = subagent_mod._subagent_depth.set(1)
         try:
             result = agent.run(SubAgentConfig(task="nested"))
         finally:
-            _subagent_active.active = False
+            subagent_mod._subagent_depth.reset(tok)
         assert result.success is False
         assert "递归" in result.error
 
-    def test_flag_cleared_after_successful_run(self):
-        agent, _ = _make_sub_agent("ok")
+    def test_depth_cleared_after_successful_run(self, minimal_edu_settings: EduSettings):
+        agent, _ = _make_sub_agent("ok", settings=minimal_edu_settings)
         agent.run(SubAgentConfig(task="t"))
-        # Flag must be cleared after run regardless of outcome
-        assert not getattr(_subagent_active, "active", False)
+        assert subagent_mod._subagent_depth.get() == 0
 
-    def test_flag_cleared_after_llm_error(self):
+    def test_depth_cleared_after_llm_error(self, minimal_edu_settings: EduSettings):
         mock_client = MagicMock()
         mock_client.chat.completions.create.side_effect = RuntimeError("err")
-        agent = SubAgent(model="mock", client=mock_client)
+        agent = SubAgent(model="mock", client=mock_client, settings=minimal_edu_settings)
         agent.run(SubAgentConfig(task="t"))
-        assert not getattr(_subagent_active, "active", False)
+        assert subagent_mod._subagent_depth.get() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +225,7 @@ class TestRecursionGuard:
 
 
 class TestToolWhitelist:
-    def test_disallowed_tool_blocked(self):
+    def test_disallowed_tool_blocked(self, minimal_edu_settings: EduSettings):
         """A tool not in allowed_tools must not be called."""
         from openai.types.chat.chat_completion_message_tool_call import (
             ChatCompletionMessageToolCall as TC,
@@ -217,15 +237,17 @@ class TestToolWhitelist:
             _make_response([_make_choice(tool_calls=[tc], finish_reason="tool_calls")]),
             _make_response([_make_choice(content="fallback", finish_reason="stop")]),
         ]
-        agent = SubAgent(model="mock", client=mock_client)
+        agent = SubAgent(model="mock", client=mock_client, settings=minimal_edu_settings)
 
-        with patch("edu_agent.tools.execute_tool") as mock_exec:
+        with patch(
+            "edu_agent.toolsets.runtime.ToolRuntime.execute",
+            new_callable=AsyncMock,
+        ) as mock_exec:
             agent.run(SubAgentConfig(task="t", allowed_tools=["knowledge_query"]))
-        # execute_tool should NOT have been called for score_essay
         for call in mock_exec.call_args_list:
-            assert call[0][0] != "score_essay"
+            assert call.args[0] != "score_essay"
 
-    def test_delegate_task_always_blocked(self):
+    def test_delegate_task_always_blocked(self, minimal_edu_settings: EduSettings):
         """delegate_task must be blocked even if explicitly listed in allowed_tools."""
         from openai.types.chat.chat_completion_message_tool_call import (
             ChatCompletionMessageToolCall as TC,
@@ -237,12 +259,15 @@ class TestToolWhitelist:
             _make_response([_make_choice(tool_calls=[tc], finish_reason="tool_calls")]),
             _make_response([_make_choice(content="done", finish_reason="stop")]),
         ]
-        agent = SubAgent(model="mock", client=mock_client)
+        agent = SubAgent(model="mock", client=mock_client, settings=minimal_edu_settings)
 
-        with patch("edu_agent.tools.execute_tool") as mock_exec:
+        with patch(
+            "edu_agent.toolsets.runtime.ToolRuntime.execute",
+            new_callable=AsyncMock,
+        ) as mock_exec:
             agent.run(SubAgentConfig(task="t", allowed_tools=["delegate_task"]))
         for call in mock_exec.call_args_list:
-            assert call[0][0] != "delegate_task"
+            assert call.args[0] != "delegate_task"
 
 
 # ---------------------------------------------------------------------------
@@ -322,19 +347,23 @@ class TestSubAgentRuntimeContext:
 
 class TestDelegateTaskTool:
     def test_success_returns_tool_result(self, with_turn_runtime):
-        with patch("edu_agent.subagent.SubAgent") as MockSA:
-            MockSA.return_value.run.return_value = SubTaskResult(
-                success=True, summary="子任务摘要"
+        with patch("edu_agent.tools.delegation.SubAgent") as MockSA:
+            inst = MagicMock()
+            inst.arun = AsyncMock(
+                return_value=SubTaskResult(success=True, summary="子任务摘要")
             )
+            MockSA.return_value = inst
             result = execute_tool("delegate_task", {"task": "出三道题"})
         assert result.success is True
         assert result.summary == "子任务摘要"
 
     def test_failure_passes_through_error(self, with_turn_runtime):
-        with patch("edu_agent.subagent.SubAgent") as MockSA:
-            MockSA.return_value.run.return_value = SubTaskResult(
-                success=False, summary="", error="迭代预算超限"
+        with patch("edu_agent.tools.delegation.SubAgent") as MockSA:
+            inst = MagicMock()
+            inst.arun = AsyncMock(
+                return_value=SubTaskResult(success=False, summary="", error="迭代预算超限")
             )
+            MockSA.return_value = inst
             result = execute_tool("delegate_task", {"task": "t"})
         assert result.success is False
         assert "迭代预算超限" in result.error
@@ -343,11 +372,13 @@ class TestDelegateTaskTool:
         """max_iterations=99 should be silently clamped to 10."""
         captured: dict = {}
 
-        def fake_run(cfg: SubAgentConfig) -> SubTaskResult:
+        async def fake_arun(cfg: SubAgentConfig) -> SubTaskResult:
             captured["max_iter"] = cfg.max_iterations
             return SubTaskResult(success=True, summary="ok")
 
-        with patch("edu_agent.subagent.SubAgent") as MockSA:
-            MockSA.return_value.run.side_effect = fake_run
+        with patch("edu_agent.tools.delegation.SubAgent") as MockSA:
+            inst = MagicMock()
+            inst.arun = AsyncMock(side_effect=fake_arun)
+            MockSA.return_value = inst
             execute_tool("delegate_task", {"task": "t", "max_iterations": 99})
         assert captured["max_iter"] == 10

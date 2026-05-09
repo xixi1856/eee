@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
@@ -59,7 +59,7 @@ def _make_agent_mock(replies: list[str]):
     """Return a mock EduAgent that produces *replies* in sequence."""
     agent = MagicMock()
     agent.config.session_id = "testsession"
-    agent.run_turn.side_effect = replies
+    agent.run_turn = AsyncMock(side_effect=replies)
     return agent
 
 

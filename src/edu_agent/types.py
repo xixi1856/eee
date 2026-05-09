@@ -72,6 +72,24 @@ class AgentConfig:
     workspace: str = ""
     skills_dir: str = ""
     max_iterations: int = 20
+    memory_enabled: bool = True
+    """When False, skip memory extraction, consolidation, retrieval, and profile updates."""
+    memory_inject_into_prompt: bool = False
+    """When True and memory is enabled, inject a short retrieved-memory block into the system prompt."""
+    approve_all_tools: bool = False
+    """When True, skip interactive approval for tools that require confirmation."""
+    disabled_tools: list[str] = field(default_factory=list)
+    """Tool names excluded from model tool list and blocked at runtime."""
+    allow_network_tools: bool = False
+    """Session override: allow tools that declare NETWORK (merged with yaml ``permission_policy``)."""
+    allow_write_tools: bool = False
+    """Session override: allow tools that declare WRITE (merged with yaml)."""
+    allow_execute_tools: bool = False
+    """Session override: allow tools that declare EXECUTE."""
+    allow_external_tools: bool = False
+    """Session override: allow tools that declare EXTERNAL."""
+    course_id: str = ""
+    """Optional course scope for RAG routing (injected into turn runtime context)."""
 
 
 @dataclass

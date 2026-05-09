@@ -16,7 +16,8 @@ logs.txt
 data/input/
 docs/
 mindmap_storage/
-session_logs/
+sessions.db
+memory/
 # OS
 .DS_Store
 Thumbs.db

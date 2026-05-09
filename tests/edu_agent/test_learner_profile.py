@@ -12,6 +12,23 @@ from edu_agent.learner_profile import (
     save_profile,
     update_topic_mastery,
 )
+from edu_agent.memory.models import Concept, LearnerProfile
+from edu_agent.memory.storage import MemoryStore
+
+
+class TestLoadProfileMemoryStore:
+    def test_topics_mastery_reflects_concept_mastery(self, tmp_path):
+        mdir = tmp_path / "mem"
+        store = MemoryStore(mdir)
+        cid = "c_tcp_1"
+        store.save_concept("alice", Concept(id=cid, name="TCP", description="", mastery_level=0.82))
+        prof = LearnerProfile(user_id="alice", concepts_mastered_ids=[cid])
+        store.save_profile(prof)
+
+        d = load_profile("alice", storage_dir=tmp_path, memory_store=store)
+        assert d.get("memory_profile") is True
+        assert cid in d["topics"]
+        assert abs(d["topics"][cid]["mastery"] - 0.82) < 0.01
 
 
 class TestLoadProfile:

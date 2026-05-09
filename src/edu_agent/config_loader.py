@@ -17,6 +17,7 @@ from edu_agent.config import (
     ProvidersSettings,
     RuntimeSettings,
     ToolsSettings,
+    ToolsetsSettings,
 )
 
 
@@ -139,7 +140,14 @@ def load_settings_from_file(path: Path) -> EduSettings:
     runtime = RuntimeSettings.model_validate(
         {**RuntimeSettings().model_dump(), **(raw.get("runtime") or {})}
     )
-    return EduSettings(agent=agent, providers=providers, tools=tools, runtime=runtime)
+    toolsets = ToolsetsSettings.from_raw(raw.get("toolsets") or {})
+    return EduSettings(
+        agent=agent,
+        providers=providers,
+        tools=tools,
+        runtime=runtime,
+        toolsets=toolsets,
+    )
 
 
 def load_settings(config_path: Path | None = None) -> EduSettings:
@@ -158,6 +166,7 @@ def load_settings(config_path: Path | None = None) -> EduSettings:
         "providers": {"entries": {}},
         "tools": ToolsSettings().model_dump(),
         "runtime": RuntimeSettings().model_dump(),
+        "toolsets": {},
     }
     _apply_legacy_env_into_data(data)
     agent_dict = data["agent"]
@@ -167,4 +176,11 @@ def load_settings(config_path: Path | None = None) -> EduSettings:
     providers = ProvidersSettings(entries=_normalize_provider_entries(prov_raw))
     tools = ToolsSettings.model_validate(data.get("tools") or {})
     runtime = RuntimeSettings.model_validate(data.get("runtime") or {})
-    return EduSettings(agent=agent, providers=providers, tools=tools, runtime=runtime)
+    toolsets = ToolsetsSettings.from_raw(data.get("toolsets") or {})
+    return EduSettings(
+        agent=agent,
+        providers=providers,
+        tools=tools,
+        runtime=runtime,
+        toolsets=toolsets,
+    )

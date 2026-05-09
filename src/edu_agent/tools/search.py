@@ -11,7 +11,9 @@ import logging
 import urllib.parse
 from typing import Any
 
-from edu_agent.registry import registry, tool_error, tool_result
+from edu_agent.tool_payloads import tool_error, tool_result
+from edu_agent.toolsets.models import ToolPermission, ToolSpec
+from edu_agent.toolsets.registry import toolset_registry
 from edu_agent.runtime_context import get_current_runtime
 
 logger = logging.getLogger(__name__)
@@ -177,7 +179,7 @@ def _ddg_search(query: str, max_results: int) -> list[dict]:
 # Handlers
 # ---------------------------------------------------------------------------
 
-def _handle_web_search(args: dict, **kw) -> str:
+async def _handle_web_search(args: dict) -> str:
     query = args.get("query", "")
     if not query:
         return tool_error("缺少必要参数：query")
@@ -222,7 +224,7 @@ def _handle_web_search(args: dict, **kw) -> str:
     return tool_result("\n".join(lines), payload=results)
 
 
-def _handle_web_fetch(args: dict, **kw) -> str:
+async def _handle_web_fetch(args: dict) -> str:
     url = args.get("url", "")
     if not url:
         return tool_error("缺少必要参数：url")
@@ -253,7 +255,7 @@ def _handle_web_fetch(args: dict, **kw) -> str:
     return tool_result(text[:max_chars])
 
 
-def _handle_ollama_web_search(args: dict, **kw) -> str:
+async def _handle_ollama_web_search(args: dict) -> str:
     query = args.get("query", "")
     if not query:
         return tool_error("缺少必要参数：query")
@@ -299,7 +301,7 @@ def _handle_ollama_web_search(args: dict, **kw) -> str:
     return tool_result("\n".join(lines), payload=results)
 
 
-def _handle_wikipedia_search(args: dict, **kw) -> str:
+async def _handle_wikipedia_search(args: dict) -> str:
     query = args.get("query", "")
     if not query:
         return tool_error("缺少必要参数：query")
@@ -390,34 +392,47 @@ def _handle_wikipedia_search(args: dict, **kw) -> str:
 # Registration
 # ---------------------------------------------------------------------------
 
-registry.register(
-    name="web_search",
-    schema=_SCHEMA_WEB_SEARCH,
-    handler=_handle_web_search,
-    toolset="search",
-    emoji="🌐",
+toolset_registry.register(
+    ToolSpec(
+        name=_SCHEMA_WEB_SEARCH["name"],
+        description=_SCHEMA_WEB_SEARCH["description"],
+        input_schema=_SCHEMA_WEB_SEARCH["parameters"],
+        handler=_handle_web_search,
+        toolset="search",
+        permissions=[ToolPermission.NETWORK],
+        emoji="🌐",
+    )
 )
-
-registry.register(
-    name="web_fetch",
-    schema=_SCHEMA_WEB_FETCH,
-    handler=_handle_web_fetch,
-    toolset="search",
-    emoji="🌍",
+toolset_registry.register(
+    ToolSpec(
+        name=_SCHEMA_WEB_FETCH["name"],
+        description=_SCHEMA_WEB_FETCH["description"],
+        input_schema=_SCHEMA_WEB_FETCH["parameters"],
+        handler=_handle_web_fetch,
+        toolset="search",
+        permissions=[ToolPermission.NETWORK],
+        emoji="🌍",
+    )
 )
-
-registry.register(
-    name="ollama_web_search",
-    schema=_SCHEMA_OLLAMA_WEB_SEARCH,
-    handler=_handle_ollama_web_search,
-    toolset="search",
-    emoji="🔭",
+toolset_registry.register(
+    ToolSpec(
+        name=_SCHEMA_OLLAMA_WEB_SEARCH["name"],
+        description=_SCHEMA_OLLAMA_WEB_SEARCH["description"],
+        input_schema=_SCHEMA_OLLAMA_WEB_SEARCH["parameters"],
+        handler=_handle_ollama_web_search,
+        toolset="search",
+        permissions=[ToolPermission.NETWORK],
+        emoji="🔭",
+    )
 )
-
-registry.register(
-    name="wikipedia_search",
-    schema=_SCHEMA_WIKIPEDIA_SEARCH,
-    handler=_handle_wikipedia_search,
-    toolset="search",
-    emoji="📖",
+toolset_registry.register(
+    ToolSpec(
+        name=_SCHEMA_WIKIPEDIA_SEARCH["name"],
+        description=_SCHEMA_WIKIPEDIA_SEARCH["description"],
+        input_schema=_SCHEMA_WIKIPEDIA_SEARCH["parameters"],
+        handler=_handle_wikipedia_search,
+        toolset="search",
+        permissions=[ToolPermission.NETWORK],
+        emoji="📖",
+    )
 )

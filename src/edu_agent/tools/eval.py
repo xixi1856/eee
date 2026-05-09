@@ -6,10 +6,13 @@ Tools: hint_generator, score_essay, evaluate_code
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
-from edu_agent.registry import registry, tool_result, tool_error
+from edu_agent.tool_payloads import tool_error, tool_result
+from edu_agent.toolsets.models import ToolPermission, ToolSpec
+from edu_agent.toolsets.registry import toolset_registry
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +144,7 @@ _HINT_INSTRUCTIONS: dict[int, str] = {
 # Handlers
 # ---------------------------------------------------------------------------
 
-def _handle_hint_generator(args: dict, **kw) -> str:
+async def _handle_hint_generator(args: dict) -> str:
     question = args.get("question", "")
     if not question:
         return tool_error("缺少必要参数：question")
@@ -155,14 +158,14 @@ def _handle_hint_generator(args: dict, **kw) -> str:
         f"请生成一个适合等级 {level} 的提示（中文）。"
     )
     try:
-        hint = _call_llm(prompt, system)
+        hint = await asyncio.to_thread(_call_llm, prompt, system)
         return tool_result(hint)
     except Exception as exc:
         logger.error("hint_generator failed: %s", exc)
         return tool_error(str(exc))
 
 
-def _handle_score_essay(args: dict, **kw) -> str:
+async def _handle_score_essay(args: dict) -> str:
     question = args.get("question", "")
     student_answer = args.get("student_answer", "")
     if not question or not student_answer:
@@ -179,7 +182,7 @@ def _handle_score_essay(args: dict, **kw) -> str:
         "请给出 0–100 分的评分，并提供总体评价、优点和改进建议。"
     )
     try:
-        raw = _call_llm(prompt, system)
+        raw = await asyncio.to_thread(_call_llm, prompt, system)
         try:
             data = json.loads(raw)
             score = data.get("score", "N/A")
@@ -197,7 +200,7 @@ def _handle_score_essay(args: dict, **kw) -> str:
         return tool_error(str(exc))
 
 
-def _handle_evaluate_code(args: dict, **kw) -> str:
+async def _handle_evaluate_code(args: dict) -> str:
     code = args.get("code", "")
     task_description = args.get("task_description", "")
     if not code or not task_description:
@@ -215,7 +218,7 @@ def _handle_evaluate_code(args: dict, **kw) -> str:
         "4. 改进建议"
     )
     try:
-        feedback = _call_llm(prompt, system)
+        feedback = await asyncio.to_thread(_call_llm, prompt, system)
         return tool_result(feedback)
     except Exception as exc:
         logger.error("evaluate_code failed: %s", exc)
@@ -226,26 +229,36 @@ def _handle_evaluate_code(args: dict, **kw) -> str:
 # Registration
 # ---------------------------------------------------------------------------
 
-registry.register(
-    name="hint_generator",
-    schema=_SCHEMA_HINT_GENERATOR,
-    handler=_handle_hint_generator,
-    toolset="eval",
-    emoji="💡",
+toolset_registry.register(
+    ToolSpec(
+        name=_SCHEMA_HINT_GENERATOR["name"],
+        description=_SCHEMA_HINT_GENERATOR["description"],
+        input_schema=_SCHEMA_HINT_GENERATOR["parameters"],
+        handler=_handle_hint_generator,
+        toolset="eval",
+        permissions=[ToolPermission.NETWORK, ToolPermission.EXTERNAL],
+        emoji="💡",
+    )
 )
-
-registry.register(
-    name="score_essay",
-    schema=_SCHEMA_SCORE_ESSAY,
-    handler=_handle_score_essay,
-    toolset="eval",
-    emoji="📊",
+toolset_registry.register(
+    ToolSpec(
+        name=_SCHEMA_SCORE_ESSAY["name"],
+        description=_SCHEMA_SCORE_ESSAY["description"],
+        input_schema=_SCHEMA_SCORE_ESSAY["parameters"],
+        handler=_handle_score_essay,
+        toolset="eval",
+        permissions=[ToolPermission.NETWORK, ToolPermission.EXTERNAL],
+        emoji="📊",
+    )
 )
-
-registry.register(
-    name="evaluate_code",
-    schema=_SCHEMA_EVALUATE_CODE,
-    handler=_handle_evaluate_code,
-    toolset="eval",
-    emoji="💻",
+toolset_registry.register(
+    ToolSpec(
+        name=_SCHEMA_EVALUATE_CODE["name"],
+        description=_SCHEMA_EVALUATE_CODE["description"],
+        input_schema=_SCHEMA_EVALUATE_CODE["parameters"],
+        handler=_handle_evaluate_code,
+        toolset="eval",
+        permissions=[ToolPermission.NETWORK, ToolPermission.EXTERNAL],
+        emoji="💻",
+    )
 )

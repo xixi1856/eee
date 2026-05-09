@@ -6,6 +6,7 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 import logging
@@ -17,6 +18,9 @@ import click
 
 from edu_agent.agent import EduAgent
 from edu_agent.config_loader import load_settings
+from edu_agent.paths import build_paths
+from edu_agent.sessions.store import SessionStore
+from edu_agent.toolsets.registry import toolset_registry
 from edu_agent.types import AgentCallbacks, AgentConfig
 
 logger = logging.getLogger(__name__)
@@ -57,7 +61,7 @@ def _tool_emoji(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 _SPINNER_FRAMES = ["◜", "◠", "◝", "◞", "◟", "◡"]
-_THINKING_WORDS = itertools.cycle(["思考中\n", "推理中\n", "整理知识\n", "查询记忆\n"])
+_THINKING_WORDS = itertools.cycle(["思考中", "推理中", "整理知识", "查询记忆"])
 
 # Enable ANSI escape codes on Windows (requires Windows 10 1511+).
 def _enable_windows_ansi() -> None:
@@ -253,11 +257,100 @@ def cli(debug: bool) -> None:
     default=False,
     help="Start the background CronDaemon for scheduled tasks.",
 )
-def chat(user: str, skills: str, max_iter: int, progress: str, enable_cron: bool) -> None:
+@click.option(
+    "--session-id",
+    default="",
+    show_default=False,
+    help="Resume an existing session (messages loaded from workspace/sessions.db).",
+)
+@click.option(
+    "--disable-memory",
+    is_flag=True,
+    default=False,
+    help="Disable long-term memory (no extraction, consolidation, or memory tools).",
+)
+@click.option(
+    "--approve-all",
+    is_flag=True,
+    default=False,
+    help="Skip interactive tool permission prompts (non-interactive / CI).",
+)
+@click.option(
+    "--disable-tool",
+    multiple=True,
+    default=[],
+    help="Disable specific tool names (repeatable).",
+)
+@click.option(
+    "--allow-network",
+    is_flag=True,
+    default=False,
+    help="Allow tools that declare NETWORK (merged with yaml permission_policy).",
+)
+@click.option(
+    "--allow-write",
+    is_flag=True,
+    default=False,
+    help="Allow tools that declare WRITE without separate approval (merged with yaml).",
+)
+@click.option(
+    "--allow-execute",
+    is_flag=True,
+    default=False,
+    help="Allow tools that declare EXECUTE.",
+)
+@click.option(
+    "--allow-external",
+    is_flag=True,
+    default=False,
+    help="Allow tools that declare EXTERNAL (e.g. MCP proxies).",
+)
+@click.option(
+    "--course-id",
+    default="",
+    show_default=False,
+    help="Optional course id for knowledge_query routing (session context).",
+)
+def chat(
+    user: str,
+    skills: str,
+    max_iter: int,
+    progress: str,
+    enable_cron: bool,
+    session_id: str,
+    disable_memory: bool,
+    approve_all: bool,
+    disable_tool: tuple[str, ...],
+    allow_network: bool,
+    allow_write: bool,
+    allow_execute: bool,
+    allow_external: bool,
+    course_id: str,
+) -> None:
     """Start an interactive chat session with the educational agent."""
     settings = load_settings()
-    config = AgentConfig(user_id=user, skills_dir=skills, max_iterations=max_iter)
-    agent = EduAgent(config, settings=settings)
+    config = AgentConfig(
+        user_id=user,
+        skills_dir=skills,
+        max_iterations=max_iter,
+        session_id=session_id.strip(),
+        memory_enabled=not disable_memory,
+        approve_all_tools=approve_all,
+        disabled_tools=[t.strip() for t in disable_tool if t.strip()],
+        allow_network_tools=allow_network,
+        allow_write_tools=allow_write,
+        allow_execute_tools=allow_execute,
+        allow_external_tools=allow_external,
+        course_id=course_id.strip(),
+    )
+    paths = build_paths(settings, skills_dir=skills)
+    store = SessionStore(paths.sessions_db)
+    try:
+        agent = EduAgent(config, settings=settings, session_store=store)
+    except ValueError as exc:
+        store.close()
+        click.echo(click.style(f"[错误] {exc}", fg="red"), err=True)
+        raise SystemExit(1) from exc
     mode_state: list[str] = [progress]
 
     if enable_cron:
@@ -267,10 +360,35 @@ def chat(user: str, skills: str, max_iter: int, progress: str, enable_cron: bool
         click.echo(click.style("[CronDaemon 已启动]", dim=True))
 
     click.echo(
-        click.style("EduAgent 已启动。输入 /quit 或 /exit 退出，/reset 清空对话历史，/verbose 切换进度模式。", fg="green")
+        click.style(
+            "EduAgent 已启动。/quit 或 /exit 退出；/reset 清空对话；/verbose 切换进度；"
+            "/compress-context（或 /ctx-compress）手动压缩会话上下文。",
+            fg="green",
+        )
     )
     click.echo(click.style(f"会话 ID: {config.session_id}  进度模式: {mode_state[0]}", dim=True))
 
+    try:
+        asyncio.run(_chat_async_loop(agent, mode_state))
+    finally:
+        try:
+            asyncio.run(_shutdown_mcp_async())
+        except RuntimeError:
+            pass
+        try:
+            agent.finalize_memory_session()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("finalize_memory_session: %s", exc)
+        store.close()
+
+
+async def _shutdown_mcp_async() -> None:
+    from edu_agent.mcp.integration import shutdown_mcp_servers
+
+    await shutdown_mcp_servers()
+
+
+async def _chat_async_loop(agent: EduAgent, mode_state: list[str]) -> None:
     while True:
         try:
             user_input = click.prompt(click.style("你", fg="cyan"), prompt_suffix=" > ")
@@ -296,24 +414,159 @@ def chat(user: str, skills: str, max_iter: int, progress: str, enable_cron: bool
             click.echo(click.style(f"[进度模式已切换为: {mode_state[0]}]", dim=True))
             continue
 
-        # Build fresh callbacks for this turn (resets per-turn state like _first_chunk).
+        if stripped in ("/compress-context", "/ctx-compress"):
+            if not agent.has_context_manager:
+                click.echo(
+                    click.style("[未启用会话存储，无法压缩上下文]", dim=True),
+                    err=True,
+                )
+                continue
+            if not agent.context_compression_active:
+                click.echo(click.style("[上下文压缩已在配置中关闭]", dim=True))
+                continue
+            try:
+                agent.trigger_context_compress()
+                click.echo(click.style("[上下文压缩已完成]", dim=True))
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Context compress failed: %s", exc)
+                click.echo(click.style(f"[上下文压缩失败] {exc}", fg="red"), err=True)
+            continue
+
         cbs = build_callbacks(mode_state[0])
         agent.callbacks = cbs
 
         try:
-            reply = agent.run_turn(stripped)
+            reply = await agent.run_turn(stripped)
         except Exception as exc:  # noqa: BLE001
             logger.error("Agent error: %s", exc)
             click.echo(click.style(f"[错误] {exc}", fg="red"), err=True)
             continue
 
-        # If streaming emitted text, just add a newline.
-        # If not (e.g. mocked agent or callbacks never called), print full reply.
         if cbs.on_text_chunk is not None and cbs.was_streamed and cbs.was_streamed():
-            click.echo()  # end the streamed line
+            click.echo()
         else:
             click.echo(click.style("助手", fg="yellow") + " > " + reply)
         click.echo()
+
+
+@cli.command("show-profile")
+@click.option("--user", default="default", show_default=True, help="User identifier.")
+def show_profile(user: str) -> None:
+    """Display the persisted learner profile (A3 memory/profiles)."""
+    import json as _json
+
+    settings = load_settings()
+    paths = build_paths(settings)
+    from edu_agent.memory.storage import MemoryStore
+
+    mstore = MemoryStore(paths.memory_dir)
+    prof = mstore.load_profile(user)
+    if prof is None:
+        click.echo(click.style("（尚无画像文件；完成一次带记忆会话后可生成）", dim=True))
+        return
+    click.echo(_json.dumps(prof.model_dump(mode="json"), indent=2, ensure_ascii=False, default=str))
+
+
+@cli.command("list-tools")
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Print machine-readable JSON (name, toolset, description).",
+)
+def list_tools(as_json: bool) -> None:
+    """List tools exposed to the LLM for the current settings (toolsets + checks)."""
+    from edu_agent.toolsets.registry import discover_builtin_tools, toolset_registry
+
+    settings = load_settings()
+    discover_builtin_tools()
+    specs = toolset_registry.list_specs(settings)
+    if as_json:
+        click.echo(
+            json.dumps(
+                [
+                    {
+                        "name": s.name,
+                        "toolset": s.toolset,
+                        "description": s.description,
+                        "permissions": [p.value for p in s.permissions],
+                        "approval_required": s.approval_required,
+                    }
+                    for s in specs
+                ],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+    click.echo(click.style(f"已启用工具（{len(specs)}）", fg="green"))
+    for s in specs:
+        flags = []
+        if s.approval_required:
+            flags.append("需确认")
+        extra = f"  [{', '.join(flags)}]" if flags else ""
+        click.echo(f"  {_tool_emoji(s.name)} {s.name}  ({s.toolset}){extra}")
+
+
+@cli.command("list-sessions")
+@click.option("--user", default="default", show_default=True, help="User identifier.")
+@click.option("--limit", default=20, show_default=True, type=int, help="Max sessions to list.")
+def list_sessions(user: str, limit: int) -> None:
+    """List recent sessions for a user (from workspace/sessions.db)."""
+    settings = load_settings()
+    paths = build_paths(settings)
+    store = SessionStore(paths.sessions_db)
+    try:
+        sessions = store.search_sessions(user_id=user, limit=limit)
+        if not sessions:
+            click.echo(click.style("（无会话记录）", dim=True))
+            return
+        click.echo(click.style(f"最近会话（最多 {limit} 条）", fg="green"))
+        for s in sessions:
+            st = s.metadata.status.value
+            title = s.metadata.title or ""
+            click.echo(
+                f"  {s.metadata.id}  [{st}]  updated={s.metadata.updated_at.isoformat()}  {title}"
+            )
+    finally:
+        store.close()
+
+
+@cli.command("cleanup-sessions")
+@click.option(
+    "--before",
+    required=True,
+    help="ISO date or datetime; delete sessions created strictly before this instant.",
+)
+@click.option(
+    "--archived-only",
+    is_flag=True,
+    default=False,
+    help="Only delete sessions already in ARCHIVED status.",
+)
+@click.option("--yes", is_flag=True, default=False, help="Skip confirmation prompt.")
+def cleanup_sessions(before: str, archived_only: bool, yes: bool) -> None:
+    """Delete old sessions from sessions.db (destructive)."""
+    from datetime import datetime
+
+    settings = load_settings()
+    paths = build_paths(settings)
+    store = SessionStore(paths.sessions_db)
+    try:
+        cutoff = datetime.fromisoformat(before.replace("Z", "+00:00"))
+    except ValueError as exc:
+        store.close()
+        raise click.BadParameter(f"Invalid --before datetime: {before}") from exc
+    if not yes:
+        click.confirm(
+            f"Delete sessions created before {cutoff.isoformat()} "
+            f"(archived_only={archived_only})?",
+            abort=True,
+        )
+    n = store.delete_sessions_before(cutoff, archived_only=archived_only)
+    store.close()
+    click.echo(click.style(f"Deleted {n} session(s).", fg="green"))
 
 
 if __name__ == "__main__":

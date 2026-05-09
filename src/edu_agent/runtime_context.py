@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextvars import ContextVar, Token
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict
 
@@ -24,6 +24,15 @@ class TurnRuntimeContext(BaseModel):
     provider_runtime: ResolvedProviderRuntime
     user_id: str
     session_id: str
+    memory_enabled: bool = False
+    memory_store: Any | None = None
+    memory_retriever: Any | None = None
+    # A4: shared ToolRuntime for main agent and SubAgent (optional in tests)
+    tool_runtime: Any | None = None
+    # Same PermissionChecker as main agent (SubAgent must not mint a looser checker).
+    permission_checker: Any | None = None
+    # Optional course scope for knowledge_query routing (phase4).
+    course_id: str | None = None
 
 
 def set_current_runtime(ctx: TurnRuntimeContext) -> Token[Optional[TurnRuntimeContext]]:

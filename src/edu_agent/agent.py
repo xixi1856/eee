@@ -7,8 +7,7 @@ Follows the Hermes-style ReAct pattern:
   4. If LLM returns a final message → append → return to caller.
   5. Abort after max_iterations to prevent infinite loops.
 
-The agent is intentionally synchronous so it can be used directly from CLI
-code without managing an event loop externally.
+The agent's ``run_turn`` is async; CLI uses ``asyncio.run`` (or an existing loop).
 """
 
 from __future__ import annotations
@@ -17,24 +16,44 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
 from openai.types.chat import ChatCompletionMessage
 
 from edu_agent.config import EduSettings
+from edu_agent.context.calculator import estimate_messages_tokens_rough
+from edu_agent.context.compressor import ContextOverflowError
+from edu_agent.context.manager import ContextManager
+from edu_agent.context.models import ContextConfig
+from edu_agent.memory import MemoryConfig, MemoryConsolidator, MemoryExtractor, MemoryRetriever, MemoryStore
+from edu_agent.memory.coordinator import MemoryCoordinator
+from edu_agent.memory.manager import EduMemoryManager
+from edu_agent.memory.output_scrubber import sanitize_completed_assistant_output
+from edu_agent.memory.provider import BuiltinFilesystemMemoryProvider
 from edu_agent.paths import build_paths
 from edu_agent.providers.runtime import build_openai_client, resolve_provider_runtime
-from edu_agent.registry import registry as _registry
 from edu_agent.learner_profile import load_profile, profile_summary
+from edu_agent.llm_tools import tool_specs_to_openai_tools
 from edu_agent.prompt_builder import build_system_prompt
-from edu_agent.registry import discover_builtin_tools
-from edu_agent.runtime_context import TurnRuntimeContext, reset_current_runtime, set_current_runtime
+from edu_agent.runtime_context import (
+    TurnRuntimeContext,
+    get_current_runtime,
+    reset_current_runtime,
+    set_current_runtime,
+)
+from edu_agent.toolsets import (
+    PermissionChecker,
+    ToolRuntime,
+    discover_builtin_tools,
+    resolve_effective_permission_policy,
+    toolset_registry,
+)
 from edu_agent.safety import check_input, check_output
-from edu_agent.session_store import append_message
-from edu_agent.skill_tool_registry import discover_and_register
+from edu_agent.sessions.models import SessionStatus
+from edu_agent.sessions.store import SessionArchivedError, SessionStore
 from edu_agent.skills_loader import load_skill_entries
-from edu_agent.tools import TOOL_SCHEMAS
 from edu_agent.types import AgentCallbacks, AgentConfig
 
 logger = logging.getLogger(__name__)
@@ -51,7 +70,14 @@ class EduAgent:
     a fresh conversation without creating a new instance.
     """
 
-    def __init__(self, config: AgentConfig | None = None, settings: EduSettings | None = None) -> None:
+    def __init__(
+        self,
+        config: AgentConfig | None = None,
+        settings: EduSettings | None = None,
+        *,
+        session_store: SessionStore | None = None,
+        context_manager: ContextManager | None = None,
+    ) -> None:
         if settings is None:
             raise ValueError(
                 "EduAgent requires `settings=...` from edu_agent.config_loader.load_settings() "
@@ -60,8 +86,24 @@ class EduAgent:
         discover_builtin_tools()
         self._settings = settings
         self.config = config or AgentConfig()
-        if not self.config.session_id:
-            self.config.session_id = uuid.uuid4().hex[:12]
+        _policy = resolve_effective_permission_policy(
+            self._settings.tools.permission_policy,
+            allow_network=self.config.allow_network_tools,
+            allow_write=self.config.allow_write_tools,
+            allow_execute=self.config.allow_execute_tools,
+            allow_external=self.config.allow_external_tools,
+        )
+        self._permissions = PermissionChecker(
+            _policy,
+            approve_all=self.config.approve_all_tools,
+            interactive=True,
+        )
+        self._tool_runtime = ToolRuntime(
+            toolset_registry,
+            self._settings,
+            self._permissions,
+        )
+        self._mcp_registered = False
 
         self.messages: list[dict] = []
 
@@ -78,51 +120,213 @@ class EduAgent:
         self._skills_dir: Path = self._paths.skills_dir
         self._skill_entries = load_skill_entries(self._skills_dir)
 
+        self._session_store = session_store
+        self._context = None
+        if session_store is not None:
+            if not self.config.session_id:
+                sess = session_store.create_session(self.config.user_id)
+                self.config.session_id = sess.metadata.id
+            else:
+                existing = session_store.get_session(self.config.session_id)
+                if existing is None:
+                    raise ValueError(f"Unknown session_id: {self.config.session_id}")
+            if context_manager is not None:
+                self._context = context_manager
+            else:
+                self._context = ContextManager(
+                    session_store,
+                    ContextConfig(model_max_tokens=self._max_tokens),
+                    self._settings,
+                    model_name=self._model,
+                    summarizer=self._build_summarizer(),
+                )
+            self.messages = self._context.load_context(self.config.session_id)
+        else:
+            if not self.config.session_id:
+                self.config.session_id = uuid.uuid4().hex[:12]
+
+        self._memory_store: MemoryStore | None = None
+        self._memory_retriever: MemoryRetriever | None = None
+        self._memory_consolidator: MemoryConsolidator | None = None
+        self._memory_coordinator: MemoryCoordinator | None = None
+        self._memory_manager: EduMemoryManager | None = None
+        self._memory_config = MemoryConfig()
+        self._memory_mid_consolidate_done = False
+        self._memory_last_extracted_seq: int = 0
+        if session_store is not None and self.config.memory_enabled:
+            self._memory_store = MemoryStore(self._paths.memory_dir)
+            self._memory_retriever = MemoryRetriever(self._memory_store)
+            _extractor = MemoryExtractor(self._main_runtime, self._settings)
+            self._memory_consolidator = MemoryConsolidator(
+                self._memory_store,
+                _extractor,
+                self._settings,
+                self._memory_config,
+            )
+            self._memory_coordinator = MemoryCoordinator(
+                self._memory_retriever,
+                self._memory_config,
+                self._memory_consolidator,
+            )
+            self._memory_manager = EduMemoryManager()
+            self._memory_manager.add_provider(
+                BuiltinFilesystemMemoryProvider(self._memory_coordinator)
+            )
+            self._memory_manager.initialize_all(
+                self.config.session_id,
+                user_id=self.config.user_id,
+            )
+
         # Load learner profile and cache its summary for prompt injection.
         self._profile = load_profile(
             self.config.user_id,
             storage_dir=self._paths.profiles_dir,
+            memory_store=self._memory_store,
+            concepts_store=self._memory_store,
         )
         self._profile_summary: str = profile_summary(self._profile)
 
         # Optional event hooks — set by CLI after construction.
         self.callbacks: AgentCallbacks | None = None
 
-        # Auto-register script-backed skills as callable tools (Hermes Level-0).
-        _registered = discover_and_register(self._skill_entries)
-        if _registered:
-            logger.info("Auto-registered skill tools: %s", _registered)
+    async def _ensure_mcp_tools_registered(self) -> None:
+        """Connect MCP servers once and register dynamic tools (best-effort)."""
+        if self._mcp_registered:
+            return
+        self._mcp_registered = True
+        try:
+            from edu_agent.mcp.integration import register_mcp_servers
+
+            await register_mcp_servers(self._settings, toolset_registry)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("MCP registration skipped: %s", exc)
+
+    def _refresh_profile_cache(self) -> None:
+        self._profile = load_profile(
+            self.config.user_id,
+            storage_dir=self._paths.profiles_dir,
+            memory_store=self._memory_store,
+            concepts_store=self._memory_store,
+        )
+        self._profile_summary = profile_summary(self._profile)
+
+    def finalize_memory_session(self) -> None:
+        """Run memory consolidation for the current session (CLI exit / shutdown)."""
+        if (
+            not self.config.memory_enabled
+            or self._memory_consolidator is None
+            or self._session_store is None
+        ):
+            return
+        rows = self._session_store.list_messages(self.config.session_id, limit=50_000, offset=0)
+        if self._memory_coordinator is not None:
+            self._memory_coordinator.consolidate_session(
+                self.config.user_id,
+                self.config.session_id,
+                rows,
+                force_extract=False,
+                extract_after_seq=self._memory_last_extracted_seq,
+            )
+            if rows:
+                self._memory_last_extracted_seq = max(m.metadata.seq for m in rows)
+        if self._memory_manager is not None:
+            self._memory_manager.on_session_end([m.to_openai_dict() for m in rows])
+        self._refresh_profile_cache()
+
+    def _maybe_memory_threshold_consolidate(self) -> None:
+        if (
+            not self.config.memory_enabled
+            or self._memory_coordinator is None
+            or self._session_store is None
+            or self._memory_mid_consolidate_done
+        ):
+            return
+        rows = self._session_store.list_messages(self.config.session_id, limit=50_000, offset=0)
+        if not rows:
+            return
+        if not self._memory_coordinator.should_run_threshold_consolidate(
+            [m.to_openai_dict() for m in rows]
+        ):
+            return
+        self._memory_coordinator.consolidate_session(
+            self.config.user_id,
+            self.config.session_id,
+            rows,
+            force_extract=False,
+            extract_after_seq=self._memory_last_extracted_seq,
+        )
+        if rows:
+            self._memory_last_extracted_seq = max(m.metadata.seq for m in rows)
+        self._memory_mid_consolidate_done = True
+        self._refresh_profile_cache()
+
+    def _build_summarizer(self) -> Callable[[list[dict[str, Any]]], str | None]:
+        """LLM-based middle summarization (injected into ContextManager)."""
+
+        def _summarize(middle: list[dict[str, Any]]) -> str | None:
+            serialized = json.dumps(middle, ensure_ascii=False, default=str)
+            if len(serialized) > 120_000:
+                serialized = serialized[:120_000] + "\n...[truncated]"
+            resp = self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Summarize the conversation excerpt for another assistant that will "
+                            "continue the session. Use markdown with these sections:\n"
+                            "## Goal\n## Constraints & Preferences\n## Progress (Done / In Progress / Blocked)\n"
+                            "## Key Decisions\n## Relevant Files\n## Next Steps\n## Critical Context\n"
+                            "Do not answer the user directly — summary only."
+                        ),
+                    },
+                    {"role": "user", "content": serialized},
+                ],
+                temperature=min(self._temperature, 0.3),
+                max_tokens=min(2048, self._max_tokens),
+            )
+            msg = resp.choices[0].message
+            text = (msg.content or "").strip()
+            return text or None
+
+        return _summarize
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def run_turn(self, user_input: str) -> str:
-        """Process one user message and return the agent's final reply.
-
-        The conversation history (``self.messages``) is updated in-place so
-        subsequent calls continue the same session.
-
-        Args:
-            user_input: Raw text from the user.
-
-        Returns:
-            The agent's final text response for this turn.
-        """
+    async def run_turn(self, user_input: str) -> str:
+        """Process one user message and return the agent's final reply (async A4)."""
+        _cid = (self.config.course_id or "").strip()
         ctx = TurnRuntimeContext(
             settings=self._settings,
             paths=self._paths,
             provider_runtime=self._main_runtime,
             user_id=self.config.user_id,
             session_id=self.config.session_id,
+            memory_enabled=bool(self.config.memory_enabled and self._memory_store is not None),
+            memory_store=self._memory_store,
+            memory_retriever=self._memory_retriever,
+            tool_runtime=self._tool_runtime,
+            permission_checker=self._permissions,
+            course_id=_cid or None,
         )
         token = set_current_runtime(ctx)
         try:
-            return self._run_turn_inner(user_input)
+            return await self._run_turn_inner(user_input)
         finally:
             reset_current_runtime(token)
 
-    def _run_turn_inner(self, user_input: str) -> str:
+    async def _run_turn_inner(self, user_input: str) -> str:
+        await self._ensure_mcp_tools_registered()
+
+        if self._session_store is not None:
+            sess = self._session_store.get_session(self.config.session_id)
+            if sess is not None and sess.metadata.status == SessionStatus.ARCHIVED:
+                raise SessionArchivedError(
+                    f"Session {self.config.session_id} is archived (read-only)."
+                )
+
         # --- Input safety gate ---
         input_check = check_input(user_input)
         if not input_check.safe:
@@ -136,16 +340,53 @@ class EduAgent:
             self.messages.append(asst_msg)
             self._persist_message(user_msg)
             self._persist_message(asst_msg)
+            self._maybe_compress()
             return block_msg
 
         user_msg = {"role": "user", "content": user_input}
         self.messages.append(user_msg)
         self._persist_message(user_msg)
+
+        if self._context is not None:
+            cfg = self._context.config
+            if cfg.gateway_hygiene_enabled:
+                rough = estimate_messages_tokens_rough(self.messages)
+                cap = max(256, int(cfg.model_max_tokens * cfg.gateway_hygiene_ratio))
+                if rough >= cap:
+                    logger.warning(
+                        "Gateway hygiene: rough token estimate %s >= %s%% of model_max (%s); "
+                        "attempting early compaction",
+                        rough,
+                        int(cfg.gateway_hygiene_ratio * 100),
+                        cfg.model_max_tokens,
+                    )
+                    self._apply_context_compression(force=True)
+
+        memory_context = ""
+        memory_injection_used = False
+        if (
+            self.config.memory_enabled
+            and self.config.memory_inject_into_prompt
+            and self._memory_manager is not None
+        ):
+            try:
+                memory_context = self._memory_manager.prefetch_all(
+                    user_input.strip()[:2000],
+                    session_id=self.config.session_id,
+                ).strip()
+                memory_injection_used = bool(memory_context)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Memory prompt injection skipped: %s", exc)
+
+        _disabled = frozenset(self.config.disabled_tools)
+        _specs = toolset_registry.list_specs(self._settings, disabled_names=_disabled)
+        _openai_tools = tool_specs_to_openai_tools(_specs)
         system_prompt = build_system_prompt(
             skills_dir=self._skills_dir,
             learner_profile_summary=self._profile_summary,
-            available_tools={s["function"]["name"] for s in TOOL_SCHEMAS},
+            available_tools={s.name for s in _specs},
             skill_entries=self._skill_entries,
+            memory_context=memory_context,
         )
 
         for iteration in range(1, self.config.max_iterations + 1):
@@ -153,12 +394,15 @@ class EduAgent:
 
             self._safe_cb(self.callbacks and self.callbacks.on_thinking_start)
 
-            content, finish_reason, tool_calls = self._llm_call(
+            content, finish_reason, tool_calls, usage = self._llm_call(
                 system_prompt=system_prompt,
+                openai_tools=_openai_tools,
             )
+            if self._context is not None and usage[0] is not None:
+                self._context.update_from_llm_usage(usage[0], usage[1])
 
             if finish_reason == "tool_calls" or tool_calls:
-                self._handle_tool_calls_from_stream(tool_calls)
+                await self._handle_tool_calls_from_stream(tool_calls, _disabled)
                 continue  # next LLM call with tool results appended
 
             # --- Final answer ---
@@ -169,24 +413,85 @@ class EduAgent:
                     "Output blocked [%s]", output_check.categories
                 )
                 content = "抱歉，我无法提供相关内容。请换一个学习问题来问我。"
+            elif self.config.memory_inject_into_prompt:
+                content = sanitize_completed_assistant_output(
+                    content,
+                    memory_injection_used=memory_injection_used,
+                )
 
             asst_msg = {"role": "assistant", "content": content}
             self.messages.append(asst_msg)
             self._persist_message(asst_msg)
             logger.debug("Agent replied after %d iteration(s)", iteration)
+            self._maybe_compress()
+            self._maybe_memory_threshold_consolidate()
             return content
 
         # Iteration budget exhausted
         budget_msg = "抱歉，当前问题需要更多推理步骤。请尝试将问题拆分为更小的部分重新提问。"
+        if self.config.memory_inject_into_prompt:
+            budget_msg = sanitize_completed_assistant_output(
+                budget_msg,
+                memory_injection_used=memory_injection_used,
+            )
         asst_msg = {"role": "assistant", "content": budget_msg}
         self.messages.append(asst_msg)
         self._persist_message(asst_msg)
+        self._maybe_compress()
+        self._maybe_memory_threshold_consolidate()
         return budget_msg
 
     def reset(self) -> None:
-        """Clear conversation history while keeping the same session config."""
+        """Clear conversation history; with a session store, start a new session row."""
         self.messages = []
-        logger.debug("Conversation history cleared for session %s", self.config.session_id)
+        self._memory_mid_consolidate_done = False
+        self._memory_last_extracted_seq = 0
+        if self._session_store is not None and self._context is not None:
+            sess = self._session_store.create_session(self.config.user_id)
+            self.config.session_id = sess.metadata.id
+        if self._memory_manager is not None:
+            self._memory_manager.initialize_all(
+                self.config.session_id,
+                user_id=self.config.user_id,
+            )
+        logger.debug("Conversation history cleared; session_id=%s", self.config.session_id)
+
+    @property
+    def has_context_manager(self) -> bool:
+        return self._context is not None
+
+    @property
+    def context_compression_active(self) -> bool:
+        """True when session-backed context compression can run (manager present and enabled)."""
+        return bool(self._context and self._context.config.compression_enabled)
+
+    def trigger_context_compress(self) -> None:
+        """User-initiated context compaction (e.g. CLI ``/compress-context``)."""
+        self._apply_context_compression(force=True)
+
+    def _maybe_compress(self) -> None:
+        self._apply_context_compression(force=False)
+
+    def _apply_context_compression(self, *, force: bool) -> None:
+        if self._context is None:
+            return
+        try:
+            self._context.check_and_compress(self.config.session_id, force=force)
+            self.messages = self._context.load_context(self.config.session_id)
+        except ContextOverflowError as exc:
+            logger.error("Context compaction could not fit model limit: %s", exc)
+            try:
+                self._context.record_compaction_failure(self.config.session_id, str(exc))
+                self.messages = self._context.load_context(self.config.session_id)
+            except Exception as persist_exc:  # noqa: BLE001
+                logger.exception("Failed to persist compaction failure notice: %s", persist_exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("check_and_compress failed: %s", exc)
+            try:
+                self._context.record_compaction_failure(self.config.session_id, str(exc))
+                self.messages = self._context.load_context(self.config.session_id)
+            except Exception as persist_exc:  # noqa: BLE001
+                logger.exception("Failed to persist compaction failure notice: %s", persist_exc)
 
     def reload_skills(self) -> None:
         """Invalidate the in-memory skill file cache.
@@ -216,7 +521,9 @@ class EduAgent:
     def _llm_call(
         self,
         system_prompt: str,
-    ) -> tuple[str, str | None, list[dict]]:
+        *,
+        openai_tools: list[dict],
+    ) -> tuple[str, str | None, list[dict], tuple[int | None, int | None]]:
         """Unified LLM call — streaming when ``callbacks.on_text_chunk`` is set.
 
         Returns
@@ -224,6 +531,9 @@ class EduAgent:
         (content, finish_reason, tool_calls)
             ``tool_calls`` is a list of plain dicts with keys
             ``{id, name, arguments}`` ready for ``_handle_tool_calls_from_stream``.
+
+        The fourth tuple element is ``(prompt_tokens, completion_tokens)`` from the
+        API when available (streaming responses often omit usage).
         """
         cb = self.callbacks
         use_stream = cb is not None and cb.on_text_chunk is not None
@@ -238,7 +548,7 @@ class EduAgent:
             response = self._client.chat.completions.create(
                 model=self._model,
                 messages=api_messages,
-                tools=cast(list[Any], TOOL_SCHEMAS),
+                tools=cast(list[Any], openai_tools),
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
             )
@@ -253,13 +563,16 @@ class EduAgent:
                         "arguments": tc.function.arguments,
                         "_tc_obj": tc,  # keep original for model_dump
                     })
-            return msg.content or "", choice.finish_reason, tool_calls_raw
+            usage = getattr(response, "usage", None)
+            pt = getattr(usage, "prompt_tokens", None) if usage else None
+            ct = getattr(usage, "completion_tokens", None) if usage else None
+            return msg.content or "", choice.finish_reason, tool_calls_raw, (pt, ct)
 
         # ── Streaming path ────────────────────────────────────────────────
         stream = self._client.chat.completions.create(
             model=self._model,
             messages=api_messages,
-            tools=cast(list[Any], TOOL_SCHEMAS),
+            tools=cast(list[Any], openai_tools),
             temperature=self._temperature,
             max_tokens=self._max_tokens,
             stream=True,
@@ -306,23 +619,23 @@ class EduAgent:
             self._safe_cb(cb.on_thinking_end)
 
         tool_calls_list = [tc_acc[i] for i in sorted(tc_acc)]
-        return "".join(content_parts), finish_reason, tool_calls_list
+        return "".join(content_parts), finish_reason, tool_calls_list, (None, None)
 
     def _persist_message(self, message: dict) -> None:
-        """Persist a single OpenAI-compatible message to the session JSONL."""
+        """Persist a single OpenAI-compatible message (SQLite when store is configured)."""
+        if self._context is None:
+            return
         try:
-            append_message(
-                session_id=self.config.session_id,
-                user_id=self.config.user_id,
-                message=message,
-                storage_dir=self._paths.sessions_dir,
-            )
+            self._context.add_message(self.config.session_id, message)
+        except SessionArchivedError:
+            logger.error("Cannot persist to archived session %s", self.config.session_id)
         except OSError as exc:
             logger.error("Failed to persist message: %s", exc)
 
-    def _handle_tool_calls_from_stream(
+    async def _handle_tool_calls_from_stream(
         self,
         tool_calls: list[dict],
+        disabled_names: frozenset[str],
     ) -> None:
         """Execute tool calls collected from streaming/non-streaming response.
 
@@ -357,9 +670,15 @@ class EduAgent:
             logger.info("Calling tool: %s(%s)", tool_name, args)
 
             t0 = time.monotonic()
-            result_content: str = _registry.dispatch(tool_name, args)
+            ctx_rt = get_current_runtime()
+            result_content, tr = await self._tool_runtime.execute(
+                tool_name,
+                args,
+                ctx_rt,
+                disabled_names=disabled_names,
+            )
             duration = time.monotonic() - t0
-            result_success = '"error"' not in result_content
+            result_success = tr.success
 
             logger.info(
                 "Tool %s → success=%s, content_len=%d",

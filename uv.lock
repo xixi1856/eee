@@ -2808,6 +2808,19 @@ wheels = [
 ]
 
 [[package]]
+name = "pytest-asyncio"
+version = "1.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pytest" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/90/2c/8af215c0f776415f3590cac4f9086ccefd6fd463befeae41cd4d3f193e5a/pytest_asyncio-1.3.0.tar.gz", hash = "sha256:d7f52f36d231b80ee124cd216ffb19369aa168fc10095013c6b014a34d3ee9e5", size = 50087, upload-time = "2025-11-10T16:07:47.256Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e5/35/f8b19922b6a25bc0880171a2f1a003eaeb93657475193ab516fd87cac9da/pytest_asyncio-1.3.0-py3-none-any.whl", hash = "sha256:611e26147c7f77640e6d0a92a38ed17c3e9848063698d5c93d5aa7aa11cebff5", size = 15075, upload-time = "2025-11-10T16:07:45.537Z" },
+]
+
+[[package]]
 name = "pytest-mock"
 version = "3.15.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2956,13 +2969,18 @@ dependencies = [
     { name = "click" },
     { name = "httpx" },
     { name = "huggingface-hub", extra = ["hf-xet"] },
+    { name = "jsonschema" },
     { name = "loguru" },
     { name = "mineru" },
     { name = "openai" },
+    { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "pytest-asyncio" },
     { name = "pytest-timeout" },
     { name = "python-dotenv" },
+    { name = "pyyaml" },
     { name = "raganything", extra = ["all"] },
+    { name = "tiktoken" },
     { name = "wikipedia" },
     { name = "wikipedia-api" },
     { name = "wikipedia-mcp" },
@@ -2971,6 +2989,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
+    { name = "pytest-asyncio" },
     { name = "pytest-mock" },
 ]
 
@@ -2980,13 +2999,18 @@ requires-dist = [
     { name = "click", specifier = ">=8.1.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "huggingface-hub", extras = ["hf-xet"], specifier = ">=0.36.2" },
+    { name = "jsonschema", specifier = ">=4.0.0" },
     { name = "loguru", specifier = ">=0.7.0" },
     { name = "mineru", specifier = ">=3.0.0" },
     { name = "openai", specifier = ">=1.0.0" },
+    { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pydantic-settings", specifier = ">=2.0.0" },
+    { name = "pytest-asyncio", specifier = ">=1.3.0" },
     { name = "pytest-timeout", specifier = ">=2.4.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
+    { name = "pyyaml", specifier = ">=6.0.0" },
     { name = "raganything", extras = ["all"], specifier = ">=0.1.0" },
+    { name = "tiktoken", specifier = ">=0.7.0" },
     { name = "wikipedia", specifier = ">=1.4.0" },
     { name = "wikipedia-api", specifier = ">=0.14.1" },
     { name = "wikipedia-mcp", git = "https://github.com/rudra-ravi/wikipedia-mcp.git" },
@@ -2995,6 +3019,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "pytest", specifier = ">=8.0.0" },
+    { name = "pytest-asyncio", specifier = ">=0.24.0" },
     { name = "pytest-mock", specifier = ">=3.14.0" },
 ]
 

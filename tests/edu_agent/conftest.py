@@ -12,11 +12,15 @@ from edu_agent.config import (
     ProviderCredentials,
     ProvidersSettings,
     RuntimeSettings,
+    ToolPermissionPolicy,
     ToolsSettings,
 )
 from edu_agent.paths import build_paths
 from edu_agent.providers.runtime import resolve_provider_runtime
 from edu_agent.runtime_context import TurnRuntimeContext, reset_current_runtime, set_current_runtime
+from edu_agent.toolsets import ToolRuntime
+from edu_agent.toolsets.permissions import PermissionChecker, permissive_permission_policy
+from edu_agent.toolsets.registry import toolset_registry
 
 
 @pytest.fixture()
@@ -44,7 +48,14 @@ def minimal_edu_settings(tmp_path: Path) -> EduSettings:
                 ),
             },
         ),
-        tools=ToolsSettings(),
+        tools=ToolsSettings(
+            permission_policy=ToolPermissionPolicy(
+                allow_network=True,
+                allow_write=True,
+                allow_execute=True,
+                allow_external=True,
+            ),
+        ),
         runtime=RuntimeSettings(),
     )
 
@@ -54,12 +65,22 @@ def with_turn_runtime(minimal_edu_settings: EduSettings):
     """Set ContextVar so execute_tool can call handlers that use get_current_runtime()."""
     paths = build_paths(minimal_edu_settings)
     pr = resolve_provider_runtime(minimal_edu_settings, None, "main")
+    tool_rt = ToolRuntime(
+        toolset_registry,
+        minimal_edu_settings,
+        PermissionChecker(
+            permissive_permission_policy(),
+            approve_all=True,
+            interactive=False,
+        ),
+    )
     ctx = TurnRuntimeContext(
         settings=minimal_edu_settings,
         paths=paths,
         provider_runtime=pr,
         user_id="test",
         session_id="test-session",
+        tool_runtime=tool_rt,
     )
     tok = set_current_runtime(ctx)
     yield

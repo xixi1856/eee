@@ -89,6 +89,7 @@ def build_system_prompt(
     learner_profile_summary: str = "",
     available_tools: set[str] | None = None,
     skill_entries: list[SkillEntry] | None = None,
+    memory_context: str = "",
 ) -> str:
     """Assemble and return the full system prompt string.
 
@@ -99,6 +100,8 @@ def build_system_prompt(
         available_tools: Set of tool names currently registered. Skills whose
             ``requires_tools`` lists a tool not in this set are excluded from
             the index (Hermes-style gating). Pass ``None`` to skip filtering.
+        memory_context: Optional short block of retrieved long-term memory
+            (only injected when the caller enables memory prompt injection).
     """
     entries = skill_entries if skill_entries is not None else load_skill_entries(skills_dir)
 
@@ -137,6 +140,9 @@ def build_system_prompt(
         sections.append(
             f"## 学习者当前状态\n{learner_profile_summary.strip()}"
         )
+
+    if memory_context.strip():
+        sections.append(f"## 相关长期记忆（检索注入）\n{memory_context.strip()}")
 
     # 4. Safety block
     sections.append(_SAFETY_BLOCK)

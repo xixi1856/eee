@@ -119,7 +119,22 @@ uv sync
 uv run edu chat
 ```
 
-常用选项：`--user`、`--skills`（技能目录）、`--max-iter`。用户数据路径（会话、画像、缓存等）由 `agent.workspace` 与 [`EduPaths`](src/edu_agent/paths.py) 推导，勿在业务代码中硬编码 `session_logs` 等目录名。
+常用选项：`--user`、`--skills`（技能目录）、`--max-iter`。用户数据路径（会话、画像、缓存等）由 `agent.workspace` 与 [`EduPaths`](src/edu_agent/paths.py) 推导。
+
+### 长期记忆（A3）
+
+- 数据落在工作区 **`memory/`** 下（`facts/` JSONL、`concepts/`、`profiles/`，按用户隔离）。设计说明见 [`docs/phase3.md`](docs/phase3.md)（文末有与 [Hermes-agent](https://github.com/NousResearch/hermes-agent) 记忆分层的简要对照）；与 Hermes `MemoryManager` / `MemoryProvider` 的 API 与能力矩阵见 [`review_docs/hermes_memory_gap.md`](review_docs/hermes_memory_gap.md)。
+- **运行时编排**：`MemoryCoordinator` 统一做检索上下文与阈值协整判断；`EduMemoryManager` 与内置的 `BuiltinFilesystemMemoryProvider` 在每轮对话前执行 `prefetch`（与 Hermes 的「单入口 + 至多一个外部槽位」心智一致；记忆类工具仍由 `src/edu_agent/tools/memory.py` 全局注册）。若开启向系统提示注入记忆片段，会对**非流式**完成后的助手正文做一次轻量清理，减轻模型回声复述注入标题的风险。
+- **关闭记忆**：`uv run edu chat --disable-memory`（不提取、不协整、不注册记忆类工具）。
+- **查看画像**：`uv run edu show-profile [--user default]`。
+
+### 会话存储与恢复（SQLite）
+
+- 会话数据仅存工作区根目录下的 **`sessions.db`**（结构化 Session / Message / ToolCall）。
+- **恢复会话**：`uv run edu chat --session-id <uuid>`（会话 ID 在启动时打印；也可通过下列命令查看）。
+- **列出最近会话**：`uv run edu list-sessions [--user default] [--limit 20]`。
+- **清理旧会话**：`uv run edu cleanup-sessions --before 2025-01-01T00:00:00`（可加 `--archived-only`、`--yes` 跳过确认）。
+- 超长对话会在超过上下文预算时由 `ContextManager` **自动**触发**压缩**（保留尾部若干轮与工具链；摘要失败时使用显式占位说明，见 `docs/phase2.md`）。在交互式 `edu chat` 中也可输入 **`/compress-context`** 或 **`/ctx-compress`** 手动触发一次压缩（调用 `EduAgent.trigger_context_compress()`，跳过「是否超阈值」判断，与网关卫生强制压缩同源；不影响长期记忆的阈值/退出协整）。
 
 ---
 
@@ -132,7 +147,7 @@ uv run edu chat
 │   ├── llm.py         # Qwen LLM / Vision LLM / Embedding 函数
 │   ├── engine.py      # RAGAnything 初始化与 ingest/query 封装
 │   └── cli.py         # Click CLI 入口
-├── src/edu_agent/     # 教学 Agent（独立 edu_agent.yaml + providers 注册表）
+├── src/edu_agent/     # 教学 Agent（edu_agent.yaml；memory/ 含 coordinator、manager、provider 等 A3 编排）
 ├── edu_agent.yaml.example  # EduAgent 配置模板
 ├── data/input/        # 放待处理文档（不提交到 git）
 ├── output/parsed/     # MinerU 解析输出（Markdown + JSON）

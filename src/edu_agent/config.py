@@ -8,6 +8,38 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
+class ToolsetToggle(BaseModel):
+    enabled: bool = True
+
+
+class ToolsetsSettings(BaseModel):
+    """YAML `toolsets:` block — keys are toolset ids; values are bool or {enabled: bool}."""
+
+    entries: dict[str, ToolsetToggle] = Field(default_factory=dict)
+
+    @classmethod
+    def from_raw(cls, raw: Any) -> ToolsetsSettings:
+        if not isinstance(raw, dict):
+            return cls()
+        entries: dict[str, ToolsetToggle] = {}
+        for k, v in raw.items():
+            key = str(k).lower()
+            if isinstance(v, bool):
+                entries[key] = ToolsetToggle(enabled=v)
+            elif isinstance(v, dict):
+                entries[key] = ToolsetToggle(enabled=bool(v.get("enabled", True)))
+            else:
+                entries[key] = ToolsetToggle(enabled=True)
+        return cls(entries=entries)
+
+    def is_toolset_enabled(self, toolset: str) -> bool:
+        tid = toolset.lower()
+        ent = self.entries.get(tid)
+        if ent is None:
+            return True
+        return ent.enabled
+
+
 class AgentDefaults(BaseModel):
     """Default agent behaviour and workspace layout (global defaults)."""
 
@@ -18,6 +50,7 @@ class AgentDefaults(BaseModel):
     max_tokens: int = 4096
     max_iterations: int = 20
     skills_dir: str = "skills"
+    tool_timeout_sec: float = 120.0
 
 
 class ProviderCredentials(BaseModel):
@@ -34,6 +67,20 @@ class ProvidersSettings(BaseModel):
     entries: dict[str, ProviderCredentials] = Field(default_factory=dict)
 
 
+class ToolPermissionPolicy(BaseModel):
+    """Process-wide caps for tool permission *classes* (independent of ``--approve-all``).
+
+    ``--approve-all`` only skips ``approval_required`` prompts; these flags (or an
+    interactive session grant) are required for NETWORK / WRITE / EXECUTE / EXTERNAL
+    when set to False.
+    """
+
+    allow_network: bool = False
+    allow_write: bool = False
+    allow_execute: bool = False
+    allow_external: bool = False
+
+
 class ToolsSettings(BaseModel):
     """Tool-related configuration (search, eval aux, MCP placeholders)."""
 
@@ -43,6 +90,7 @@ class ToolsSettings(BaseModel):
     # A4 placeholders — keep keys so schema stays stable
     mcp_servers: list[dict[str, Any]] = Field(default_factory=list)
     evaluation: dict[str, Any] = Field(default_factory=dict)
+    permission_policy: ToolPermissionPolicy = Field(default_factory=ToolPermissionPolicy)
 
 
 class RuntimeSettings(BaseModel):
@@ -63,3 +111,4 @@ class EduSettings(BaseModel):
     providers: ProvidersSettings = Field(default_factory=ProvidersSettings)
     tools: ToolsSettings = Field(default_factory=ToolsSettings)
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
+    toolsets: ToolsetsSettings = Field(default_factory=ToolsetsSettings)

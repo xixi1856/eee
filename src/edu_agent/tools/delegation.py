@@ -1,20 +1,17 @@
-"""Sub-agent delegation tool.
-
-Toolset: delegation
-Tools: delegate_task
-"""
+"""Sub-agent delegation tool (A4 async)."""
 
 from __future__ import annotations
 
 import logging
 
-from edu_agent.registry import registry, tool_result, tool_error
+from edu_agent.runtime_context import get_current_runtime
+from edu_agent.subagent import SubAgent
+from edu_agent.tool_payloads import tool_error
+from edu_agent.toolsets.models import ToolPermission, ToolSpec
+from edu_agent.toolsets.registry import toolset_registry
+from edu_agent.types import SubAgentConfig, ToolResult
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Schema
-# ---------------------------------------------------------------------------
 
 SCHEMA = {
     "name": "delegate_task",
@@ -48,20 +45,12 @@ SCHEMA = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Handler
-# ---------------------------------------------------------------------------
-
-def _handle_delegate_task(args: dict, **kw) -> str:
+async def _handle_delegate_task(args: dict) -> str:
     task = args.get("task", "")
     if not task:
         return tool_error("缺少必要参数：task")
     allowed_tools: list[str] = list(args.get("allowed_tools") or [])
     max_iterations = max(1, min(int(args.get("max_iterations", 5)), 10))
-
-    from edu_agent.runtime_context import get_current_runtime
-    from edu_agent.subagent import SubAgent
-    from edu_agent.types import SubAgentConfig
 
     cfg = SubAgentConfig(
         task=task,
@@ -69,23 +58,33 @@ def _handle_delegate_task(args: dict, **kw) -> str:
         max_iterations=max_iterations,
     )
     try:
-        result = SubAgent(settings=get_current_runtime().settings).run(cfg)
+        result = await SubAgent(settings=get_current_runtime().settings).arun(cfg)
         if result.success:
-            return tool_result(result.summary, payload=result.payload)
-        return tool_error(result.error or "子 Agent 执行失败")
+            return ToolResult(
+                tool_name=SCHEMA["name"],
+                success=True,
+                summary=result.summary,
+                payload=result.payload,
+            )
+        return ToolResult(
+            tool_name=SCHEMA["name"],
+            success=False,
+            summary="",
+            error=result.error or "子 Agent 执行失败",
+        )
     except Exception as exc:
         logger.error("delegate_task failed: %s", exc)
         return tool_error(str(exc))
 
 
-# ---------------------------------------------------------------------------
-# Registration
-# ---------------------------------------------------------------------------
-
-registry.register(
-    name="delegate_task",
-    schema=SCHEMA,
-    handler=_handle_delegate_task,
-    toolset="delegation",
-    emoji="🤖",
+toolset_registry.register(
+    ToolSpec(
+        name=SCHEMA["name"],
+        description=SCHEMA["description"],
+        input_schema=SCHEMA["parameters"],
+        handler=_handle_delegate_task,
+        toolset="delegation",
+        permissions=[ToolPermission.EXTERNAL],
+        emoji="🤖",
+    )
 )

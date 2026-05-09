@@ -87,6 +87,42 @@ class SessionStore:
         self._execute_write(_ins)
         return Session(metadata=meta, messages=[])
 
+    def get_or_create_session_by_id(self, session_id: str, user_id: str) -> Session:
+        """Return an active session row for a stable id (e.g. ``wx_ilink_<ilink_user_id>``)."""
+        existing = self.get_session(session_id)
+        if existing is not None:
+            if existing.metadata.user_id != user_id:
+                logger.warning(
+                    "session id=%s stored user_id=%s differs from inbound user_id=%s",
+                    session_id,
+                    existing.metadata.user_id,
+                    user_id,
+                )
+            return existing
+        now = utcnow().isoformat()
+        meta = SessionMetadata(
+            id=session_id,
+            user_id=user_id,
+            status=SessionStatus.ACTIVE,
+            created_at=utcnow(),
+            updated_at=utcnow(),
+            archived_at=None,
+            title=None,
+        )
+
+        def _ins():
+            self._conn.execute(
+                """
+                INSERT INTO sessions (id, user_id, status, created_at, updated_at, archived_at, title)
+                VALUES (?, ?, ?, ?, ?, NULL, NULL)
+                """,
+                (session_id, user_id, SessionStatus.ACTIVE.value, now, now),
+            )
+            self._conn.commit()
+
+        self._execute_write(_ins)
+        return Session(metadata=meta, messages=[])
+
     def get_session(self, session_id: str) -> Session | None:
         cur = self._conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,))
         row = cur.fetchone()

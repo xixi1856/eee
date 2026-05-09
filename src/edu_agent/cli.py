@@ -17,8 +17,14 @@ import time
 import click
 
 from edu_agent.agent import EduAgent
+from edu_agent.auth.checker import AuthorizationChecker
+from edu_agent.channels import CLIChannelAdapter
+from edu_agent.channels.weixin import run_weixin_qr_login
 from edu_agent.config_loader import load_settings
+from edu_agent.context.manager import ContextManager
+from edu_agent.context.models import ContextConfig
 from edu_agent.paths import build_paths
+from edu_agent.runner.gateway import Gateway
 from edu_agent.sessions.store import SessionStore
 from edu_agent.toolsets.registry import toolset_registry
 from edu_agent.types import AgentCallbacks, AgentConfig
@@ -311,6 +317,12 @@ def cli(debug: bool) -> None:
     show_default=False,
     help="Optional course id for knowledge_query routing (session context).",
 )
+@click.option(
+    "--gateway-mode",
+    is_flag=True,
+    default=False,
+    help="Label Gateway E2E path (same stack as default; for CI and documentation).",
+)
 def chat(
     user: str,
     skills: str,
@@ -326,8 +338,9 @@ def chat(
     allow_execute: bool,
     allow_external: bool,
     course_id: str,
+    gateway_mode: bool,
 ) -> None:
-    """Start an interactive chat session with the educational agent."""
+    """Start an interactive chat session (CLI → Gateway → SessionRunner → Agent)."""
     settings = load_settings()
     config = AgentConfig(
         user_id=user,
@@ -346,11 +359,36 @@ def chat(
     paths = build_paths(settings, skills_dir=skills)
     store = SessionStore(paths.sessions_db)
     try:
-        agent = EduAgent(config, settings=settings, session_store=store)
+        seed = EduAgent(config, settings=settings, session_store=store)
     except ValueError as exc:
         store.close()
         click.echo(click.style(f"[错误] {exc}", fg="red"), err=True)
         raise SystemExit(1) from exc
+
+    context_manager = ContextManager(
+        store,
+        ContextConfig(model_max_tokens=seed._max_tokens),
+        settings,
+        model_name=seed._model,
+        summarizer=seed._build_summarizer(),
+    )
+    del seed
+
+    gw_raw = settings.runtime.gateway or {}
+    gateway = Gateway(
+        settings=settings,
+        session_store=store,
+        context_manager=context_manager,
+        auth_checker=AuthorizationChecker(
+            expected_api_key=str(gw_raw.get("api_key") or "").strip() or None
+        ),
+        queue_maxsize=int(gw_raw.get("queue_maxsize", 100)),
+        outbound_queue_maxsize=int(gw_raw.get("outbound_queue_maxsize", 256)),
+        runner_idle_timeout_sec=float(gw_raw.get("runner_idle_timeout_sec", 1800.0)),
+        max_runners=int(gw_raw.get("max_runners", 256)),
+        require_http_key=bool(gw_raw.get("require_http_key", False)),
+    )
+    adapter = CLIChannelAdapter(gateway)
     mode_state: list[str] = [progress]
 
     if enable_cron:
@@ -359,26 +397,35 @@ def chat(
         _daemon.start()
         click.echo(click.style("[CronDaemon 已启动]", dim=True))
 
-    click.echo(
-        click.style(
-            "EduAgent 已启动。/quit 或 /exit 退出；/reset 清空对话；/verbose 切换进度；"
-            "/compress-context（或 /ctx-compress）手动压缩会话上下文。",
-            fg="green",
-        )
-    )
-    click.echo(click.style(f"会话 ID: {config.session_id}  进度模式: {mode_state[0]}", dim=True))
+    click.echo(click.style(f"进度模式: {mode_state[0]}", dim=True))
 
     try:
-        asyncio.run(_chat_async_loop(agent, mode_state))
+
+        async def _run() -> None:
+            await adapter.start()
+            try:
+
+                def _on_verbose() -> None:
+                    mode_state[0] = _NEXT_MODE[mode_state[0]]
+                    click.echo(click.style(f"[进度模式已切换为: {mode_state[0]}]", dim=True))
+
+                await adapter.run_chat_loop(
+                    user_id=user,
+                    initial_session_id=config.session_id,
+                    get_progress_mode=lambda: mode_state[0],
+                    on_mode_cycle=_on_verbose,
+                    gateway_mode_label=gateway_mode,
+                )
+            finally:
+                await adapter.stop()
+                try:
+                    await _shutdown_mcp_async()
+                except Exception:
+                    pass
+                await gateway.stop()
+
+        asyncio.run(_run())
     finally:
-        try:
-            asyncio.run(_shutdown_mcp_async())
-        except RuntimeError:
-            pass
-        try:
-            agent.finalize_memory_session()
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("finalize_memory_session: %s", exc)
         store.close()
 
 
@@ -388,65 +435,45 @@ async def _shutdown_mcp_async() -> None:
     await shutdown_mcp_servers()
 
 
-async def _chat_async_loop(agent: EduAgent, mode_state: list[str]) -> None:
-    while True:
-        try:
-            user_input = click.prompt(click.style("你", fg="cyan"), prompt_suffix=" > ")
-        except (EOFError, KeyboardInterrupt):
-            click.echo("\n再见！")
-            break
+@cli.group()
+def channels() -> None:
+    """External chat channels (WeChat personal via ilinkai — nanobot-style QR login)."""
+    pass
 
-        stripped = user_input.strip()
-        if not stripped:
-            continue
 
-        if stripped in ("/quit", "/exit", "quit", "exit"):
-            click.echo("再见！")
-            break
+@channels.command("login")
+@click.argument("name", type=click.Choice(["weixin"], case_sensitive=False))
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Delete saved token and scan QR again.",
+)
+def channels_login(name: str, force: bool) -> None:
+    """Save WeChat bot token (QR scan). Same flow as ``nanobot channels login weixin``."""
+    _ = name
+    settings = load_settings()
+    paths = build_paths(settings)
 
-        if stripped == "/reset":
-            agent.reset()
-            click.echo(click.style("[对话历史已清空]", dim=True))
-            continue
+    async def _run() -> bool:
+        return await run_weixin_qr_login(settings=settings, paths=paths, force=force)
 
-        if stripped == "/verbose":
-            mode_state[0] = _NEXT_MODE[mode_state[0]]
-            click.echo(click.style(f"[进度模式已切换为: {mode_state[0]}]", dim=True))
-            continue
-
-        if stripped in ("/compress-context", "/ctx-compress"):
-            if not agent.has_context_manager:
-                click.echo(
-                    click.style("[未启用会话存储，无法压缩上下文]", dim=True),
-                    err=True,
-                )
-                continue
-            if not agent.context_compression_active:
-                click.echo(click.style("[上下文压缩已在配置中关闭]", dim=True))
-                continue
-            try:
-                agent.trigger_context_compress()
-                click.echo(click.style("[上下文压缩已完成]", dim=True))
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Context compress failed: %s", exc)
-                click.echo(click.style(f"[上下文压缩失败] {exc}", fg="red"), err=True)
-            continue
-
-        cbs = build_callbacks(mode_state[0])
-        agent.callbacks = cbs
-
-        try:
-            reply = await agent.run_turn(stripped)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Agent error: %s", exc)
-            click.echo(click.style(f"[错误] {exc}", fg="red"), err=True)
-            continue
-
-        if cbs.on_text_chunk is not None and cbs.was_streamed and cbs.was_streamed():
-            click.echo()
-        else:
-            click.echo(click.style("助手", fg="yellow") + " > " + reply)
-        click.echo()
+    try:
+        ok = asyncio.run(_run())
+    except KeyboardInterrupt:
+        click.echo(click.style("Cancelled.", fg="yellow"))
+        raise SystemExit(1) from None
+    if ok:
+        click.echo(
+            click.style(
+                "WeChat token saved under workspace .edu_agent/weixin/account.json. "
+                "Set runtime.channels.weixin.enabled: true and start edu-gateway.",
+                fg="green",
+            )
+        )
+    else:
+        click.echo(click.style("WeChat login failed.", fg="red"))
+        raise SystemExit(1)
 
 
 @cli.command("show-profile")

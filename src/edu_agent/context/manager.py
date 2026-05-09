@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from edu_agent.config import EduSettings
@@ -23,6 +25,15 @@ from edu_agent.sessions.store import SessionStore
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class _SessionTurnState:
+    """Per-session token budget + summarizer cache (safe under multi-session Gateway)."""
+
+    engine: TokenBudgetEngine
+    summary_cooldown_until: float = 0.0
+    previous_summary_text: str = ""
+
+
 class ContextManager:
     def __init__(
         self,
@@ -38,24 +49,32 @@ class ContextManager:
         self._settings = settings
         self._model_name = model_name
         self._summarizer = summarizer
-        self._engine = TokenBudgetEngine(config)
-        self._summary_cooldown_until = 0.0
-        self._previous_summary_text: str = ""
+        self._turn_by_session: dict[str, _SessionTurnState] = {}
+        self._turn_state_lock = threading.Lock()
+
+    def _turn_state(self, session_id: str) -> _SessionTurnState:
+        with self._turn_state_lock:
+            st = self._turn_by_session.get(session_id)
+            if st is None:
+                st = _SessionTurnState(engine=TokenBudgetEngine(self._config))
+                self._turn_by_session[session_id] = st
+            return st
 
     @property
     def config(self) -> ContextConfig:
         return self._config
 
-    @property
-    def engine(self) -> TokenBudgetEngine:
-        return self._engine
+    def engine_for_session(self, session_id: str) -> TokenBudgetEngine:
+        """Token budget engine for *session_id* (distinct per session when multiple runners exist)."""
+        return self._turn_state(session_id).engine
 
     def update_from_llm_usage(
         self,
+        session_id: str,
         prompt_tokens: int | None,
         completion_tokens: int | None = None,
     ) -> None:
-        self._engine.update_from_llm_usage(prompt_tokens, completion_tokens)
+        self._turn_state(session_id).engine.update_from_llm_usage(prompt_tokens, completion_tokens)
 
     def load_context(self, session_id: str) -> list[dict[str, Any]]:
         rows = self._store.list_messages(session_id, limit=50_000, offset=0)
@@ -86,16 +105,17 @@ class ContextManager:
     def check_and_compress(self, session_id: str, *, force: bool = False) -> None:
         if not self._config.compression_enabled:
             return
+        st = self._turn_state(session_id)
         messages = self.load_context(session_id)
         if not messages:
             return
-        if not force and not self._engine.should_compress(messages, model_name=self._model_name):
+        if not force and not st.engine.should_compress(messages, model_name=self._model_name):
             return
 
         limit = get_context_limit(self._model_name, self._config)
         now = time.monotonic()
-        use_llm = self._engine.should_call_llm_summarizer(messages, model_name=self._model_name)
-        if now < self._summary_cooldown_until:
+        use_llm = st.engine.should_call_llm_summarizer(messages, model_name=self._model_name)
+        if now < st.summary_cooldown_until:
             use_llm = False
 
         llm_summary_ok = False
@@ -105,7 +125,7 @@ class ContextManager:
             if not use_llm or self._summarizer is None:
                 return None
             base = middle
-            prev = (self._previous_summary_text or "").strip()
+            prev = (st.previous_summary_text or "").strip()
             if prev:
                 base = [
                     {
@@ -121,13 +141,13 @@ class ContextManager:
             try:
                 out = self._summarizer(base)
                 if out and str(out).strip():
-                    self._summary_cooldown_until = 0.0
+                    st.summary_cooldown_until = 0.0
                     llm_summary_ok = True
                     return out
                 return None
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Summarizer failed: %s", exc)
-                self._summary_cooldown_until = time.monotonic() + float(
+                st.summary_cooldown_until = time.monotonic() + float(
                     self._config.summary_failure_cooldown_sec
                 )
                 return None
@@ -166,7 +186,7 @@ class ContextManager:
             if m.get("_is_summary"):
                 txt = (m.get("content") or "").strip()
                 if llm_summary_ok and txt:
-                    self._previous_summary_text = txt
+                    st.previous_summary_text = txt
                 break
 
         counts = [estimate_tokens(m, self._model_name) for m in compressed]

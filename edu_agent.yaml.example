@@ -27,3 +27,20 @@ runtime:
   log_level: INFO
   default_timezone: UTC
   env: dev
+  gateway:
+    host: "127.0.0.1"
+    port: 8765
+    require_http_key: false
+    api_key: ""
+  channels:
+    http_enabled: true
+    websocket_enabled: true
+    # Personal WeChat (ilinkai; defaults match HKUDS nanobot — no base_url required).
+    # 1) uv run edu channels login weixin
+    # 2) enabled: true; optional allow_from: ["*"] or your ilink user id
+    weixin:
+      enabled: false
+      # token: ""  # optional; else read from .edu_agent/weixin/account.json
+      # state_dir: ".edu_agent/weixin"
+      # allow_from: ["*"]
+      # route_tag: ""

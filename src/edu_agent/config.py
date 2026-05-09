@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ToolsetToggle(BaseModel):
@@ -93,6 +93,37 @@ class ToolsSettings(BaseModel):
     permission_policy: ToolPermissionPolicy = Field(default_factory=ToolPermissionPolicy)
 
 
+class WeixinChannelSettings(BaseModel):
+    """Personal WeChat via Tencent ilink HTTP API (same stack as HKUDS nanobot).
+
+    Defaults match nanobot: no need to set ``base_url`` unless you use a custom
+    gateway. Authenticate with ``edu channels login weixin`` (token persisted under
+    ``state_dir`` / ``account.json``).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = False
+    base_url: str = "https://ilinkai.weixin.qq.com"
+    cdn_base_url: str = "https://novac2c.cdn.weixin.qq.com/c2c"
+    token: str = ""
+    state_dir: str = ""
+    poll_timeout_sec: float = 35.0
+    poll_interval_sec: float = 2.0
+    allow_from: list[str] = Field(default_factory=list)
+    route_tag: str = ""
+
+
+class ChannelsSettings(BaseModel):
+    """``runtime.channels`` in ``edu_agent.yaml``."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    http_enabled: bool = True
+    websocket_enabled: bool = True
+    weixin: WeixinChannelSettings = Field(default_factory=WeixinChannelSettings)
+
+
 class RuntimeSettings(BaseModel):
     """Process-level runtime flags (not session state)."""
 
@@ -101,7 +132,7 @@ class RuntimeSettings(BaseModel):
     env: Literal["dev", "staging", "prod"] = "dev"
     # A5 placeholders
     gateway: dict[str, Any] = Field(default_factory=dict)
-    channels: dict[str, Any] = Field(default_factory=dict)
+    channels: ChannelsSettings = Field(default_factory=ChannelsSettings)
 
 
 class EduSettings(BaseModel):

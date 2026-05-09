@@ -16,9 +16,11 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
+from uuid import UUID
 
 from openai.types.chat import ChatCompletionMessage
 
@@ -33,7 +35,17 @@ from edu_agent.memory.manager import EduMemoryManager
 from edu_agent.memory.output_scrubber import sanitize_completed_assistant_output
 from edu_agent.memory.provider import BuiltinFilesystemMemoryProvider
 from edu_agent.paths import build_paths
-from edu_agent.providers.runtime import build_openai_client, resolve_provider_runtime
+from edu_agent.bus.models import (
+    OutboundContentType,
+    OutboundMessage,
+    ensure_aware_utc,
+    new_message_id,
+)
+from edu_agent.providers.runtime import (
+    build_async_openai_client,
+    build_openai_client,
+    resolve_provider_runtime,
+)
 from edu_agent.learner_profile import load_profile, profile_summary
 from edu_agent.llm_tools import tool_specs_to_openai_tools
 from edu_agent.prompt_builder import build_system_prompt
@@ -60,6 +72,16 @@ logger = logging.getLogger(__name__)
 
 # Finish reasons that signal the model has produced a final user-facing answer.
 _STOP_REASONS = {"stop", "end", "eos", None}
+
+
+@dataclass
+class _LLMStreamState:
+    """Mutable accumulator filled while draining an async LLM stream."""
+
+    content: str = ""
+    finish_reason: str | None = None
+    tool_calls: list[dict] = field(default_factory=list)
+    usage: tuple[int | None, int | None] = (None, None)
 
 
 class EduAgent:
@@ -114,6 +136,7 @@ class EduAgent:
         )
         self._main_runtime = resolve_provider_runtime(settings, self.config, "main")
         self._client = build_openai_client(self._main_runtime)
+        self._async_client = build_async_openai_client(self._main_runtime)
         self._model = self._main_runtime.model
         self._temperature = self._main_runtime.temperature
         self._max_tokens = self._main_runtime.max_tokens
@@ -188,6 +211,27 @@ class EduAgent:
 
         # Optional event hooks — set by CLI after construction.
         self.callbacks: AgentCallbacks | None = None
+
+    def _make_outbound(
+        self,
+        in_reply_to: UUID,
+        *,
+        content: str = "",
+        content_type: OutboundContentType = OutboundContentType.TEXT,
+        is_final: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> OutboundMessage:
+        return OutboundMessage(
+            message_id=new_message_id(),
+            in_reply_to=in_reply_to,
+            session_id=self.config.session_id,
+            user_id=self.config.user_id,
+            timestamp=ensure_aware_utc(),
+            content=content,
+            content_type=content_type,
+            is_final=is_final,
+            metadata=dict(metadata or {}),
+        )
 
     async def _ensure_mcp_tools_registered(self) -> None:
         """Connect MCP servers once and register dynamic tools (best-effort)."""
@@ -295,8 +339,13 @@ class EduAgent:
     # Public API
     # ------------------------------------------------------------------
 
-    async def run_turn(self, user_input: str) -> str:
-        """Process one user message and return the agent's final reply (async A4)."""
+    async def run_turn_stream(
+        self,
+        user_input: str,
+        *,
+        in_reply_to: UUID,
+    ) -> AsyncIterator[OutboundMessage]:
+        """Stream outbound chunks for one user turn (A5); uses async LLM streaming."""
         _cid = (self.config.course_id or "").strip()
         ctx = TurnRuntimeContext(
             settings=self._settings,
@@ -313,11 +362,26 @@ class EduAgent:
         )
         token = set_current_runtime(ctx)
         try:
-            return await self._run_turn_inner(user_input)
+            async for ob in self._run_turn_inner_stream(user_input, in_reply_to=in_reply_to):
+                yield ob
         finally:
             reset_current_runtime(token)
 
-    async def _run_turn_inner(self, user_input: str) -> str:
+    async def run_turn(self, user_input: str) -> str:
+        """Process one user message; aggregates ``run_turn_stream`` final TEXT."""
+        rid = uuid.uuid4()
+        last = ""
+        async for ob in self.run_turn_stream(user_input, in_reply_to=rid):
+            if ob.content_type == OutboundContentType.TEXT and ob.is_final:
+                last = ob.content or ""
+        return last
+
+    async def _run_turn_inner_stream(
+        self,
+        user_input: str,
+        *,
+        in_reply_to: UUID,
+    ) -> AsyncIterator[OutboundMessage]:
         await self._ensure_mcp_tools_registered()
 
         if self._session_store is not None:
@@ -327,7 +391,6 @@ class EduAgent:
                     f"Session {self.config.session_id} is archived (read-only)."
                 )
 
-        # --- Input safety gate ---
         input_check = check_input(user_input)
         if not input_check.safe:
             logger.warning(
@@ -341,7 +404,13 @@ class EduAgent:
             self._persist_message(user_msg)
             self._persist_message(asst_msg)
             self._maybe_compress()
-            return block_msg
+            yield self._make_outbound(
+                in_reply_to,
+                content=block_msg,
+                content_type=OutboundContentType.TEXT,
+                is_final=True,
+            )
+            return
 
         user_msg = {"role": "user", "content": user_input}
         self.messages.append(user_msg)
@@ -394,19 +463,33 @@ class EduAgent:
 
             self._safe_cb(self.callbacks and self.callbacks.on_thinking_start)
 
-            content, finish_reason, tool_calls, usage = self._llm_call(
-                system_prompt=system_prompt,
+            state = _LLMStreamState()
+            async for ob in self._llm_stream_outbounds(
+                system_prompt,
                 openai_tools=_openai_tools,
-            )
-            if self._context is not None and usage[0] is not None:
-                self._context.update_from_llm_usage(usage[0], usage[1])
+                in_reply_to=in_reply_to,
+                state=state,
+            ):
+                yield ob
+
+            if self._context is not None and state.usage[0] is not None:
+                self._context.update_from_llm_usage(
+                    self.config.session_id,
+                    state.usage[0],
+                    state.usage[1],
+                )
+
+            content = state.content
+            finish_reason = state.finish_reason
+            tool_calls = state.tool_calls
 
             if finish_reason == "tool_calls" or tool_calls:
-                await self._handle_tool_calls_from_stream(tool_calls, _disabled)
-                continue  # next LLM call with tool results appended
+                async for ob in self._handle_tool_calls_stream(
+                    tool_calls, _disabled, in_reply_to=in_reply_to
+                ):
+                    yield ob
+                continue
 
-            # --- Final answer ---
-            # Output safety gate
             output_check = check_output(content)
             if not output_check.safe:
                 logger.warning(
@@ -425,9 +508,14 @@ class EduAgent:
             logger.debug("Agent replied after %d iteration(s)", iteration)
             self._maybe_compress()
             self._maybe_memory_threshold_consolidate()
-            return content
+            yield self._make_outbound(
+                in_reply_to,
+                content=content,
+                content_type=OutboundContentType.TEXT,
+                is_final=True,
+            )
+            return
 
-        # Iteration budget exhausted
         budget_msg = "抱歉，当前问题需要更多推理步骤。请尝试将问题拆分为更小的部分重新提问。"
         if self.config.memory_inject_into_prompt:
             budget_msg = sanitize_completed_assistant_output(
@@ -439,7 +527,12 @@ class EduAgent:
         self._persist_message(asst_msg)
         self._maybe_compress()
         self._maybe_memory_threshold_consolidate()
-        return budget_msg
+        yield self._make_outbound(
+            in_reply_to,
+            content=budget_msg,
+            content_type=OutboundContentType.TEXT,
+            is_final=True,
+        )
 
     def reset(self) -> None:
         """Clear conversation history; with a session store, start a new session row."""
@@ -517,6 +610,159 @@ class EduAgent:
             fn(*args)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Callback %s raised: %s", fn, exc)
+
+    async def _llm_stream_outbounds(
+        self,
+        system_prompt: str,
+        *,
+        openai_tools: list[dict],
+        in_reply_to: UUID,
+        state: _LLMStreamState,
+    ) -> AsyncIterator[OutboundMessage]:
+        """Async LLM streaming; fills *state* and yields TEXT deltas as ``OutboundMessage``."""
+        cb = self.callbacks
+        api_messages = cast(
+            list[Any],
+            [{"role": "system", "content": system_prompt}] + self.messages,
+        )
+        stream = await self._async_client.chat.completions.create(
+            model=self._model,
+            messages=api_messages,
+            tools=cast(list[Any], openai_tools),
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+            stream=True,
+        )
+        tc_acc: dict[int, dict[str, str]] = {}
+        thinking_ended = False
+        async for chunk in stream:
+            choice = chunk.choices[0] if chunk.choices else None
+            delta = choice.delta if choice else None
+            if choice and choice.finish_reason:
+                state.finish_reason = choice.finish_reason
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                pt = getattr(usage, "prompt_tokens", None)
+                ct = getattr(usage, "completion_tokens", None)
+                state.usage = (pt, ct)
+
+            if delta is None:
+                continue
+
+            if delta.content:
+                if not thinking_ended:
+                    self._safe_cb(cb and cb.on_thinking_end)
+                    thinking_ended = True
+                state.content += delta.content
+                self._safe_cb(cb and cb.on_text_chunk, delta.content)
+                yield self._make_outbound(
+                    in_reply_to,
+                    content=delta.content,
+                    content_type=OutboundContentType.TEXT,
+                    is_final=False,
+                )
+
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tc_acc:
+                        tc_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                    if tc_delta.id:
+                        tc_acc[idx]["id"] = tc_delta.id
+                    if tc_delta.function:
+                        if tc_delta.function.name:
+                            tc_acc[idx]["name"] += tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            tc_acc[idx]["arguments"] += tc_delta.function.arguments
+
+        if not thinking_ended:
+            self._safe_cb(cb and cb.on_thinking_end)
+
+        state.tool_calls = [tc_acc[i] for i in sorted(tc_acc)]
+
+    async def _handle_tool_calls_stream(
+        self,
+        tool_calls: list[dict],
+        disabled_names: frozenset[str],
+        *,
+        in_reply_to: UUID,
+    ) -> AsyncIterator[OutboundMessage]:
+        """Persist tool round, yield TOOL_CALL / TOOL_RESULT outbounds, mirror non-stream path."""
+        tc_message_content = []
+        for tc in tool_calls:
+            tc_message_content.append({
+                "id": tc["id"],
+                "type": "function",
+                "function": {"name": tc["name"], "arguments": tc["arguments"]},
+            })
+        asst_tool_msg = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": tc_message_content,
+        }
+        self.messages.append(asst_tool_msg)
+        self._persist_message(asst_tool_msg)
+
+        cb = self.callbacks
+        for tc in tool_calls:
+            tool_name = tc["name"]
+            try:
+                args = json.loads(tc["arguments"])
+            except json.JSONDecodeError:
+                args = {}
+
+            payload = json.dumps(
+                {"id": tc["id"], "name": tool_name, "arguments": tc["arguments"]},
+                ensure_ascii=False,
+            )
+            yield self._make_outbound(
+                in_reply_to,
+                content=payload,
+                content_type=OutboundContentType.TOOL_CALL,
+                is_final=False,
+                metadata={"tool_name": tool_name},
+            )
+
+            self._safe_cb(cb and cb.on_tool_start, tool_name, args)
+            logger.info("Calling tool: %s(%s)", tool_name, args)
+
+            t0 = time.monotonic()
+            ctx_rt = get_current_runtime()
+            result_content, tr = await self._tool_runtime.execute(
+                tool_name,
+                args,
+                ctx_rt,
+                disabled_names=disabled_names,
+            )
+            duration = time.monotonic() - t0
+
+            logger.info(
+                "Tool %s → success=%s, content_len=%d",
+                tool_name,
+                tr.success,
+                len(result_content),
+            )
+            self._safe_cb(cb and cb.on_tool_end, tool_name, args, result_content, duration)
+
+            tool_msg = {
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": result_content,
+            }
+            self.messages.append(tool_msg)
+            self._persist_message(tool_msg)
+
+            yield self._make_outbound(
+                in_reply_to,
+                content=result_content,
+                content_type=OutboundContentType.TOOL_RESULT,
+                is_final=False,
+                metadata={
+                    "tool_name": tool_name,
+                    "success": tr.success,
+                    "duration_s": duration,
+                },
+            )
 
     def _llm_call(
         self,
@@ -637,61 +883,10 @@ class EduAgent:
         tool_calls: list[dict],
         disabled_names: frozenset[str],
     ) -> None:
-        """Execute tool calls collected from streaming/non-streaming response.
-
-        ``tool_calls`` is a list of ``{id, name, arguments[, _tc_obj]}`` dicts
-        produced by ``_llm_call``.
-        """
-        # Reconstruct the assistant tool-call message for the API history.
-        tc_message_content = []
-        for tc in tool_calls:
-            tc_message_content.append({
-                "id": tc["id"],
-                "type": "function",
-                "function": {"name": tc["name"], "arguments": tc["arguments"]},
-            })
-        asst_tool_msg = {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": tc_message_content,
-        }
-        self.messages.append(asst_tool_msg)
-        self._persist_message(asst_tool_msg)
-
-        cb = self.callbacks
-        for tc in tool_calls:
-            tool_name = tc["name"]
-            try:
-                args = json.loads(tc["arguments"])
-            except json.JSONDecodeError:
-                args = {}
-
-            self._safe_cb(cb and cb.on_tool_start, tool_name, args)
-            logger.info("Calling tool: %s(%s)", tool_name, args)
-
-            t0 = time.monotonic()
-            ctx_rt = get_current_runtime()
-            result_content, tr = await self._tool_runtime.execute(
-                tool_name,
-                args,
-                ctx_rt,
-                disabled_names=disabled_names,
-            )
-            duration = time.monotonic() - t0
-            result_success = tr.success
-
-            logger.info(
-                "Tool %s → success=%s, content_len=%d",
-                tool_name,
-                result_success,
-                len(result_content),
-            )
-            self._safe_cb(cb and cb.on_tool_end, tool_name, args, result_content, duration)
-
-            tool_msg = {
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "content": result_content,
-            }
-            self.messages.append(tool_msg)
-            self._persist_message(tool_msg)
+        """Execute tool calls (side effects only); streaming yields are discarded."""
+        async for _ in self._handle_tool_calls_stream(
+            tool_calls,
+            disabled_names,
+            in_reply_to=uuid.uuid4(),
+        ):
+            pass

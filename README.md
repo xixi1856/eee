@@ -121,6 +121,36 @@ uv run edu chat
 
 常用选项：`--user`、`--skills`（技能目录）、`--max-iter`。用户数据路径（会话、画像、缓存等）由 `agent.workspace` 与 [`EduPaths`](src/edu_agent/paths.py) 推导。
 
+### HTTP 网关（Phase 5）
+
+所有通道（CLI / HTTP / WebSocket）经 **Gateway** 入队，由 **SessionRunner** 按会话 FIFO 消费；模型与工具调用只在 Runner 内触发，HTTP 层不绕过 Agent。设计见 [`docs/phase5.md`](docs/phase5.md)。
+
+**启动 HTTP 服务**（默认读取 `edu_agent.yaml` 中的 `runtime.gateway.host` / `port`，本仓库示例为 `127.0.0.1:8765`）：
+
+```powershell
+uv run edu-gateway
+# 可选覆盖绑定地址
+uv run edu-gateway --host 127.0.0.1 --port 8765
+```
+
+**CLI 走网关**（本地进程内嵌 Gateway + `CLIChannelAdapter`，与独立 HTTP 进程同一套 Runner 语义）：
+
+```powershell
+uv run edu chat --gateway-mode
+```
+
+**HTTP / SSE**：`POST /v1/chat/completions`，请求体中 `"stream": true` 时返回 **SSE**（`text/event-stream`）。**WebSocket**：`GET /v1/ws`。会话：`POST /v1/sessions` 等，详见 `src/edu_agent/api/server.py`。
+
+**可选鉴权**：在 `edu_agent.yaml` 中设置 `runtime.gateway.require_http_key: true` 与 `runtime.gateway.api_key`，请求携带 `Authorization: Bearer <key>` 或 `X-API-Key`。
+
+### 个人微信（ilinkai，与 nanobot 同栈）
+
+不填 `base_url` 时默认连 **`https://ilinkai.weixin.qq.com`**；进程主动长轮询收消息，**不是**公众号服务器 URL 回调。
+
+1. `uv run edu channels login weixin`（可选 `--force` 换绑），令牌写入工作区 **`.edu_agent/weixin/account.json`**。
+2. 在 `edu_agent.yaml` 中设 `runtime.channels.weixin.enabled: true`，按需设 `allow_from: ["*"]` 或允许的 ilink 用户 id。
+3. `uv run edu-gateway`（与 HTTP 同进程拉起 `WeixinChannelAdapter`）。详见 [`docs/deployment.md`](docs/deployment.md) 第 5.1 节。
+
 ### 长期记忆（A3）
 
 - 数据落在工作区 **`memory/`** 下（`facts/` JSONL、`concepts/`、`profiles/`，按用户隔离）。设计说明见 [`docs/phase3.md`](docs/phase3.md)（文末有与 [Hermes-agent](https://github.com/NousResearch/hermes-agent) 记忆分层的简要对照）；与 Hermes `MemoryManager` / `MemoryProvider` 的 API 与能力矩阵见 [`review_docs/hermes_memory_gap.md`](review_docs/hermes_memory_gap.md)。

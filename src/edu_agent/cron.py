@@ -10,6 +10,7 @@ The CronDaemon runs as a background daemon thread and ticks every 60 seconds.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -238,7 +239,7 @@ def _run_job(job: CronJob) -> str:
             max_iterations=15,
         )
         agent = EduAgent(config=cfg, settings=load_settings())
-        reply = agent.run_turn(job.prompt)
+        reply = asyncio.run(agent.run_turn(job.prompt))
 
         # Save output
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")

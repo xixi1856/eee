@@ -1,7 +1,11 @@
 """Configuration loaded from environment / .env file."""
 
 from pathlib import Path
+
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_EMBEDDING_MODES = frozenset({"ollama", "openai_compatible"})
 
 
 class Settings(BaseSettings):
@@ -19,12 +23,50 @@ class Settings(BaseSettings):
     llm_model: str = "qwen-plus-2025-04-28"
     refine_model: str = "qwen-long"   # long-context model for structure-refine phase
     vision_model: str = "qwen-vl-max"
-    # Ollama embeddings (LightRAG ollama_embed); e.g. ollama pull bge-m3
+    # Embedding backend: ollama (local) | openai_compatible (OpenAI /v1/embeddings API, incl. DashScope compatible-mode)
+    embedding_mode: str = "ollama"
+    # Optional overrides for openai_compatible; empty → use LLM_BASE_URL / LLM_API_KEY
+    embedding_base_url: str = ""
+    embedding_api_key: str = ""
     ollama_base_url: str = "http://127.0.0.1:11434"
+    # Model id depends on embedding_mode: Ollama tag (e.g. bge-m3) or API model (e.g. text-embedding-v1).
     embedding_model: str = "bge-m3"
-    # Must match Ollama model output and PostgreSQL ``vector(N)`` on LightRAG tables (Phase 7: 1024).
+    # Must match embedding vectors and PostgreSQL ``vector(N)`` on LightRAG tables.
     embedding_dim: int = 1024
     embedding_max_tokens: int = 8192
+
+    @field_validator("embedding_mode", mode="before")
+    @classmethod
+    def _normalize_embedding_mode(cls, v: object) -> str:
+        if v is None:
+            return "ollama"
+        s = str(v).strip().lower()
+        if not s:
+            return "ollama"
+        if s in ("dashscope", "openai", "compatible", "openai-compatible"):
+            return "openai_compatible"
+        return s
+
+    @model_validator(mode="after")
+    def _validate_embedding_mode_and_warn_ollama_cloud_model(self) -> "Settings":
+        from loguru import logger
+
+        em = self.embedding_mode.strip().lower()
+        if em not in _EMBEDDING_MODES:
+            logger.error(
+                f"Invalid EMBEDDING_MODE={self.embedding_mode!r}; "
+                f"allowed: {sorted(_EMBEDDING_MODES)}. Falling back to 'ollama'."
+            )
+            self.embedding_mode = "ollama"
+            em = "ollama"
+        if em == "ollama" and "text-embedding" in self.embedding_model.lower():
+            logger.error(
+                f"EMBEDDING_MODEL={self.embedding_model!r} looks like a cloud/OpenAI-style id, "
+                "but EMBEDDING_MODE=ollama uses Ollama (local model tags). "
+                "Set EMBEDDING_MODE=openai_compatible for DashScope text-embedding-v1, "
+                "or use an Ollama tag such as bge-m3."
+            )
+        return self
 
     # LLM generation
     llm_max_tokens: int = 4096
@@ -63,10 +105,10 @@ class Settings(BaseSettings):
     # Proxy (used by wikipedia tool; leave empty to disable)
     http_proxy: str = ""
 
-    # Concurrency limits (lower to reduce 429 rate-limit errors)
+    # Concurrency limits (lower to reduce 429 rate-limit errors and asyncpg pool races)
     llm_max_async: int = 4          # parallel LLM (chat) requests
-    embedding_max_async: int = 16    # parallel embedding requests
-    max_parallel_insert: int = 2    # parallel document inserts
+    embedding_max_async: int = 8    # parallel embedding requests (was 16; PG pool + Windows)
+    max_parallel_insert: int = 1    # parallel document inserts (was 2; safer with asyncio.run)
 
     # Image filtering (skip decorative / useless images before full vision analysis)
     enable_image_filter: bool = False
@@ -84,6 +126,19 @@ class Settings(BaseSettings):
 
     ollama_api_key: str = ""
     tavily_api_key: str = ""
+
+    # MinerU Cloud API (mineru.net/apiManage/docs — 精准解析 v4)
+    # Set MINERU_CLOUD_API_KEY to enable; leave empty to use local MinerU only.
+    mineru_cloud_enabled: bool = True
+    mineru_cloud_api_key: str = ""
+    # model_version: pipeline | vlm (recommended) | MinerU-HTML
+    mineru_cloud_model_version: str = "vlm"
+    # Polling timeout (seconds) waiting for cloud task to complete
+    mineru_cloud_timeout: int = 600
+    # Interval (seconds) between status-poll requests
+    mineru_cloud_poll_interval: int = 5
+    # Fall back to local MinerU when cloud fails; set False to hard-fail instead
+    mineru_cloud_fallback_local: bool = True
 
 
 settings = Settings()

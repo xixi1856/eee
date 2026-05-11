@@ -504,9 +504,21 @@ Content-Type: application/json
 
 ## M4 课程管理
 
+### `CourseSummaryDto` 字段说明
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | `string (UUID)` | 课程 ID |
+| `name` | `string` | 课程名称 |
+| `description` | `string \| null` | 描述 |
+| `cover_image_url` | `string \| null` | 封面图 URL |
+| `status` | `DRAFT \| PUBLISHED \| ARCHIVED` | 课程状态 |
+| `created_at` / `updated_at` | `string (ISO8601)` | 时间戳 |
+| `share_code` | `string \| undefined` | **仅**当当前用户为该课**主讲或协作者**且 `status === PUBLISHED` 时返回；学生响应中不出现 |
+
 ### GET `/api/v1/courses` — 获取我的课程列表
 
-**认证**：JWT（TEACHER 返回自己创建的课程；STUDENT 返回已加入的课程）
+**认证**：JWT（`TEACHER` 返回自己**担任主讲**或以**协作者**身份参与的课程；`STUDENT` 返回已加入的课程）
 
 **响应**：`200 OK`
 
@@ -520,7 +532,8 @@ Content-Type: application/json
       "cover_image_url": null,
       "status": "PUBLISHED",
       "created_at": "2026-05-10T08:00:00.000Z",
-      "updated_at": "2026-05-10T10:00:00.000Z"
+      "updated_at": "2026-05-10T10:00:00.000Z",
+      "share_code": "A1B2C3D4E5"
     }
   ]
 }
@@ -564,7 +577,7 @@ Content-Type: application/json
 
 ### GET `/api/v1/courses/{courseId}` — 获取课程详情
 
-**认证**：JWT（课程教师或已加入的学生）
+**认证**：JWT（课程主讲、协作者或已加入的学生）
 
 **响应**：`200 OK`
 
@@ -578,7 +591,7 @@ Content-Type: application/json
 
 ### PATCH `/api/v1/courses/{courseId}` — 更新课程信息
 
-**认证**：JWT（`TEACHER`，且为课程创建者）
+**认证**：JWT（`TEACHER`，且为课程**主讲或协作者**）
 
 **请求 Body**（所有字段可选）：
 
@@ -594,7 +607,7 @@ Content-Type: application/json
 
 ### DELETE `/api/v1/courses/{courseId}` — 删除课程（软删除）
 
-**认证**：JWT（`TEACHER`，且为课程创建者）
+**认证**：JWT（`TEACHER`，且为课程**主讲**；协作者不可删除）
 
 **响应**：`200 OK`
 
@@ -606,21 +619,28 @@ Content-Type: application/json
 
 ### POST `/api/v1/courses/{courseId}/publish` — 发布课程
 
-**描述**：将课程状态从 `DRAFT` 改为 `PUBLISHED`，发布后学生可加入。
+**描述**：将课程状态从 `DRAFT` 改为 `PUBLISHED`。**首次**发布时系统自动生成全局唯一的 `share_code`（若已有则保留，不覆盖）。已 `PUBLISHED` 时再次调用为幂等，直接返回当前摘要（含 `share_code`）。已 `ARCHIVED` 时不可发布。
 
-**认证**：JWT（`TEACHER`，且为课程创建者）
+**认证**：JWT（`TEACHER`，且为课程**主讲**）
 
 **请求 Body**：无
 
-**响应**：`200 OK`，返回 `CourseSummaryDto`（status 变为 `PUBLISHED`）
+**响应**：`200 OK`，返回 `CourseSummaryDto`（`status` 为 `PUBLISHED` 时含 `share_code`，仅主讲可见）
+
+**错误**：
+
+| 状态码 | code | 说明 |
+|---|---|---|
+| 403 | `FORBIDDEN` | 非主讲 |
+| 409 | `CONFLICT` | 课程已归档，不能发布 |
 
 ---
 
 ### POST `/api/v1/courses/{courseId}/archive` — 归档课程
 
-**描述**：将课程状态改为 `ARCHIVED`，归档后不可新增学生。
+**描述**：将课程状态改为 `ARCHIVED`，归档后不可再通过分享码或本接口路径新增学生。
 
-**认证**：JWT（`TEACHER`，且为课程创建者）
+**认证**：JWT（`TEACHER`，且为课程**主讲或协作者**）
 
 **请求 Body**：无
 
@@ -628,9 +648,54 @@ Content-Type: application/json
 
 ---
 
+### POST `/api/v1/courses/join-by-code` — 凭分享码加入课程
+
+**描述**：使用课程 `share_code` 加入已发布课程。学生创建选课记录；其他教师成为该课**协作者**（与主讲权限接近，见实现：协作者不可发布/删除课程）。课程须为 `PUBLISHED` 且未删除。
+
+**认证**：JWT（`STUDENT` 或 `TEACHER`；`ADMIN` 不可用此接口）
+
+**请求 Body**：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `share_code` | `string` | ✓ | 发布课程后由系统生成的分享码（大小写不敏感，首尾空格忽略） |
+
+**响应**：`201 Created`
+
+学生：
+
+```json
+{
+  "course_id": "course-uuid-...",
+  "enrolled_at": "2026-05-11T09:00:00.000Z",
+  "role": "student"
+}
+```
+
+教师（协作者）：
+
+```json
+{
+  "course_id": "course-uuid-...",
+  "joined_at": "2026-05-11T09:00:00.000Z",
+  "role": "collaborator"
+}
+```
+
+**错误**：
+
+| 状态码 | code | 说明 |
+|---|---|---|
+| 400 | `VALIDATION_ERROR` | 缺少或空的 `share_code` |
+| 403 | `FORBIDDEN` | `ADMIN`；或课程未开放加入 |
+| 404 | `NOT_FOUND` | 分享码无效或课程不可加入 |
+| 409 | `CONFLICT` | 学生已选课 / 教师已是主讲 / 已是协作者 |
+
+---
+
 ### POST `/api/v1/courses/{courseId}/join` — 加入课程（学生）
 
-**描述**：学生加入一门已发布的课程，课程状态必须为 `PUBLISHED`。
+**描述**：学生加入一门已发布的课程（已知课程 UUID 时），课程状态必须为 `PUBLISHED`。推荐新场景使用 `POST /api/v1/courses/join-by-code`。
 
 **认证**：JWT（`STUDENT` 角色）
 
@@ -748,6 +813,7 @@ Content-Type: application/json
       "filename": "chapter1.pdf",
       "file_type": "pdf",
       "status": "READY",
+      "preview_pdf_status": "NA",
       "indexed_chunk_count": 42,
       "created_at": "2026-05-10T08:00:00.000Z",
       "status_message": null
@@ -755,6 +821,10 @@ Content-Type: application/json
   ]
 }
 ```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `preview_pdf_status` | `NA` \| `PENDING` \| `READY` \| `FAILED` | Office（ppt/doc/…）上传后为 `PENDING`，Worker 生成 `preview.pdf` 后为 `READY`；`pdf`/`md`/`txt` 为 `NA`。与 RAG `status` 独立。 |
 
 **材料状态流转**：
 
@@ -815,7 +885,58 @@ Content-Type: application/pdf
 | 404 | `NOT_FOUND` | `lesson_id` 不存在 |
 | 503 | `SERVICE_UNAVAILABLE` | MinIO 或 Redis 不可用 |
 
-> **背后流程**：上传成功后，平台向 Redis Stream（`RAG_TASK_STREAM`）发送 `parse_and_index` 任务，Python RAG Worker 异步处理，完成后更新材料 `status` 为 `READY`。
+> **背后流程**：先 **完成 MinIO 上传**，再写入数据库并发 `parse_and_index` 任务。Python RAG Worker 从 **原文件** `minio_path` 解析与索引；Office 另在同目录写入 **`preview.pdf`** 供浏览器内联预览（不覆盖 `minio_path`）。
+
+---
+
+### GET `/api/v1/materials/{materialId}` — 材料详情（预览元数据）
+
+**认证**：JWT（课程教师或已加入该课的学生）
+
+**响应**：`200 OK`
+
+```json
+{
+  "id": "material-uuid-...",
+  "filename": "slides.pptx",
+  "file_type": "pptx",
+  "lesson_id": null,
+  "status": "INDEXING",
+  "preview_pdf_status": "PENDING",
+  "indexed_chunk_count": 0,
+  "created_at": "2026-05-11T09:00:00.000Z",
+  "status_message": null
+}
+```
+
+---
+
+### GET `/api/v1/materials/{materialId}/content` — 流式下载 / 内联预览
+
+**认证**：JWT（课程教师或已加入该课的学生）
+
+**Query 参数**：
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `variant` | `string` | 可选。`original`：始终流式返回 **上传原文件**（`Content-Disposition: attachment`）。缺省：内联预览（`pdf`/`md`/`txt` 为原对象；Office 在 `preview_pdf_status === READY` 时返回 `preview.pdf`）。 |
+
+**成功响应**：`200 OK`，`Content-Type` 与 `Content-Disposition` 依类型而定；正文为二进制流。
+
+**错误**：
+
+| 状态码 | code | 说明 |
+|---|---|---|
+| 425 | `PREVIEW_NOT_READY` | Office 内联预览且 `preview.pdf` 尚未生成（`details.preview_pdf_status` 为 `PENDING` 等） |
+| 400 | `VALIDATION_ERROR` | 不支持的 `file_type` 做内联预览 |
+
+---
+
+### GET `/api/v1/materials/{materialId}/chunks/{chunkId}` — 引用块文本（占位）
+
+**认证**：JWT（课程成员）
+
+**响应**：`501 NOT_IMPLEMENTED`（当前不暴露块级存储；客户端可仅用 SSE 引用标签 + 资料预览）。
 
 ---
 
@@ -1179,6 +1300,9 @@ X-Internal-Key: internal-secret-key
 | | DELETE | `/api/v1/courses/{id}/lessons/{lid}` | JWT(TEACHER) | 删除课时 |
 | **材料** | GET | `/api/v1/courses/{id}/materials` | JWT | 材料列表 |
 | | POST | `/api/v1/courses/{id}/materials` | JWT(TEACHER) | 上传材料 |
+| | GET | `/api/v1/materials/{mid}` | JWT | 材料详情（含 `preview_pdf_status`） |
+| | GET | `/api/v1/materials/{mid}/content` | JWT | 流式预览或 `?variant=original` 下载原文件 |
+| | GET | `/api/v1/materials/{mid}/chunks/{cid}` | JWT | 占位（501） |
 | | DELETE | `/api/v1/materials/{mid}` | JWT(TEACHER) | 删除材料 |
 | **聊天** | POST | `/api/v1/courses/{id}/chat` | JWT(已绑定) | 聊天(SSE) |
 | | GET | `/api/v1/courses/{id}/chat/history` | JWT | 聊天历史 |

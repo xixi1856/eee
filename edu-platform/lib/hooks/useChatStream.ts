@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 export type ChatMessage = {
   role: "user" | "assistant";
@@ -29,6 +29,19 @@ export type AttachmentRef = {
   localPreviewUrl?: string;
 };
 
+export type UseChatStreamConfig =
+  | {
+      kind: "course";
+      courseId: string;
+      /** When set, load historical Q/A from QA center API into the transcript. */
+      hydrateSessionId?: string | null;
+    }
+  | {
+      kind: "qa_center_global";
+      sessionId: string | null;
+      onResolvedSessionId?: (id: string) => void;
+    };
+
 const ALLOWED_MIME_TYPES = new Set([
   "image/jpeg",
   "image/png",
@@ -47,7 +60,39 @@ const ALLOWED_MIME_TYPES = new Set([
 
 const MAX_FILE_SIZE = 20 * 1024 * 1024;
 
-export function useChatStream(courseId: string) {
+type ApiErrJson = {
+  error?: { message?: string; code?: string };
+};
+
+function formatChatHttpError(status: number, body: ApiErrJson): string {
+  const raw = (body.error?.message ?? "").trim();
+  const code = body.error?.code;
+  const vague = !raw || raw === "Internal server error";
+  if (vague && code === "AGENT_UNAVAILABLE") {
+    return "EduAgent 网关不可用：请确认已在仓库根启动 uv run edu-gateway，且 EDU_AGENT_BASE_URL 与网关地址一致。";
+  }
+  if (vague && code === "AGENT_NOT_BOUND") {
+    return "尚未绑定 Agent 身份：请完成 edu bind 后，在本平台「凭证」页（/credentials）完成关联。";
+  }
+  return raw || `请求失败 (${status})`;
+}
+
+function logToMsgs(
+  rows: { question: string; answer: string | null }[],
+): ChatMessage[] {
+  const out: ChatMessage[] = [];
+  for (const r of rows) {
+    out.push({ role: "user", text: r.question });
+    if (r.answer) {
+      out.push({ role: "assistant", text: r.answer });
+    }
+  }
+  return out;
+}
+
+export function useChatStream(config: UseChatStreamConfig) {
+  const cfgRef = useRef(config);
+  cfgRef.current = config;
   const [msgs, setMsgs] = useState<ChatMessage[]>([]);
   const [streaming, setStreaming] = useState<string>("");
   const [busy, setBusy] = useState(false);
@@ -57,6 +102,66 @@ export function useChatStream(courseId: string) {
   const [pendingAttachments, setPendingAttachments] = useState<AttachmentRef[]>([]);
   const [attachmentUploading, setAttachmentUploading] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+
+  const historyLoadKey =
+    config.kind === "qa_center_global"
+      ? `q:${config.sessionId ?? ""}`
+      : `c:${config.courseId}:h:${config.hydrateSessionId ?? ""}`;
+
+  useEffect(() => {
+    const c = cfgRef.current;
+    if (c.kind === "qa_center_global") {
+      if (!c.sessionId) {
+        setMsgs([]);
+        return;
+      }
+      const sid = c.sessionId;
+      let cancelled = false;
+      void (async () => {
+        try {
+          const res = await fetch(
+            `/api/v1/me/chat-threads/${encodeURIComponent(sid)}`,
+            { credentials: "include" },
+          );
+          if (!res.ok || cancelled) return;
+          const body = (await res.json()) as {
+            messages?: { question: string; answer: string | null }[];
+          };
+          const rows = Array.isArray(body.messages) ? body.messages : [];
+          if (!cancelled) setMsgs(logToMsgs(rows));
+        } catch {
+          if (!cancelled) setMsgs([]);
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }
+    if (c.kind === "course") {
+      if (!c.hydrateSessionId) return;
+      const sid = c.hydrateSessionId;
+      let cancelled = false;
+      void (async () => {
+        try {
+          const res = await fetch(
+            `/api/v1/me/chat-threads/${encodeURIComponent(sid)}`,
+            { credentials: "include" },
+          );
+          if (!res.ok || cancelled) return;
+          const body = (await res.json()) as {
+            messages?: { question: string; answer: string | null }[];
+          };
+          const rows = Array.isArray(body.messages) ? body.messages : [];
+          if (!cancelled) setMsgs(logToMsgs(rows));
+        } catch {
+          if (!cancelled) setMsgs([]);
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }
+  }, [historyLoadKey]);
 
   const addAttachment = useCallback(async (file: File) => {
     if (!ALLOWED_MIME_TYPES.has(file.type)) {
@@ -107,6 +212,7 @@ export function useChatStream(courseId: string) {
 
   const sendMessage = useCallback(
     async (text: string, lessonId?: string) => {
+      const config = cfgRef.current;
       if (busy) return;
       setBusy(true);
       setStreaming("");
@@ -114,44 +220,65 @@ export function useChatStream(courseId: string) {
       setLastMeta(null);
       setErrorMsg(null);
 
-      // Snapshot and clear pending attachments optimistically
       const snapshotAttachments = pendingAttachments.slice();
       setPendingAttachments([]);
 
       setMsgs((prev) => [
         ...prev,
-        { role: "user", text, attachments: snapshotAttachments.length ? snapshotAttachments : undefined },
+        {
+          role: "user",
+          text,
+          attachments: snapshotAttachments.length ? snapshotAttachments : undefined,
+        },
       ]);
 
       abortRef.current?.abort();
       abortRef.current = new AbortController();
 
       try {
-        const attachmentsPayload = snapshotAttachments.map(({ id, key, presigned_url, mime_type, name }) => ({
-          id,
-          key,
-          presigned_url,
-          mime_type,
-          name,
-        }));
+        const attachmentsPayload = snapshotAttachments.map(
+          ({ id, key, presigned_url, mime_type, name }) => ({
+            id,
+            key,
+            presigned_url,
+            mime_type,
+            name,
+          }),
+        );
 
-        const res = await fetch(`/api/v1/courses/${courseId}/chat`, {
+        const isQaGlobal = config.kind === "qa_center_global";
+        const courseId = config.kind === "course" ? config.courseId : "";
+        const url = isQaGlobal
+          ? "/api/v1/qa-center/chat"
+          : `/api/v1/courses/${courseId}/chat`;
+
+        const body: Record<string, unknown> = {
+          message: text,
+          ...(lessonId ? { lesson_id: lessonId } : {}),
+          ...(attachmentsPayload.length ? { attachments: attachmentsPayload } : {}),
+        };
+        if (isQaGlobal && config.sessionId) {
+          body.session_id = config.sessionId;
+        }
+
+        const res = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "include",
-          body: JSON.stringify({
-            message: text,
-            ...(lessonId ? { lesson_id: lessonId } : {}),
-            ...(attachmentsPayload.length ? { attachments: attachmentsPayload } : {}),
-          }),
+          body: JSON.stringify(body),
           signal: abortRef.current.signal,
         });
 
+        if (isQaGlobal) {
+          const hdr = res.headers.get("X-Qa-Center-Session-Id");
+          if (hdr && config.onResolvedSessionId) {
+            config.onResolvedSessionId(hdr);
+          }
+        }
+
         if (!res.ok) {
-          const j = (await res.json().catch(() => ({}))) as {
-            error?: { message?: string };
-          };
-          throw new Error(j.error?.message ?? `请求失败 (${res.status})`);
+          const j = (await res.json().catch(() => ({}))) as ApiErrJson;
+          throw new Error(formatChatHttpError(res.status, j));
         }
 
         const reader = res.body?.getReader();
@@ -219,10 +346,7 @@ export function useChatStream(courseId: string) {
         if ((e as { name?: string }).name !== "AbortError") {
           const msg = e instanceof Error ? e.message : "请求失败";
           setErrorMsg(msg);
-          setMsgs((prev) => [
-            ...prev,
-            { role: "assistant", text: `[错误: ${msg}]` },
-          ]);
+          setMsgs((prev) => [...prev, { role: "assistant", text: `[错误: ${msg}]` }]);
         }
         setStreaming("");
       } finally {
@@ -230,7 +354,7 @@ export function useChatStream(courseId: string) {
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [courseId, busy, pendingAttachments]
+    [busy, pendingAttachments],
   );
 
   return {

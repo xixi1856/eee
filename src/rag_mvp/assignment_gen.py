@@ -25,6 +25,7 @@ from loguru import logger
 from .config import settings
 from .engine import course_aquery_data
 from .llm import llm_model_func
+from .worker_async_loop import is_worker_async_loop_started, run_worker_coroutine
 from .question_gen import (
     DEFAULT_OBJECTIVE_WEIGHTS,
     DEFAULT_TYPE_WEIGHTS,
@@ -341,112 +342,168 @@ def generate_assignment(
     course_id: str,
     teacher_request: str,
     conn: Any,
+    structured_params: dict | None = None,
 ) -> None:
     """Full pipeline: plan → retrieve → generate → review → update DB.
 
     Runs the async pipeline in a dedicated event loop so it can be called
     from the synchronous Redis Stream worker.
     conn is a psycopg3 sync connection (autocommit=False).
+    When structured_params is provided, the Planner LLM step is skipped and
+    a Blueprint is constructed directly from the params.
     """
+    use_worker_loop = is_worker_async_loop_started()
 
     async def _pipeline() -> None:
+        pipe_conn: Any = None
+        if use_worker_loop:
+            from .db import connect_sync
+
+            pipe_conn = connect_sync(autocommit=False)
+        else:
+            pipe_conn = conn
         try:
-            logger.info(
-                "Assignment generation started assignment_id={} course={}",
-                assignment_id, course_id,
-            )
-
-            # ── Step 1: Planner ────────────────────────────────────────────
-            blueprint = await _run_planner(teacher_request)
-            logger.info("Blueprint ready: title={}", blueprint.get("title"))
-            _db_update(conn, assignment_id, blueprint=blueprint)
-
-            # ── Step 2: Retrieve entity candidates from course RAG ─────────
-            count = int(blueprint.get("count", 10))
-            topic_hint = str(blueprint.get("topic_hint", ""))
-            candidates = await _retrieve_candidates(course_id, topic_hint, count)
-
-            if not candidates:
-                raise RuntimeError(
-                    "No entities or chunks found in course RAG. "
-                    "Ensure course materials are indexed (status=READY)."
+            try:
+                logger.info(
+                    "Assignment generation started assignment_id={} course={}",
+                    assignment_id, course_id,
                 )
 
-            # ── Step 3: Generate questions ─────────────────────────────────
-            type_weights: dict = blueprint.get("type_weights") or DEFAULT_TYPE_WEIGHTS
-            obj_weights: dict = blueprint.get("objective_weights") or DEFAULT_OBJECTIVE_WEIGHTS
+                # ── Step 1: Planner (or structured bypass) ───────────────────────
+                if structured_params is not None:
+                    # Build Blueprint directly from structured params — skip LLM Planner
+                    sp = structured_params
+                    difficulty = sp.get("difficulty", "medium")
+                    count = max(1, min(50, int(sp.get("count", 10))))
+                    type_weights_raw: dict = sp.get("typeWeights") or DEFAULT_TYPE_WEIGHTS
+                    obj_weights_raw: dict = sp.get("objectiveWeights") or DEFAULT_OBJECTIVE_WEIGHTS
+                    # Normalise weights to sum to 1
+                    tw_total = sum(type_weights_raw.values()) or 1
+                    ow_total = sum(obj_weights_raw.values()) or 1
+                    tw = {k: v / tw_total for k, v in type_weights_raw.items()}
+                    ow = {k: v / ow_total for k, v in obj_weights_raw.items()}
 
-            pairs = assign_objective_format_pairs(
-                count, obj_weights, type_weights, OBJECTIVE_FORMAT_COMPATIBILITY
-            )
+                    lesson_names: list[str] = sp.get("lessonNames") or []
+                    kp: list[str] = sp.get("knowledgePoints") or []
+                    topic_parts = lesson_names + kp
+                    topic_hint = "、".join(topic_parts[:4]) if topic_parts else ""
 
-            sem = asyncio.Semaphore(settings.llm_max_async)
+                    blueprint: dict[str, Any] = {
+                        "title": teacher_request.strip() or "结构化作业",
+                        "topic_hint": topic_hint,
+                        "difficulty": difficulty,
+                        "count": count,
+                        "type_weights": tw,
+                        "objective_weights": ow,
+                        "estimated_minutes": count * 2,
+                    }
+                    logger.info(
+                        "Blueprint built from structured_params (bypass planner): title={}",
+                        blueprint["title"],
+                    )
+                else:
+                    blueprint = await _run_planner(teacher_request)
+                    logger.info("Blueprint ready: title={}", blueprint.get("title"))
+                _db_update(pipe_conn, assignment_id, blueprint=blueprint)
 
-            async def _guarded(idx: int, entity: dict, obj: str, fmt: str) -> dict | None:
-                async with sem:
-                    return await generate_one(
-                        entity_name=entity["name"],
-                        context=entity["context"],
-                        q_type=fmt,
-                        q_id=idx + 1,
-                        score=entity["score"],
-                        chunk_ids=entity["chunk_ids"],
-                        objective=obj,
+                # ── Step 2: Retrieve entity candidates from course RAG ─────────
+                count = int(blueprint.get("count", 10))
+                topic_hint = str(blueprint.get("topic_hint", ""))
+                candidates = await _retrieve_candidates(course_id, topic_hint, count)
+
+                if not candidates:
+                    raise RuntimeError(
+                        "No entities or chunks found in course RAG. "
+                        "Ensure course materials are indexed (status=READY)."
                     )
 
-            tasks = [
-                _guarded(idx, candidates[idx % len(candidates)], obj, fmt)
-                for idx, (obj, fmt) in enumerate(pairs)
-                if candidates[idx % len(candidates)]["context"]
-            ]
+                # ── Step 3: Generate questions ─────────────────────────────────
+                type_weights: dict = blueprint.get("type_weights") or DEFAULT_TYPE_WEIGHTS
+                obj_weights: dict = blueprint.get("objective_weights") or DEFAULT_OBJECTIVE_WEIGHTS
 
-            raw_results = await asyncio.gather(*tasks, return_exceptions=True)
-            questions: list[dict] = []
-            for r in raw_results:
-                if isinstance(r, dict):
-                    r.setdefault("score", 5)  # default point value per question
-                    questions.append(r)
-                elif isinstance(r, Exception):
-                    logger.warning("Question generation task failed: {}", r)
-
-            if not questions:
-                raise RuntimeError("All question generation tasks failed — check LLM logs.")
-
-            # Re-number sequentially after filtering
-            for seq, q in enumerate(questions, 1):
-                q["id"] = seq
-
-            _db_update(conn, assignment_id, questions=questions)
-            logger.info(
-                "{} questions generated for assignment {}",
-                len(questions), assignment_id,
-            )
-
-            # ── Step 4: Review ─────────────────────────────────────────────
-            quality_report = await _run_reviewer(questions, blueprint)
-            _db_update(
-                conn, assignment_id,
-                quality_report=quality_report,
-                status="DRAFT",
-            )
-            logger.info(
-                "Assignment {} DRAFT — quality_score={}",
-                assignment_id, quality_report.get("overall_score"),
-            )
-
-        except Exception as exc:
-            logger.exception(
-                "Assignment generation failed assignment_id={}", assignment_id
-            )
-            try:
-                _db_update(
-                    conn, assignment_id,
-                    status="FAILED",
-                    error_message=str(exc)[:500],
+                pairs = assign_objective_format_pairs(
+                    count, obj_weights, type_weights, OBJECTIVE_FORMAT_COMPATIBILITY
                 )
-            except Exception:
-                logger.warning("Could not write FAILED status to DB")
-            raise
+
+                sem = asyncio.Semaphore(settings.llm_max_async)
+
+                async def _guarded(idx: int, entity: dict, obj: str, fmt: str) -> dict | None:
+                    async with sem:
+                        return await generate_one(
+                            entity_name=entity["name"],
+                            context=entity["context"],
+                            q_type=fmt,
+                            q_id=idx + 1,
+                            score=entity["score"],
+                            chunk_ids=entity["chunk_ids"],
+                            objective=obj,
+                        )
+
+                tasks = [
+                    _guarded(idx, candidates[idx % len(candidates)], obj, fmt)
+                    for idx, (obj, fmt) in enumerate(pairs)
+                    if candidates[idx % len(candidates)]["context"]
+                ]
+
+                raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+                questions: list[dict] = []
+                for r in raw_results:
+                    if isinstance(r, dict):
+                        r.setdefault("score", 5)  # default point value per question
+                        questions.append(r)
+                    elif isinstance(r, Exception):
+                        logger.warning("Question generation task failed: {}", r)
+
+                if not questions:
+                    raise RuntimeError("All question generation tasks failed — check LLM logs.")
+
+                # Re-number sequentially after filtering
+                for seq, q in enumerate(questions, 1):
+                    q["id"] = seq
+
+                _db_update(pipe_conn, assignment_id, questions=questions)
+                logger.info(
+                    "{} questions generated for assignment {}",
+                    len(questions), assignment_id,
+                )
+
+                # ── Step 4: Review ─────────────────────────────────────────────
+                quality_report = await _run_reviewer(questions, blueprint)
+                _db_update(
+                    pipe_conn,
+                    assignment_id,
+                    quality_report=quality_report,
+                    status="DRAFT",
+                )
+                logger.info(
+                    "Assignment {} DRAFT — quality_score={}",
+                    assignment_id, quality_report.get("overall_score"),
+                )
+
+            except Exception as exc:
+                logger.exception(
+                    "Assignment generation failed assignment_id={}", assignment_id
+                )
+                try:
+                    _db_update(
+                        pipe_conn,
+                        assignment_id,
+                        status="FAILED",
+                        error_message=str(exc)[:500],
+                    )
+                except Exception:
+                    logger.warning("Could not write FAILED status to DB")
+                raise
+        finally:
+            if use_worker_loop and pipe_conn is not None:
+                try:
+                    pipe_conn.close()
+                except Exception:
+                    pass
+
+    if use_worker_loop:
+        run_worker_coroutine(_pipeline(), timeout=None)
+        return
 
     # Run async pipeline — avoid nesting if a loop is already running (e.g. tests)
     try:

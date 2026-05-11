@@ -4,11 +4,29 @@ import { jsonOk, jsonError } from "@/lib/http/json-response";
 import { ApiError } from "@/lib/http/api-error";
 import { requireAuthenticated } from "@/lib/admin";
 import { getAuthFromRequest } from "@/lib/request-auth";
-import { deleteMaterial } from "@/lib/services/materialService";
+import { deleteMaterial, getMaterialDetailDto } from "@/lib/services/materialService";
 
 export const dynamic = "force-dynamic";
 
 type Ctx = { params: Promise<{ materialId: string }> };
+
+export async function GET(req: NextRequest, ctx: Ctx) {
+  try {
+    const auth = requireAuthenticated(await getAuthFromRequest(req));
+    const { materialId } = await ctx.params;
+    const detail = await getMaterialDetailDto(
+      auth.sub,
+      auth.role as UserRole,
+      materialId,
+    );
+    return jsonOk(detail);
+  } catch (e) {
+    if (e instanceof ApiError) return jsonError(e);
+    return jsonError(
+      new ApiError(500, "INTERNAL_ERROR", "Internal server error"),
+    );
+  }
+}
 
 export async function DELETE(req: NextRequest, ctx: Ctx) {
   try {

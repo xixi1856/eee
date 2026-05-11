@@ -3,24 +3,9 @@ import { jsonOk, jsonError } from "@/lib/http/json-response";
 import { ApiError } from "@/lib/http/api-error";
 import { getInternalApiKeyOrNull } from "@/lib/config";
 import { hasCourseRagAccess } from "@/lib/course-access";
-import { prisma } from "@/lib/db";
+import { resolvePlatformUserFromAgentQuery } from "@/lib/internal-agent-user";
 
 export const dynamic = "force-dynamic";
-
-/**
- * Agent HTTP passes ``user_id`` = bound ``agent_user_id``. Enrollment checks use
- * platform ``users.id`` — resolve mapping when present.
- */
-async function resolvePlatformUserIdForCourseRag(
-  userIdParam: string,
-): Promise<string> {
-  const row = await prisma.agentIdentityMapping.findUnique({
-    where: { agentUserId: userIdParam },
-    select: { platformUserId: true },
-  });
-  if (row) return row.platformUserId;
-  return userIdParam;
-}
 
 export async function GET(req: NextRequest) {
   try {
@@ -41,7 +26,7 @@ export async function GET(req: NextRequest) {
     if (!courseId || !userId) {
       throw new ApiError(400, "VALIDATION_ERROR", "course_id and user_id are required");
     }
-    const platformUserId = await resolvePlatformUserIdForCourseRag(userId);
+    const platformUserId = await resolvePlatformUserFromAgentQuery(userId);
     const access = await hasCourseRagAccess(platformUserId, courseId);
     return jsonOk({ access });
   } catch (e) {

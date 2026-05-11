@@ -2,6 +2,11 @@
 
 If PostgreSQL reports ``another operation is in progress`` during indexing, try
 lowering ``MAX_PARALLEL_INSERT`` or ``EMBEDDING_MAX_ASYNC`` in ``rag_mvp`` settings.
+
+When ``edu-rag-worker`` has started the persistent async loop (``worker_async_loop``),
+parse and ingest run on that loop so LightRAG global locks stay on one event loop.
+Otherwise parse uses ``engine.parse_file`` (``asyncio.run``) and ingest uses sync wrappers.
+PARSED / INDEXING commits remain on the main thread between parse and ingest.
 """
 
 from __future__ import annotations
@@ -19,12 +24,17 @@ import psycopg
 from loguru import logger
 
 from rag_mvp.config import settings
-from rag_mvp.db import connect_sync
 from rag_mvp.engine import (
+    _aparse_file,
+    _build_parser,
+    _invalidate_course_rag_cache_for,
+    delete_material_course_async,
     delete_material_course_sync,
+    ingest_parsed_material_into_course_async,
     ingest_parsed_material_into_course_sync,
     parse_file,
 )
+from rag_mvp.worker_async_loop import is_worker_async_loop_started, run_worker_coroutine
 
 
 def _s3_client():
@@ -46,6 +56,63 @@ def _s3_client():
 
 def _bucket() -> str:
     return os.environ["MINIO_BUCKET"].strip()
+
+
+async def _parse_material_file_async(local_file: Path) -> None:
+    """MinerU parse only (same behaviour as ``engine.parse_file``)."""
+    logger.info("Parsing file: {}", local_file.name)
+    rag = _build_parser()
+    await _aparse_file(rag, local_file)
+
+
+async def _ingest_parsed_material_worker_async(
+    course_id: str,
+    material_id: str,
+    local_file: Path,
+) -> int:
+    """Ingest + same cache invalidation as ``ingest_parsed_material_into_course_sync``."""
+    try:
+        return await ingest_parsed_material_into_course_async(
+            course_id,
+            material_id,
+            local_file,
+        )
+    finally:
+        _invalidate_course_rag_cache_for(course_id)
+
+
+async def _delete_material_course_worker_async(course_id: str, material_id: str) -> None:
+    """Delete + same cache invalidation as ``delete_material_course_sync``."""
+    try:
+        await delete_material_course_async(course_id, material_id)
+    finally:
+        _invalidate_course_rag_cache_for(course_id)
+
+
+def _parse_file_dispatch(local_file: Path) -> None:
+    if is_worker_async_loop_started():
+        run_worker_coroutine(_parse_material_file_async(local_file), timeout=None)
+    else:
+        parse_file(local_file)
+
+
+def _ingest_parsed_dispatch(course_id: str, material_id: str, local_file: Path) -> int:
+    if is_worker_async_loop_started():
+        return run_worker_coroutine(
+            _ingest_parsed_material_worker_async(course_id, material_id, local_file),
+            timeout=None,
+        )
+    return ingest_parsed_material_into_course_sync(course_id, material_id, local_file)
+
+
+def _delete_material_rag_dispatch(course_id: str, material_id: str) -> None:
+    if is_worker_async_loop_started():
+        run_worker_coroutine(
+            _delete_material_course_worker_async(course_id, material_id),
+            timeout=None,
+        )
+    else:
+        delete_material_course_sync(course_id, material_id)
 
 
 def download_object_to_path(minio_path: str, dest: Path) -> None:
@@ -95,21 +162,24 @@ def _upload_object(local_path: Path, minio_path: str) -> None:
     client.upload_file(str(local_path), _bucket(), minio_path)
 
 
-def _update_material_file_info(
-    conn: psycopg.Connection,
-    material_id: str,
-    new_minio_path: str,
-    new_file_type: str,
+def _preview_pdf_minio_key(minio_path: str) -> str:
+    """Stable key for browser preview PDF (Office originals keep ``minio_path``)."""
+    return str(Path(minio_path).parent / "preview.pdf")
+
+
+def update_material_preview_pdf_status(
+    conn: psycopg.Connection, material_id: str, status: str
 ) -> None:
-    """Update minio_path and file_type for a material record after format conversion."""
+    """``status``: NA | PENDING | READY | FAILED (Prisma enum)."""
     with conn.cursor() as cur:
         cur.execute(
             """
             UPDATE materials
-            SET minio_path = %s, file_type = %s, updated_at = NOW()
+            SET preview_pdf_status = %s::"MaterialPreviewPdfStatus",
+                updated_at = NOW()
             WHERE id = %s::uuid AND is_deleted = false
             """,
-            (new_minio_path, new_file_type, material_id),
+            (status, material_id),
         )
 
 
@@ -225,24 +295,29 @@ def process_parse_and_index(conn: psycopg.Connection, material_id: str) -> None:
         if ft == "image":
             raise ValueError("Image indexing is not supported for course materials in this phase")
 
-        # Convert PPTX/DOCX → PDF so MinerU can parse them uniformly.
+        # Convert Office → PDF for MinerU and upload ``preview.pdf`` (original ``minio_path`` unchanged).
         if local_file.suffix.lower() in _OFFICE_SUFFIXES:
             logger.info(
                 "Converting {} to PDF via LibreOffice (material {})",
                 local_file.suffix,
                 material_id,
             )
-            pdf_file = _convert_to_pdf(local_file, work_parent / "pdf_out")
-            pdf_minio_path = str(Path(minio_path).parent / f"{material_id}.pdf")
-            _upload_object(pdf_file, pdf_minio_path)
-            with conn.transaction():
-                _update_material_file_info(conn, material_id, pdf_minio_path, "pdf")
+            try:
+                pdf_file = _convert_to_pdf(local_file, work_parent / "pdf_out")
+                preview_key = _preview_pdf_minio_key(minio_path)
+                _upload_object(pdf_file, preview_key)
+                with conn.transaction():
+                    update_material_preview_pdf_status(conn, material_id, "READY")
+            except Exception:
+                with conn.transaction():
+                    update_material_preview_pdf_status(conn, material_id, "FAILED")
+                raise
             local_file = pdf_file
             ft = "pdf"
-            logger.info("Conversion done → {}", pdf_file.name)
+            logger.info("Conversion done → {} (preview at {})", pdf_file.name, preview_key)
 
-        # Same parse stack as CLI `rag parse` (engine.parse_file).
-        parse_file(local_file)
+        # Same parse stack as CLI `rag parse` (engine.parse_file), or worker persistent loop.
+        _parse_file_dispatch(local_file)
 
         with conn.transaction():
             update_material_status(
@@ -254,7 +329,7 @@ def process_parse_and_index(conn: psycopg.Connection, material_id: str) -> None:
                 conn, material_id, "INDEXING", None, expect_status_in=("PARSED",)
             )
 
-        n = ingest_parsed_material_into_course_sync(course_id, material_id, local_file)
+        n = _ingest_parsed_dispatch(course_id, material_id, local_file)
 
         with conn.transaction():
             ok = update_material_status(
@@ -308,5 +383,5 @@ def process_delete_material(conn: psycopg.Connection, material_id: str) -> None:
                 raise RuntimeError(
                     f"delete_material: material {material_id} expected is_deleted=true",
                 )
-    delete_material_course_sync(course_id, material_id)
+    _delete_material_rag_dispatch(course_id, material_id)
     logger.info("Deleted LightRAG document for material {} (course {})", material_id, course_id)

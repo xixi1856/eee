@@ -473,7 +473,11 @@ def status() -> None:
     if metadata_path.exists():
         import json
         meta = json.loads(metadata_path.read_text(encoding="utf-8"))
-        click.echo(f"Embed model : {meta.get('embedding_model')} (dim={meta.get('embedding_dim')})")
+        mode = meta.get("embedding_mode") or "ollama"
+        click.echo(
+            f"Embed       : mode={mode} model={meta.get('embedding_model')} "
+            f"(dim={meta.get('embedding_dim')})"
+        )
 
     click.echo(f"Storage size: {total_mb:.1f} MB")
     click.echo(f"Parsed docs : {len(parsed_files)} markdown files")

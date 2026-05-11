@@ -1,4 +1,7 @@
 import { prisma } from "@/lib/db";
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const px = prisma as any;
 import { createAgentSession, postChatCompletionsStream } from "@/lib/agentClient";
 import { ApiError } from "@/lib/http/api-error";
 
@@ -84,7 +87,7 @@ export async function getOrCreateCourseChatSession(
 }
 
 type PersistArgs = {
-  courseId: string;
+  courseId: string | null;
   platformStudentId: string;
   lessonId: string | null;
   sessionId: string;
@@ -120,7 +123,7 @@ async function maybePersistQaLog(a: PersistArgs): Promise<void> {
         ? (b3.hit_materials as string[])
         : [],
       hitSources: Array.isArray(b3.hit_sources) ? (b3.hit_sources as string[]) : [],
-    },
+    } as Parameters<typeof prisma.qaLog.create>[0]["data"],
   });
 }
 
@@ -295,6 +298,113 @@ export async function courseChatSseResponse(
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
+    },
+  });
+}
+
+export type QaCenterChatParams = {
+  platformStudentId: string;
+  agentUserId: string;
+  message: string;
+  sessionId?: string | null;
+  attachments?: AttachmentParam[];
+};
+
+async function getOrCreateQaCenterAgentSession(
+  platformStudentId: string,
+  agentUserId: string,
+  existingSessionId?: string | null,
+): Promise<string> {
+  const sid = existingSessionId?.trim();
+  if (sid) {
+    const row = await px.qaCenterSession.findFirst({
+      where: {
+        agentSessionId: sid,
+        studentId: platformStudentId,
+        deletedAt: null,
+      },
+    });
+    if (!row) {
+      throw new ApiError(404, "NOT_FOUND", "问答会话不存在或已删除");
+    }
+    return row.agentSessionId;
+  }
+  const agentSessionId = await createAgentSession(agentUserId, "问答中心");
+  try {
+    await px.qaCenterSession.create({
+      data: {
+        studentId: platformStudentId,
+        agentSessionId,
+      },
+    });
+  } catch {
+    const again = await px.qaCenterSession.findFirst({
+      where: {
+        agentSessionId,
+        studentId: platformStudentId,
+        deletedAt: null,
+      },
+    });
+    if (again) return again.agentSessionId;
+    throw new ApiError(500, "INTERNAL_ERROR", "Failed to persist QA center session");
+  }
+  return agentSessionId;
+}
+
+/** QA center: no course header; RAG uses ``enrolled_courses`` in EduAgent. */
+export async function qaCenterChatSseResponse(
+  p: QaCenterChatParams,
+): Promise<Response> {
+  const user = await prisma.user.findFirst({
+    where: { id: p.platformStudentId, isActive: true },
+    select: { qaCollectionEnabled: true },
+  });
+  if (!user) {
+    throw new ApiError(404, "NOT_FOUND", "User not found");
+  }
+  const sessionId = await getOrCreateQaCenterAgentSession(
+    p.platformStudentId,
+    p.agentUserId,
+    p.sessionId,
+  );
+  const agentRes = await postChatCompletionsStream({
+    agentUserId: p.agentUserId,
+    courseId: null,
+    lessonId: null,
+    sessionId,
+    userMessage: p.message,
+    stream: true,
+    attachments: p.attachments,
+  });
+  if (!agentRes.ok) {
+    const t = await agentRes.text();
+    throw new ApiError(
+      502,
+      "AGENT_CHAT_FAILED",
+      `Agent chat failed: ${agentRes.status} ${t.slice(0, 400)}`,
+    );
+  }
+  if (!agentRes.body) {
+    throw new ApiError(502, "AGENT_CHAT_FAILED", "Agent returned empty body");
+  }
+  const persist = user.qaCollectionEnabled;
+  const transform = createB3SseTransformFromAgent({
+    courseId: null,
+    platformStudentId: p.platformStudentId,
+    lessonId: null,
+    sessionId,
+    question: p.message,
+    answer: "",
+    persist,
+  });
+  const out = agentRes.body.pipeThrough(transform);
+  return new Response(out, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Qa-Center-Session-Id": sessionId,
     },
   });
 }

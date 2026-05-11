@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import type { ReadableStream } from "node:stream/web";
 import {
+  MaterialPreviewPdfStatus,
   MaterialStatus,
   UserRole,
   type Material,
@@ -14,10 +15,24 @@ import {
   getRedisUrl,
 } from "@/lib/config";
 import { assertTeacherOfCourse, getCourseIfMember, assertUuid } from "@/lib/course-access";
-import { deleteObject, putObjectStream } from "@/lib/minio";
+import {
+  deleteObject,
+  getObjectStream,
+  putObjectStream,
+} from "@/lib/minio";
+import {
+  isOfficeMaterialFileType,
+  legacyConvertedPdfObjectKey,
+  previewPdfObjectKey,
+} from "@/lib/material-office";
 import { enqueueRagTask, type RagQueueTask } from "@/lib/queue/ragTask";
-import type { MaterialCreatedDto, MaterialSummaryDto } from "@/lib/dto/material.dto";
+import type {
+  MaterialCreatedDto,
+  MaterialDetailDto,
+  MaterialSummaryDto,
+} from "@/lib/dto/material.dto";
 import { MATERIAL_UPLOAD_ALLOWED_EXT_SET } from "@/lib/material-upload-allowed";
+import { mapStorageReadError } from "@/lib/material-storage-errors";
 
 async function enqueueRagTaskWithRetry(task: RagQueueTask, maxAttempts = 5): Promise<void> {
   let last: unknown;
@@ -59,6 +74,7 @@ function toSummary(m: Material): MaterialSummaryDto {
     file_type: m.fileType,
     lesson_id: m.lessonId ?? null,
     status: m.status,
+    preview_pdf_status: m.previewPdfStatus,
     indexed_chunk_count: m.indexedChunkCount,
     created_at: m.createdAt.toISOString(),
     status_message: m.statusMessage,
@@ -147,19 +163,9 @@ export async function uploadMaterialStream(params: {
   const materialId = randomUUID();
   const safeName = params.originalFilename.replace(/[^a-zA-Z0-9._-]/g, "_");
   const minioPath = `materials/${params.courseId}/${materialId}/${safeName}`;
-
-  const material = await prisma.material.create({
-    data: {
-      id: materialId,
-      courseId: params.courseId,
-      lessonId: params.lessonId || null,
-      originalFilename: params.originalFilename,
-      fileType,
-      fileSize: params.contentLength,
-      minioPath,
-      status: MaterialStatus.UPLOADED,
-    },
-  });
+  const previewPdfStatus = isOfficeMaterialFileType(fileType)
+    ? MaterialPreviewPdfStatus.PENDING
+    : MaterialPreviewPdfStatus.NA;
 
   const nodeReadable =
     params.body instanceof Readable
@@ -174,17 +180,36 @@ export async function uploadMaterialStream(params: {
       contentType: params.contentType,
     });
   } catch (e) {
-    await prisma.material.update({
-      where: { id: materialId },
-      data: {
-        status: MaterialStatus.FAILED,
-        statusMessage: e instanceof Error ? e.message : "MinIO upload failed",
-      },
-    });
     throw new ApiError(
       503,
       "SERVICE_UNAVAILABLE",
       "Object storage upload failed",
+      { detail: e instanceof Error ? e.message : String(e) },
+    );
+  }
+
+  let material: Material;
+  try {
+    material = await prisma.material.create({
+      data: {
+        id: materialId,
+        courseId: params.courseId,
+        lessonId: params.lessonId || null,
+        originalFilename: params.originalFilename,
+        fileType,
+        fileSize: params.contentLength,
+        minioPath,
+        previewPdfStatus,
+        status: MaterialStatus.UPLOADED,
+      } as never,
+    });
+  } catch (e) {
+    await deleteObject(minioPath).catch(() => {});
+    throw new ApiError(
+      500,
+      "INTERNAL_ERROR",
+      "Failed to persist material after upload",
+      { detail: e instanceof Error ? e.message : String(e) },
     );
   }
 
@@ -251,4 +276,131 @@ export async function deleteMaterial(
     );
   }
   await deleteObject(m.minioPath);
+  if (isOfficeMaterialFileType(m.fileType)) {
+    await deleteObject(previewPdfObjectKey(m.minioPath)).catch(() => {});
+    await deleteObject(
+      legacyConvertedPdfObjectKey(m.minioPath, m.id),
+    ).catch(() => {});
+  }
+}
+
+function guessContentTypeByFileType(fileType: string): string {
+  const ft = fileType.toLowerCase();
+  if (ft === "pdf") return "application/pdf";
+  if (ft === "md") return "text/markdown; charset=utf-8";
+  if (ft === "txt") return "text/plain; charset=utf-8";
+  return "application/octet-stream";
+}
+
+export async function assertMaterialReadAccess(
+  userId: string,
+  role: UserRole,
+  materialId: string,
+): Promise<Material> {
+  assertUuid(materialId, "material_id");
+  const m = await prisma.material.findFirst({
+    where: { id: materialId, isDeleted: false },
+  });
+  if (!m) {
+    throw new ApiError(404, "NOT_FOUND", "Material not found");
+  }
+  await getCourseIfMember(userId, role, m.courseId);
+  return m;
+}
+
+export async function getMaterialDetailDto(
+  userId: string,
+  role: UserRole,
+  materialId: string,
+): Promise<MaterialDetailDto> {
+  const m = await assertMaterialReadAccess(userId, role, materialId);
+  return {
+    id: m.id,
+    filename: m.originalFilename,
+    file_type: m.fileType,
+    lesson_id: m.lessonId ?? null,
+    status: m.status,
+    preview_pdf_status: m.previewPdfStatus,
+    indexed_chunk_count: m.indexedChunkCount,
+    created_at: m.createdAt.toISOString(),
+    status_message: m.statusMessage,
+  };
+}
+
+async function readObjectStreamForMaterial(
+  objectKey: string,
+): Promise<Awaited<ReturnType<typeof getObjectStream>>> {
+  try {
+    return await getObjectStream({ objectKey });
+  } catch (e) {
+    throw mapStorageReadError(e);
+  }
+}
+
+export type OpenMaterialContentParams = {
+  userId: string;
+  role: UserRole;
+  materialId: string;
+  /** `original` streams the uploaded object as attachment (for download). */
+  variant: "inline" | "original";
+};
+
+export type OpenMaterialContentResult = {
+  /** S3 web stream (cast for ``NextResponse`` / BodyInit typing). */
+  body: BodyInit;
+  contentType: string;
+  contentDisposition: string;
+};
+
+export async function openMaterialContentStream(
+  params: OpenMaterialContentParams,
+): Promise<OpenMaterialContentResult> {
+  const m = await assertMaterialReadAccess(
+    params.userId,
+    params.role,
+    params.materialId,
+  );
+  const ft = m.fileType.toLowerCase();
+
+  if (params.variant === "original") {
+    const { body, contentType } = await readObjectStreamForMaterial(m.minioPath);
+    const ct = contentType || guessContentTypeByFileType(ft);
+    const name = encodeURIComponent(m.originalFilename);
+    return {
+      body,
+      contentType: ct,
+      contentDisposition: `attachment; filename*=UTF-8''${name}`,
+    };
+  }
+
+  if (isOfficeMaterialFileType(ft)) {
+    const ps = m.previewPdfStatus;
+    if (ps !== MaterialPreviewPdfStatus.READY) {
+      throw new ApiError(425, "PREVIEW_NOT_READY", "Preview PDF is not ready yet", {
+        preview_pdf_status: ps,
+      });
+    }
+    const key = previewPdfObjectKey(m.minioPath);
+    const { body, contentType } = await readObjectStreamForMaterial(key);
+    return {
+      body,
+      contentType: contentType || "application/pdf",
+      contentDisposition: "inline",
+    };
+  }
+
+  if (ft === "pdf" || ft === "md" || ft === "txt") {
+    const { body, contentType } = await readObjectStreamForMaterial(m.minioPath);
+    return {
+      body,
+      contentType: contentType || guessContentTypeByFileType(ft),
+      contentDisposition: "inline",
+    };
+  }
+
+  throw new ApiError(
+    400,
+    "VALIDATION_ERROR",
+    "Unsupported material type for inline preview",
+  );
 }

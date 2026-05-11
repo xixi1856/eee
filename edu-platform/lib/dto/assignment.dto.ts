@@ -49,10 +49,21 @@ export interface QualityReport {
 
 // ── Request bodies ──────────────────────────────────────────────────────────
 
+export interface StructuredGenerationParams {
+  lessonIds: string[];
+  lessonNames: string[];
+  knowledgePoints: string[];
+  difficulty: "easy" | "medium" | "hard";
+  count: number;
+  typeWeights: Record<string, number>;
+  objectiveWeights: Record<string, number>;
+}
+
 export interface GenerateAssignmentBody {
   title: string;
   teacherRequest: string;
   deadline?: string; // ISO-8601
+  structuredParams?: StructuredGenerationParams;
 }
 
 export interface PatchAssignmentBody {

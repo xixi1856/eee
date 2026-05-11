@@ -1,4 +1,7 @@
-import type { MaterialStatus } from "@prisma/client";
+import type {
+  MaterialPreviewPdfStatus,
+  MaterialStatus,
+} from "@prisma/client";
 
 export type MaterialSummaryDto = {
   id: string;
@@ -6,6 +9,19 @@ export type MaterialSummaryDto = {
   file_type: string;
   lesson_id: string | null;
   status: MaterialStatus;
+  preview_pdf_status: MaterialPreviewPdfStatus;
+  indexed_chunk_count: number;
+  created_at: string;
+  status_message: string | null;
+};
+
+export type MaterialDetailDto = {
+  id: string;
+  filename: string;
+  file_type: string;
+  lesson_id: string | null;
+  status: MaterialStatus;
+  preview_pdf_status: MaterialPreviewPdfStatus;
   indexed_chunk_count: number;
   created_at: string;
   status_message: string | null;

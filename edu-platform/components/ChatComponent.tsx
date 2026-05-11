@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState, useRef } from "react";
+import Link from "next/link";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
@@ -9,15 +10,57 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Send, User, Bot, AlertCircle, Paperclip, X, FileText, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { useChatStream, type AttachmentRef } from "@/lib/hooks/useChatStream";
+import {
+  useChatStream,
+  type AttachmentRef,
+  type UseChatStreamConfig,
+} from "@/lib/hooks/useChatStream";
 
 type UserMe = {
   qa_collection_enabled?: boolean;
   qa_collection_notice_accepted_at?: string | null;
+  agent_identity_bound?: boolean;
 };
 
-export default function ChatComponent({ courseId }: { courseId: string }) {
+export type ChatComponentProps =
+  | {
+      variant?: "course";
+      courseId: string;
+      hydrateSessionId?: string | null;
+      emptyHint?: string;
+    }
+  | {
+      variant: "qa_center";
+      sessionId: string | null;
+      onSessionResolved?: (sessionId: string) => void;
+      emptyHint?: string;
+    };
+
+function buildStreamConfig(props: ChatComponentProps): UseChatStreamConfig {
+  if (props.variant === "qa_center") {
+    return {
+      kind: "qa_center_global",
+      sessionId: props.sessionId,
+      onResolvedSessionId: props.onSessionResolved,
+    };
+  }
+  return {
+    kind: "course",
+    courseId: props.courseId,
+    hydrateSessionId: props.hydrateSessionId ?? null,
+  };
+}
+
+function defaultEmptyHint(props: ChatComponentProps): string {
+  if (props.variant === "qa_center") {
+    return "向助手提问，将检索你有权限的全部课程资料";
+  }
+  return "向我提问关于本节课的任何问题";
+}
+
+export default function ChatComponent(props: ChatComponentProps) {
   const [input, setInput] = useState("");
+  const [agentIdentityBound, setAgentIdentityBound] = useState<boolean | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const {
     msgs,
@@ -31,13 +74,17 @@ export default function ChatComponent({ courseId }: { courseId: string }) {
     attachmentUploading,
     addAttachment,
     removeAttachment,
-  } = useChatStream(courseId);
+  } = useChatStream(buildStreamConfig(props));
   const scrollRef = useRef<HTMLDivElement>(null);
+  const emptyHint = props.emptyHint ?? defaultEmptyHint(props);
 
   const loadUser = useCallback(async () => {
     const res = await fetch("/api/v1/user", { credentials: "include" });
     if (!res.ok) return;
     const u = (await res.json()) as UserMe;
+    if (typeof u.agent_identity_bound === "boolean") {
+      setAgentIdentityBound(u.agent_identity_bound);
+    }
     if (!u.qa_collection_notice_accepted_at) {
       if (window.confirm("为改进教学，我们会记录提问数据。此行为可随时在个人资料关闭。确认知悉？")) {
         await fetch("/api/v1/user", {
@@ -91,12 +138,29 @@ export default function ChatComponent({ courseId }: { courseId: string }) {
 
   return (
     <div className="flex flex-col h-full bg-background relative">
+      {agentIdentityBound === false && (
+        <div className="shrink-0 border-b border-amber-500/25 bg-amber-500/10 px-4 py-2.5 text-sm text-amber-950 dark:text-amber-100">
+          <div className="max-w-3xl mx-auto flex flex-wrap items-center gap-2">
+            <AlertCircle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" aria-hidden />
+            <span>
+              当前账号尚未绑定 Edu Agent。请先在 Agent 侧执行绑定（edu bind），再到本平台的
+            </span>
+            <Link
+              href="/credentials"
+              className="font-medium text-amber-900 underline underline-offset-2 hover:text-amber-800 dark:text-amber-200 dark:hover:text-amber-50"
+            >
+              凭证
+            </Link>
+            <span>页完成关联后再使用 AI 聊天。</span>
+          </div>
+        </div>
+      )}
       <ScrollArea ref={scrollRef} className="flex-1 w-full px-4 md:px-8 pt-6 pb-32">
         <div className="max-w-3xl mx-auto space-y-8 flex flex-col">
           {msgs.length === 0 && !streaming && (
             <div className="h-[50vh] flex flex-col items-center justify-center text-muted-foreground opacity-50">
               <Bot className="h-16 w-16 mb-4" />
-              <p>向我提问关于本节课的任何问题</p>
+              <p>{emptyHint}</p>
             </div>
           )}
 

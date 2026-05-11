@@ -1,4 +1,6 @@
 export type ApiErrorCode =
+  | "FILE_TOO_LARGE"
+  | "UNSUPPORTED_MEDIA_TYPE"
   | "VALIDATION_ERROR"
   | "UNAUTHORIZED"
   | "FORBIDDEN"
@@ -12,7 +14,9 @@ export type ApiErrorCode =
   | "AGENT_NOT_BOUND"
   | "AGENT_UNAVAILABLE"
   | "AGENT_SESSION_CREATE_FAILED"
-  | "AGENT_CHAT_FAILED";
+  | "AGENT_CHAT_FAILED"
+  | "PREVIEW_NOT_READY"
+  | "NOT_IMPLEMENTED";
 
 export class ApiError extends Error {
   readonly status: number;

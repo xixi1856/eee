@@ -1,10 +1,11 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Input } from "@/components/ui/input";
 import { Plus, BookOpen, ChevronRight, Clock, Archive } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -44,9 +45,13 @@ function CourseCardSkeleton() {
 }
 
 export default function CoursesPage() {
+  const router = useRouter();
   const [courses, setCourses] = useState<CourseRow[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [role, setRole] = useState<string | null>(null);
+  const [shareCode, setShareCode] = useState("");
+  const [joining, setJoining] = useState(false);
+  const [joinErr, setJoinErr] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -71,6 +76,32 @@ export default function CoursesPage() {
     return () => { cancelled = true; };
   }, []);
 
+  async function joinByShareCode() {
+    setJoinErr(null);
+    setJoining(true);
+    try {
+      const res = await fetch("/api/v1/courses/join-by-code", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ share_code: shareCode }),
+      });
+      const data = (await res.json()) as {
+        course_id?: string;
+        error?: { message?: string };
+      };
+      if (!res.ok) {
+        setJoinErr(data.error?.message ?? `加入失败 (${res.status})`);
+        return;
+      }
+      if (data.course_id) {
+        router.push(`/courses/${data.course_id}`);
+      }
+    } finally {
+      setJoining(false);
+    }
+  }
+
   return (
     <div className="flex flex-col h-full overflow-auto">
       <div className="max-w-5xl mx-auto w-full px-6 py-8 space-y-8">
@@ -81,7 +112,9 @@ export default function CoursesPage() {
               课程空间
             </h1>
             <p className="mt-1 text-sm text-muted-foreground">
-              {role === "TEACHER" ? "管理你创建的所有课程" : "浏览并加入你的课程"}
+              {role === "TEACHER"
+                ? "管理你创建或协作的课程"
+                : "浏览并加入你的课程"}
             </p>
           </div>
           {role === "TEACHER" && (
@@ -93,6 +126,37 @@ export default function CoursesPage() {
             </Button>
           )}
         </div>
+
+        {(role === "STUDENT" || role === "TEACHER") && (
+          <div className="rounded-xl border border-border bg-card p-4 flex flex-col sm:flex-row sm:items-end gap-3">
+            <div className="flex-1 space-y-1.5 min-w-0">
+              <label htmlFor="course-share-code" className="text-sm font-medium text-foreground">
+                通过分享码加入课程
+              </label>
+              <Input
+                id="course-share-code"
+                placeholder="输入教师提供的分享码"
+                value={shareCode}
+                onChange={(e) => setShareCode(e.target.value)}
+                className="font-mono tracking-wide max-w-md"
+                autoComplete="off"
+              />
+            </div>
+            <Button
+              type="button"
+              disabled={joining || !shareCode.trim()}
+              onClick={() => void joinByShareCode()}
+              className="shrink-0 w-full sm:w-auto"
+            >
+              {joining ? "加入中…" : "加入"}
+            </Button>
+          </div>
+        )}
+        {joinErr && (
+          <div className="rounded-lg border border-destructive/30 bg-destructive/8 px-4 py-3 text-sm text-destructive">
+            {joinErr}
+          </div>
+        )}
 
         {/* Error */}
         {err && (
@@ -120,7 +184,7 @@ export default function CoursesPage() {
             <p className="text-sm text-muted-foreground max-w-xs">
               {role === "TEACHER"
                 ? "点击右上角「创建课程」开始构建你的第一门课程。"
-                : "当前还没有可以访问的课程，请联系老师获取加入权限。"}
+                : "在上方输入教师提供的分享码加入课程，或联系教师获取分享码。"}
             </p>
           </div>
         )}

@@ -6,6 +6,7 @@ import { requireAuthenticated } from "@/lib/admin";
 import { getAuthFromRequest } from "@/lib/request-auth";
 import { assertUuid, getCourseIfMember } from "@/lib/course-access";
 import { prisma } from "@/lib/db";
+import { agentNotBoundError } from "@/lib/agent-not-bound-error";
 import { courseChatSseResponse } from "@/lib/services/chatService";
 
 export const dynamic = "force-dynamic";
@@ -18,11 +19,7 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     const { courseId } = await ctx.params;
     await getCourseIfMember(auth.sub, auth.role as UserRole, courseId);
     if (!auth.agent_user_id) {
-      throw new ApiError(
-        400,
-        "AGENT_NOT_BOUND",
-        "Bind an agent identity before using course chat",
-      );
+      throw agentNotBoundError();
     }
     const body = (await req.json()) as {
       message?: string;

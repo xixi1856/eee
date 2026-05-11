@@ -12,7 +12,7 @@ export async function GET(req: NextRequest) {
   try {
     const ctx = requireAuthenticated(await getAuthFromRequest(req));
     const user = await getUserProfile(ctx.sub);
-    return jsonOk(user);
+    return jsonOk({ ...user, agent_identity_bound: !!ctx.agent_user_id });
   } catch (e) {
     if (e instanceof ApiError) return jsonError(e);
     return jsonError(

@@ -6,13 +6,104 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import httpx
 from openai import AsyncOpenAI
 from lightrag.llm.openai import openai_complete_if_cache
-from lightrag.llm.ollama import ollama_embed
-from lightrag.utils import EmbeddingFunc
 from loguru import logger
 
 from .config import settings
+from .http_env import ensure_loopback_bypass_http_proxy
+
+# Before any httpx / ollama calls: so Ollama and other loopback URLs ignore HTTP_PROXY.
+ensure_loopback_bypass_http_proxy()
+
+
+def ensure_ollama_embedding_reachable(*, timeout: float = 3.0) -> None:
+    """Fail fast before LightRAG opens PG pools if Ollama is down (course indexing).
+
+    Only runs when ``EMBEDDING_MODE=ollama``. Uses ``OLLAMA_BASE_URL``.
+    Set ``RAG_SKIP_OLLAMA_PREFLIGHT=1`` to skip (e.g. isolated unit tests).
+    Set ``RAG_SKIP_EMBEDDING_PREFLIGHT=1`` to skip all embedding pref lights.
+    """
+    import os
+
+    if settings.embedding_mode != "ollama":
+        return
+    if os.environ.get("RAG_SKIP_EMBEDDING_PREFLIGHT", "").strip() in ("1", "true", "yes"):
+        return
+    if os.environ.get("RAG_SKIP_OLLAMA_PREFLIGHT", "").strip() in ("1", "true", "yes"):
+        return
+    base = settings.ollama_base_url.rstrip("/")
+    url = f"{base}/api/tags"
+    headers: dict[str, str] = {}
+    key = settings.ollama_api_key.strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    try:
+        with httpx.Client(timeout=timeout, trust_env=False) as client:
+            r = client.get(url, headers=headers or None)
+            r.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Ollama is not reachable at {base} (GET {url} failed). "
+            "Course material indexing requires a running Ollama with the embedding model "
+            f"pulled (e.g. `ollama pull {settings.embedding_model}`). "
+            "See https://ollama.com/download — "
+            "or set RAG_SKIP_OLLAMA_PREFLIGHT=1 only for tests."
+        ) from exc
+
+
+def ensure_openai_compatible_embedding_reachable(*, timeout: float = 5.0) -> None:
+    """Optional reachability hint for OpenAI-compatible embedding base URL (no hard fail).
+
+    When ``EMBEDDING_MODE=openai_compatible``, performs a lightweight GET ``/models``.
+    Set ``RAG_SKIP_EMBEDDING_PREFLIGHT=1`` to skip.
+    """
+    import os
+
+    if settings.embedding_mode != "openai_compatible":
+        return
+    if os.environ.get("RAG_SKIP_EMBEDDING_PREFLIGHT", "").strip() in ("1", "true", "yes"):
+        return
+
+    base = (settings.embedding_base_url or settings.llm_base_url or "").strip().rstrip("/")
+    if not base:
+        logger.warning(
+            "[embedding] EMBEDDING_MODE=openai_compatible but LLM_BASE_URL / EMBEDDING_BASE_URL is empty."
+        )
+        return
+
+    url = f"{base}/models"
+    headers: dict[str, str] = {}
+    key = (settings.embedding_api_key or settings.llm_api_key or "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    try:
+        with httpx.Client(timeout=timeout, trust_env=False) as client:
+            r = client.get(url, headers=headers or None)
+            if r.status_code >= 400:
+                logger.warning(
+                    f"[embedding] OpenAI-compatible preflight GET {url} returned {r.status_code}; "
+                    "embeddings may still work if your provider omits /models."
+                )
+    except Exception as exc:
+        logger.warning(
+            f"[embedding] OpenAI-compatible preflight failed ({url}): {exc}. "
+            "Continuing; set RAG_SKIP_EMBEDDING_PREFLIGHT=1 to silence."
+        )
+
+
+def ensure_embedding_backend_reachable(*, timeout: float = 3.0) -> None:
+    """Run the appropriate embedding preflight for ``EMBEDDING_MODE``."""
+    import os
+
+    if os.environ.get("RAG_SKIP_EMBEDDING_PREFLIGHT", "").strip() in ("1", "true", "yes"):
+        return
+    if settings.embedding_mode == "ollama":
+        ensure_ollama_embedding_reachable(timeout=timeout)
+    elif settings.embedding_mode == "openai_compatible":
+        ensure_openai_compatible_embedding_reachable(timeout=max(timeout, 5.0))
+
 
 # ---------------------------------------------------------------------------
 # Inject source context into LightRAG's rate-limit log lines.
@@ -256,27 +347,4 @@ async def _filtered_vision_model_func(
     )
 
 
-async def _ollama_embedding_func_with_label(texts: list[str], **kwargs):
-    """Ollama embeddings via LightRAG's ``ollama_embed.func`` (use .func to avoid double-wrap)."""
-    token = _llm_role.set(f"embedding/{settings.embedding_model}")
-    try:
-        key = settings.ollama_api_key.strip() or None
-        return await ollama_embed.func(
-            texts,
-            embed_model=settings.embedding_model,
-            host=settings.ollama_base_url.rstrip("/"),
-            api_key=key,
-            **kwargs,
-        )
-    finally:
-        _llm_role.reset(token)
-
-
-def build_embedding_func() -> EmbeddingFunc:
-    """Return a new ``EmbeddingFunc`` bound to current settings (fresh LightRAG worker queues)."""
-    return EmbeddingFunc(
-        embedding_dim=settings.embedding_dim,
-        max_token_size=settings.embedding_max_tokens,
-        func=_ollama_embedding_func_with_label,
-        model_name=settings.embedding_model,
-    )
+from .embedding_factory import build_embedding_func  # noqa: E402

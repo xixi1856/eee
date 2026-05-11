@@ -20,6 +20,12 @@ export type CourseSummaryDto = {
   status: CourseStatus;
   created_at: string;
   updated_at: string;
+  /** Present only for course owner or collaborator when status is PUBLISHED. */
+  share_code?: string | null;
+};
+
+export type JoinByShareCodeBody = {
+  share_code: string;
 };
 
 export type LessonDto = {

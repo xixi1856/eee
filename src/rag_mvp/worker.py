@@ -13,6 +13,7 @@ from loguru import logger
 
 from rag_mvp.db import connect_sync
 from rag_mvp.material_processor import process_delete_material, process_parse_and_index
+from rag_mvp.worker_async_loop import start_worker_async_loop, stop_worker_async_loop
 
 
 def _stream_name() -> str:
@@ -75,12 +76,15 @@ def _process_one(conn: Any, fields: dict[str, str]) -> None:
     op = fields.get("operation")
     if op == "assignment.generate":
         from rag_mvp.assignment_gen import generate_assignment
+        import json as _json
         assignment_id = (fields.get("assignment_id") or "").strip()
         course_id = (fields.get("course_id") or "").strip()
         teacher_request = fields.get("teacher_request", "")
         if not assignment_id or not course_id:
             raise ValueError("missing assignment_id or course_id")
-        generate_assignment(assignment_id, course_id, teacher_request, conn)
+        structured_params_raw = (fields.get("structured_params") or "").strip()
+        structured_params = _json.loads(structured_params_raw) if structured_params_raw else None
+        generate_assignment(assignment_id, course_id, teacher_request, conn, structured_params=structured_params)
         return
     material_id = (fields.get("material_id") or "").strip()
     if not material_id:
@@ -139,46 +143,49 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _stop)
 
     _ensure_group(r, stream, group)
+    start_worker_async_loop()
     logger.info(
-        "edu-rag-worker stream={} group={} consumer={} claim_idle_ms={}",
+        "edu-rag-worker stream={} group={} consumer={} claim_idle_ms={} persistent_async_loop=on",
         stream,
         group,
         consumer,
         idle_ms,
     )
-    while not stop:
-        try:
-            resp = r.execute_command(
-                "XAUTOCLAIM",
-                stream,
-                group,
-                consumer,
-                str(idle_ms),
-                "0-0",
-                "COUNT",
-                25,
-            )
-            claimed = _parse_autoclaim_messages(resp)
-            if claimed:
-                _handle_entries(conn, r, stream, group, claimed)
-            msgs = r.xreadgroup(
-                groupname=group,
-                consumername=consumer,
-                streams={stream: ">"},
-                count=5,
-                block=5000,
-            )
-            if msgs:
-                for _sname, entries in msgs:
-                    if entries:
-                        _handle_entries(conn, r, stream, group, entries)
-        except redis.ConnectionError:
-            logger.exception("Redis connection error")
-        except Exception:
-            logger.exception("Worker loop error")
-
-    conn.close()
-    logger.info("edu-rag-worker stopped")
+    try:
+        while not stop:
+            try:
+                resp = r.execute_command(
+                    "XAUTOCLAIM",
+                    stream,
+                    group,
+                    consumer,
+                    str(idle_ms),
+                    "0-0",
+                    "COUNT",
+                    25,
+                )
+                claimed = _parse_autoclaim_messages(resp)
+                if claimed:
+                    _handle_entries(conn, r, stream, group, claimed)
+                msgs = r.xreadgroup(
+                    groupname=group,
+                    consumername=consumer,
+                    streams={stream: ">"},
+                    count=5,
+                    block=5000,
+                )
+                if msgs:
+                    for _sname, entries in msgs:
+                        if entries:
+                            _handle_entries(conn, r, stream, group, entries)
+            except redis.ConnectionError:
+                logger.exception("Redis connection error")
+            except Exception:
+                logger.exception("Worker loop error")
+    finally:
+        stop_worker_async_loop()
+        conn.close()
+        logger.info("edu-rag-worker stopped")
 
 
 if __name__ == "__main__":

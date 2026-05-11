@@ -7,6 +7,7 @@ import { useTheme } from "next-themes";
 import {
   BookOpen,
   GraduationCap,
+  MessageSquare,
   Key,
   LogOut,
   Moon,
@@ -42,6 +43,12 @@ type UserInfo = {
 
 const navItems = [
   { label: "课程空间", href: "/courses", icon: BookOpen },
+  {
+    label: "问答中心",
+    href: "/me/qa-center",
+    icon: MessageSquare,
+    roles: ["STUDENT", "TEACHER", "ADMIN"],
+  },
   { label: "我的凭证", href: "/credentials", icon: Key, roles: ["STUDENT", "TEACHER", "ADMIN"] },
   { label: "个人中心", href: "/user", icon: User },
   { label: "学习进度", href: "/me/progress", icon: TrendingUp, roles: ["STUDENT"] },

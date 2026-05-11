@@ -668,6 +668,13 @@ class EduAgent:
             skill_entries=_skill_entries,
             memory_context=memory_context,
         )
+        if not (self.config.course_id or "").strip():
+            system_prompt += (
+                "\n\n## 当前会话模式（问答中心）\n"
+                "当前未绑定单一课程。调用 `knowledge_query` 时必须使用 "
+                "`sources=enrolled_courses`（检索用户有权限的全部课程知识库）"
+                "或 `sources=personal`；不得使用 `sources=course` 或 `sources=all`。\n"
+            )
 
         for iteration in range(1, self.config.max_iterations + 1):
             logger.debug("Iteration %d/%d", iteration, self.config.max_iterations)

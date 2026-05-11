@@ -33,3 +33,6 @@ Dockerfile_minerU
 uv.lock
 edu-platform/postgres/*
 scripts/truncate_except_prisma.sql
+AGENTS.md
+.gitignore
+test.py

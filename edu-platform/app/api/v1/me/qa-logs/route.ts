@@ -7,15 +7,24 @@ import { prisma } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const px = prisma as any;
+
 /** Soft-delete all QA logs for the authenticated user (GDPR erasure). */
 export async function DELETE(req: NextRequest) {
   try {
     const auth = requireAuthenticated(await getAuthFromRequest(req));
     const now = new Date();
-    const r = await prisma.qaLog.updateMany({
-      where: { studentId: auth.sub, deletedAt: null },
-      data: { deletedAt: now },
-    });
+    const [r, _qc] = await prisma.$transaction([
+      prisma.qaLog.updateMany({
+        where: { studentId: auth.sub, deletedAt: null },
+        data: { deletedAt: now },
+      }),
+      px.qaCenterSession.updateMany({
+        where: { studentId: auth.sub, deletedAt: null },
+        data: { deletedAt: now },
+      }),
+    ]);
     return jsonOk({ deleted_count: r.count });
   } catch (e) {
     if (e instanceof ApiError) return jsonError(e);

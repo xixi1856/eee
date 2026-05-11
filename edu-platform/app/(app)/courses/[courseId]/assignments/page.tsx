@@ -17,8 +17,6 @@ import {
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
-import { GenerateAssignmentDialog } from "@/components/assignment/GenerateAssignmentDialog";
-import { useNotify } from "@/hooks/useNotify";
 import type { AssignmentSummaryDto } from "@/lib/dto/assignment.dto";
 import { AssignmentStatus } from "@prisma/client";
 
@@ -83,11 +81,9 @@ function AssignmentRow({ a, courseId }: { a: AssignmentSummaryDto; courseId: str
 export default function AssignmentsPage() {
   const { courseId } = useParams<{ courseId: string }>();
   const router = useRouter();
-  const { notification, notify } = useNotify();
 
   const [loading, setLoading] = useState(true);
   const [assignments, setAssignments] = useState<AssignmentSummaryDto[]>([]);
-  const [showDialog, setShowDialog] = useState(false);
 
   const load = useCallback(async () => {
     const res = await fetch(`/api/v1/courses/${courseId}/assignments`, { credentials: "include" });
@@ -110,30 +106,12 @@ export default function AssignmentsPage() {
     return () => clearInterval(id);
   }, [assignments, load]);
 
-  function handleCreated(assignmentId: string) {
-    setShowDialog(false);
-    notify("success", "作业生成任务已提交，后台处理中…");
-    void load();
-    // Navigate to detail page after a short delay
-    setTimeout(() => router.push(`/courses/${courseId}/assignments/${assignmentId}`), 800);
+  function handleNewAssignment() {
+    router.push(`/courses/${courseId}/assignments/new`);
   }
 
   return (
     <div className="max-w-3xl mx-auto px-4 py-6 space-y-6">
-      {/* Notification */}
-      {notification && (
-        <div
-          className={cn(
-            "fixed top-4 right-4 z-50 rounded-lg px-4 py-3 text-sm shadow-lg flex items-center gap-2",
-            notification.type === "success"
-              ? "bg-green-600 text-white"
-              : "bg-destructive text-destructive-foreground",
-          )}
-        >
-          {notification.type === "success" ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
-          {notification.msg}
-        </div>
-      )}
 
       {/* Header */}
       <div className="flex items-center gap-3">
@@ -151,7 +129,7 @@ export default function AssignmentsPage() {
         <Button
           size="sm"
           className="gap-1.5"
-          onClick={() => setShowDialog(true)}
+          onClick={handleNewAssignment}
         >
           <Sparkles size={14} />
           AI 生成作业
@@ -176,15 +154,6 @@ export default function AssignmentsPage() {
             <AssignmentRow key={a.id} a={a} courseId={courseId} />
           ))}
         </div>
-      )}
-
-      {/* Dialog */}
-      {showDialog && (
-        <GenerateAssignmentDialog
-          courseId={courseId}
-          onClose={() => setShowDialog(false)}
-          onCreated={handleCreated}
-        />
       )}
     </div>
   );

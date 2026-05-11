@@ -3,6 +3,7 @@
 import asyncio
 import json
 import re
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -14,10 +15,12 @@ from raganything import RAGAnything, RAGAnythingConfig
 
 from .config import settings
 from .course_workspace import course_id_to_workspace
+from .mineru_cloud import MineruCloudError, parse_file_via_cloud
+from .embedding_factory import build_embedding_func
 from .llm import (
     _filtered_vision_model_func,
     build_data_uri_from_image_path,
-    build_embedding_func,
+    ensure_embedding_backend_reachable,
     llm_model_func,
     vision_model_func,
 )
@@ -33,6 +36,7 @@ def _write_metadata() -> None:
     path = Path(_METADATA_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "embedding_mode": settings.embedding_mode,
         "embedding_model": settings.embedding_model,
         "embedding_dim": settings.embedding_dim,
     }
@@ -51,6 +55,12 @@ def _check_metadata() -> None:
             f"(model: {stored.get('embedding_model')}), but current config uses "
             f"dim={settings.embedding_dim} (model: {settings.embedding_model}).\n"
             "Run 'rag clear-storage' to delete the existing index, then re-ingest."
+        )
+    if stored.get("embedding_mode") != settings.embedding_mode:
+        logger.warning(
+            f"Embedding mode changed: stored={stored.get('embedding_mode')!r} "
+            f"current={settings.embedding_mode!r}. "
+            "Vectors may be incompatible; run 'rag clear-storage' and re-ingest."
         )
     if stored.get("embedding_model") != settings.embedding_model:
         logger.warning(
@@ -182,15 +192,51 @@ def mineru_kwargs() -> dict:
     return _mineru_kwargs()
 
 
+async def _aingest_file_from_cloud_output(rag: RAGAnything, file_path: Path, out_dir: Path) -> None:
+    """Index already-parsed cloud output (content_list JSON) into LightRAG."""
+    json_files = [
+        p for p in out_dir.rglob("*_content_list.json")
+        if "_content_list_v2" not in p.name
+    ]
+    if not json_files:
+        raise FileNotFoundError(f"MinerU Cloud 解压后未找到 *_content_list.json: {out_dir}")
+    for json_path in json_files:
+        stem = json_path.stem.replace("_content_list", "")
+        raw: list = json.loads(json_path.read_text(encoding="utf-8"))
+        content_list = _fix_image_paths(raw, json_path.parent)
+        await rag.insert_content_list(content_list, file_path=stem)
+        logger.debug("Cloud indexed: {} ({} blocks)", stem, len(content_list))
+
+
 async def _aingest_file(rag: RAGAnything, file_path: Path) -> None:
-    """Async: parse and index a single document file."""
-    out_dir = str(settings.output_dir / file_path.stem)
+    """Async: parse and index a single document file.
+
+    Tries MinerU Cloud API first when configured; falls back to local MinerU
+    on failure (if ``mineru_cloud_fallback_local`` is True).
+    """
+    out_dir = settings.output_dir / file_path.stem
+
+    if settings.mineru_cloud_enabled and settings.mineru_cloud_api_key:
+        try:
+            await parse_file_via_cloud(file_path, out_dir)
+            await _aingest_file_from_cloud_output(rag, file_path, out_dir)
+            logger.success(f"Ingested (cloud): {file_path.name}")
+            return
+        except MineruCloudError as exc:
+            if settings.mineru_cloud_fallback_local:
+                logger.warning(
+                    "MinerU Cloud 解析失败，降级到本地: {} — {}", file_path.name, exc
+                )
+            else:
+                raise
+
+    # Local MinerU (original path / fallback)
     await rag.process_document_complete(
         file_path=str(file_path),
-        output_dir=out_dir,
+        output_dir=str(out_dir),
         **_mineru_kwargs(),
     )
-    logger.success(f"Ingested: {file_path.name}")
+    logger.success(f"Ingested (local): {file_path.name}")
 
 
 def ingest_file(file_path: str | Path) -> None:
@@ -589,14 +635,33 @@ def _build_parser() -> RAGAnything:
 
 
 async def _aparse_file(rag: RAGAnything, file_path: Path) -> None:
-    """Async: parse a single document with MinerU (no indexing)."""
-    out_dir = str(settings.output_dir / file_path.stem)
+    """Async: parse a single document (no indexing).
+
+    Tries MinerU Cloud API first when configured; falls back to local MinerU
+    on failure (if ``mineru_cloud_fallback_local`` is True).
+    """
+    out_dir = settings.output_dir / file_path.stem
+
+    if settings.mineru_cloud_enabled and settings.mineru_cloud_api_key:
+        try:
+            await parse_file_via_cloud(file_path, out_dir)
+            logger.success(f"Parsed (cloud): {file_path.name}")
+            return
+        except MineruCloudError as exc:
+            if settings.mineru_cloud_fallback_local:
+                logger.warning(
+                    "MinerU Cloud 解析失败，降级到本地: {} — {}", file_path.name, exc
+                )
+            else:
+                raise
+
+    # Local MinerU (original path / fallback)
     await rag.parse_document(
         file_path=str(file_path),
-        output_dir=out_dir,
+        output_dir=str(out_dir),
         **_mineru_kwargs(),
     )
-    logger.success(f"Parsed: {file_path.name}")
+    logger.success(f"Parsed (local): {file_path.name}")
 
 
 def parse_file(file_path: str | Path) -> None:
@@ -709,6 +774,14 @@ async def get_course_rag_anything(course_id: str) -> RAGAnything:
         _course_cache[workspace] = rag
         logger.info("Course RAGAnything ready workspace={}", workspace)
         return rag
+
+async def _finalize_course_rag(course_id: str) -> None:
+    """Finalize course LightRAG storages on the current event loop when present."""
+    ws = course_id_to_workspace(course_id)
+    rag = _course_cache.get(ws)
+    if not rag or not rag.lightrag:
+        return
+    await rag.lightrag.finalize_storages()
 
 
 def _chunk_relevance_score(chunk: dict[str, Any], rank_index: int) -> float:
@@ -834,6 +907,8 @@ async def ingest_parsed_material_into_course_async(
     source_file: Path,
 ) -> int:
     """Insert already-parsed MinerU JSON (under output_dir / stem) into course LightRAG."""
+    ensure_embedding_backend_reachable()
+
     stem = source_file.stem
     scan_dir = settings.output_dir / stem
     if not scan_dir.exists():
@@ -846,21 +921,94 @@ async def ingest_parsed_material_into_course_async(
     if not json_files:
         raise FileNotFoundError(f"No *_content_list.json under {scan_dir}")
 
-    rag = await get_course_rag_anything(course_id)
-    doc_id = material_stable_doc_id(material_id)
-    total = 0
-    for json_path in json_files:
-        sub_stem = json_path.stem.replace("_content_list", "")
-        raw: list = json.loads(json_path.read_text(encoding="utf-8"))
-        content_list = _fix_image_paths(raw, json_path.parent)
-        await rag.insert_content_list(
-            content_list,
-            file_path=sub_stem,
-            doc_id=doc_id,
-        )
-        total += len(content_list)
-    st = await rag.get_document_processing_status(doc_id)
-    return int(st.get("chunks_count") or total)
+    try:
+        rag = await get_course_rag_anything(course_id)
+        doc_id = material_stable_doc_id(material_id)
+        total = 0
+        for json_path in json_files:
+            sub_stem = json_path.stem.replace("_content_list", "")
+            raw: list = json.loads(json_path.read_text(encoding="utf-8"))
+            content_list = _fix_image_paths(raw, json_path.parent)
+            await rag.insert_content_list(
+                content_list,
+                file_path=sub_stem,
+                doc_id=doc_id,
+            )
+            total += len(content_list)
+
+        # DocStatus storage can be briefly stale after inserts (especially for multimodal),
+        # so poll for a short window to avoid false failures.
+        poll_deadline_s = 60.0
+        poll_sleep_s = 1.0
+        poll_started = time.monotonic()
+        st: dict[str, Any] = {}
+        while True:
+            st = await rag.get_document_processing_status(doc_id)
+            if st.get("error") or st.get("fully_processed"):
+                break
+            if (time.monotonic() - poll_started) >= poll_deadline_s:
+                break
+            await asyncio.sleep(poll_sleep_s)
+
+        if st.get("error"):
+            raise RuntimeError(
+                f"LightRAG document status lookup failed (doc_id={doc_id}): {st['error']}"
+            )
+        if total > 0 and not st.get("exists"):
+            raise RuntimeError(
+                f"LightRAG has no document record after ingest (doc_id={doc_id}, "
+                f"content_blocks={total}). Check embedding and PostgreSQL connectivity."
+            )
+        if total > 0 and not st.get("fully_processed"):
+            status = st.get("status")
+            chunks_count = st.get("chunks_count")
+            text_processed = st.get("text_processed")
+            multimodal_processed = st.get("multimodal_processed")
+            waited_ms = int((time.monotonic() - poll_started) * 1000)
+
+            # Relaxed success criteria (prevents false FAILED when multimodal flag lags):
+            # - doc exists and is marked processed
+            # - we have chunks, and text processing is done
+            try:
+                chunks_int = int(chunks_count or 0)
+            except (TypeError, ValueError):
+                chunks_int = 0
+
+            if (
+                status == "processed"
+                and chunks_int > 0
+                and text_processed is True
+                and st.get("exists")
+            ):
+                logger.warning(
+                    "LightRAG doc_status not fully processed after ingest; continuing with relaxed success "
+                    "(material_id={}, doc_id={}, waited_ms={}, fully_processed={}, text_processed={}, "
+                    "multimodal_processed={}, status={!r}, chunks_count={}, embedding_mode={!r})",
+                    material_id,
+                    doc_id,
+                    waited_ms,
+                    st.get("fully_processed"),
+                    text_processed,
+                    multimodal_processed,
+                    status,
+                    chunks_count,
+                    settings.embedding_mode,
+                )
+                return chunks_int
+
+            raise RuntimeError(
+                f"LightRAG did not fully index material {material_id} (doc_id={doc_id}): "
+                f"waited_ms={waited_ms}, "
+                f"text_processed={text_processed}, "
+                f"multimodal_processed={multimodal_processed}, "
+                f"fully_processed={st.get('fully_processed')}, "
+                f"status={status!r}, chunks_count={chunks_count}. "
+                "Possible cause: doc_status update lag, embedding backend failure, or PostgreSQL write issues."
+            )
+
+        return int(st.get("chunks_count") or total)
+    finally:
+        await _finalize_course_rag(course_id)
 
 
 def ingest_parsed_material_into_course_sync(
@@ -877,11 +1025,16 @@ def ingest_parsed_material_into_course_sync(
 
 
 async def delete_material_course_async(course_id: str, material_id: str) -> None:
-    rag = await get_course_rag_anything(course_id)
-    doc_id = material_stable_doc_id(material_id)
-    result = await rag.lightrag.adelete_by_doc_id(doc_id)
-    if result.status not in ("success", "not_found"):
-        raise RuntimeError(f"LightRAG delete failed: {result.status} {result.message}")
+    try:
+        rag = await get_course_rag_anything(course_id)
+        if rag.lightrag is None:
+            raise RuntimeError("Course RAGAnything has no LightRAG instance")
+        doc_id = material_stable_doc_id(material_id)
+        result = await rag.lightrag.adelete_by_doc_id(doc_id)
+        if result.status not in ("success", "not_found"):
+            raise RuntimeError(f"LightRAG delete failed: {result.status} {result.message}")
+    finally:
+        await _finalize_course_rag(course_id)
 
 
 def delete_material_course_sync(course_id: str, material_id: str) -> None:

@@ -39,6 +39,13 @@ enum MaterialStatus {
   FAILED
 }
 
+enum MaterialPreviewPdfStatus {
+  NA
+  PENDING
+  READY
+  FAILED
+}
+
 enum AssignmentStatus {
   GENERATING
   FAILED
@@ -67,10 +74,13 @@ model User {
   refreshTokens       RefreshToken[]
   agentMapping        AgentIdentityMapping?
   teacherCourses      Course[]             @relation("TeacherCourses")
+  courseCollaborations CourseCollaborator[] @relation("CourseCollaborators")
   courseEnrollments   CourseEnrollment[]   @relation("StudentEnrollments")
-  qaLogs              QaLog[]              @relation("QaLogStudent")
-  courseChatSessions  CourseChatSession[]
-  assignments         Assignment[]
+  qaLogs                    QaLog[]                    @relation("QaLogStudent")
+  courseChatSessions        CourseChatSession[]
+  qaCenterSessions          QaCenterSession[]
+  chatThreadTitleOverrides  ChatThreadTitleOverride[]
+  assignments               Assignment[]
 
   @@map("users")
 }
@@ -82,12 +92,14 @@ model Course {
   description   String?      @map("description")
   coverImageUrl String?      @map("cover_image_url")
   status        CourseStatus @default(DRAFT) @map("status")
+  shareCode     String?      @unique @map("share_code")
   createdAt     DateTime     @default(now()) @map("created_at")
   updatedAt     DateTime     @updatedAt @map("updated_at")
   isDeleted     Boolean      @default(false) @map("is_deleted")
 
-  teacher     User                 @relation("TeacherCourses", fields: [teacherId], references: [id], onDelete: Cascade)
-  enrollments CourseEnrollment[]
+  teacher         User                   @relation("TeacherCourses", fields: [teacherId], references: [id], onDelete: Cascade)
+  collaborators   CourseCollaborator[]
+  enrollments     CourseEnrollment[]
   lessons     Lesson[]
   materials   Material[]
   qaLogs      QaLog[]
@@ -96,6 +108,20 @@ model Course {
 
   @@index([teacherId])
   @@map("courses")
+}
+
+model CourseCollaborator {
+  id        String   @id @default(uuid()) @db.Uuid
+  courseId  String   @map("course_id") @db.Uuid
+  teacherId String   @map("teacher_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+
+  course  Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  teacher User   @relation("CourseCollaborators", fields: [teacherId], references: [id], onDelete: Cascade)
+
+  @@unique([courseId, teacherId])
+  @@index([teacherId])
+  @@map("course_collaborators")
 }
 
 model Lesson {
@@ -138,6 +164,7 @@ model Material {
   fileType           String         @map("file_type")
   fileSize           Int            @map("file_size")
   minioPath          String         @map("minio_path")
+  previewPdfStatus   MaterialPreviewPdfStatus @default(NA) @map("preview_pdf_status")
   status             MaterialStatus @default(UPLOADED) @map("status")
   statusMessage      String?        @map("status_message")
   indexedChunkCount  Int            @default(0) @map("indexed_chunk_count")
@@ -227,9 +254,41 @@ model CourseChatSession {
   @@map("course_chat_sessions")
 }
 
+/// QA center global threads (cross-course RAG); one Agent session per row.
+model QaCenterSession {
+  id             String    @id @default(uuid()) @db.Uuid
+  studentId      String    @map("student_id") @db.Uuid
+  agentSessionId String    @unique @map("agent_session_id") @db.VarChar(255)
+  title          String?   @map("title")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+  deletedAt      DateTime? @map("deleted_at")
+
+  student User @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@index([studentId])
+  @@map("qa_center_sessions")
+}
+
+/// Custom titles for course-scoped chat threads (keyed by agent session_id).
+model ChatThreadTitleOverride {
+  id        String   @id @default(uuid()) @db.Uuid
+  studentId String   @map("student_id") @db.Uuid
+  sessionId String   @map("session_id") @db.VarChar(255)
+  title     String   @map("title")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  student User @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@unique([studentId, sessionId])
+  @@index([studentId])
+  @@map("chat_thread_title_overrides")
+}
+
 model QaLog {
   id                String    @id @default(uuid()) @db.Uuid
-  courseId          String    @map("course_id") @db.Uuid
+  courseId          String?   @map("course_id") @db.Uuid
   studentId         String    @map("student_id") @db.Uuid
   lessonId          String?   @map("lesson_id") @db.Uuid
   sessionId         String    @map("session_id") @db.VarChar(255)
@@ -250,7 +309,7 @@ model QaLog {
   createdAt         DateTime  @default(now()) @map("created_at")
   deletedAt         DateTime? @map("deleted_at")
 
-  course  Course  @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  course  Course? @relation(fields: [courseId], references: [id], onDelete: Cascade)
   student User    @relation("QaLogStudent", fields: [studentId], references: [id], onDelete: Cascade)
   lesson  Lesson? @relation(fields: [lessonId], references: [id], onDelete: SetNull)
 

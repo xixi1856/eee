@@ -47,13 +47,15 @@ _SCHEMA_KNOWLEDGE_QUERY = {
             },
             "sources": {
                 "description": (
-                    "必填。字符串：personal | course | all；或数组：仅含 course/personal "
-                    "（如 [\"course\",\"personal\"] 等价于 all）"
+                    "必填。字符串：personal | course | all | enrolled_courses；或数组：仅含 course/personal "
+                    "（如 [\"course\",\"personal\"] 等价于 all）。"
+                    "未绑定单门课程（问答中心）时必须使用 personal 或 enrolled_courses；"
+                    "enrolled_courses 会在用户有权限的全部课程知识库中检索。"
                 ),
                 "oneOf": [
                     {
                         "type": "string",
-                        "enum": ["personal", "course", "all"],
+                        "enum": ["personal", "course", "all", "enrolled_courses"],
                     },
                     {
                         "type": "array",
@@ -207,17 +209,47 @@ def _sync_verify_and_query_course(
     return course_retrieval_hits_sync(course_id, question, mode=mode, top_k=top_k)
 
 
+def _sync_list_enrolled_course_ids(user_id: str) -> list[str]:
+    """Platform internal: course UUIDs the agent user may RAG (enrollments + teaching)."""
+    import os
+
+    import httpx
+
+    base = os.environ.get("EDU_PLATFORM_BASE_URL", "").rstrip("/")
+    key = os.environ.get("EDU_PLATFORM_INTERNAL_API_KEY", "").strip()
+    if not base or len(key) < 16:
+        raise RuntimeError(
+            "EDU_PLATFORM_BASE_URL and EDU_PLATFORM_INTERNAL_API_KEY (16+ chars) are required",
+        )
+    with httpx.Client(timeout=60.0) as client:
+        r = client.get(
+            f"{base}/api/v1/internal/enrolled-courses-rag",
+            params={"user_id": user_id},
+            headers={"X-Internal-Key": key},
+        )
+        r.raise_for_status()
+        body = r.json()
+    raw = body.get("course_ids")
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for x in raw:
+        if isinstance(x, str) and x.strip():
+            out.append(x.strip())
+    return out
+
+
 def _normalize_knowledge_sources(raw: Any) -> tuple[str | None, str | None]:
-    """Map ``sources`` tool arg to personal|course|all. Returns (mode, error_message)."""
+    """Map ``sources`` tool arg to personal|course|all|enrolled_courses."""
     if raw is None:
-        return None, "缺少必要参数：sources（personal | course | all 或 [course, personal]）"
+        return None, "缺少必要参数：sources（personal | course | all | enrolled_courses 或 [course, personal]）"
     if isinstance(raw, str):
         s = raw.strip().lower()
         if not s:
-            return None, "缺少必要参数：sources（personal | course | all 或 [course, personal]）"
-        if s in ("personal", "course", "all"):
+            return None, "缺少必要参数：sources（personal | course | all | enrolled_courses 或 [course, personal]）"
+        if s in ("personal", "course", "all", "enrolled_courses"):
             return s, None
-        return None, f"非法 sources: {raw!r}（仅允许 personal、course、all）"
+        return None, f"非法 sources: {raw!r}（仅允许 personal、course、all、enrolled_courses）"
     if isinstance(raw, list):
         items: set[str] = set()
         for x in raw:
@@ -260,6 +292,8 @@ async def _handle_knowledge_query(args: dict) -> str:
 
     if sources in ("course", "all") and not course_id:
         return tool_error("当前会话未绑定课程，无法使用 sources=course 或 all")
+    if sources == "enrolled_courses" and course_id:
+        return tool_error("sources=enrolled_courses 仅用于未绑定单课的会话（问答中心）")
 
     raw_top = args.get("top_k", 5)
     try:
@@ -271,6 +305,62 @@ async def _handle_knowledge_query(args: dict) -> str:
 
     results: list[dict[str, Any]] = []
     leg_errors: list[str] = []
+
+    if sources == "enrolled_courses":
+        try:
+            cids = await asyncio.to_thread(_sync_list_enrolled_course_ids, user_id)
+        except Exception as exc:
+            logger.error("knowledge_query enrolled_courses list failed: %s", exc)
+            return tool_error(f"无法获取可检索课程列表: {exc}")
+        if not cids:
+            leg_errors.append("enrolled_courses:no_courses")
+        merged_raw: list[tuple[str, dict[str, Any]]] = []
+        max_courses = 40
+        for cid in cids[:max_courses]:
+            try:
+                ch = await asyncio.to_thread(
+                    _sync_verify_and_query_course,
+                    user_id,
+                    cid,
+                    str(question),
+                    top_k,
+                    str(mode),
+                )
+            except PermissionError:
+                continue
+            except Exception as exc:
+                logger.warning("knowledge_query course %s leg failed: %s", cid, exc)
+                leg_errors.append(f"course:{cid}:{exc}")
+                continue
+            for h in ch:
+                merged_raw.append((cid, h))
+        merged_raw.sort(
+            key=lambda t: float((t[1].get("relevance_score") or 0.0)),
+            reverse=True,
+        )
+        merged_raw = merged_raw[:top_k]
+        mids: set[str] = set()
+        for _cid, h in merged_raw:
+            meta = h.get("metadata") or {}
+            mid = meta.get("material_id")
+            if isinstance(mid, str) and mid:
+                mids.add(mid)
+        titles = _fetch_material_titles(mids)
+        for cid_row, h in merged_raw:
+            meta = h.get("metadata") or {}
+            mid = meta.get("material_id")
+            mid_s = str(mid) if mid else None
+            results.append(
+                {
+                    "origin": "course",
+                    "chunk_id": h.get("chunk_id", ""),
+                    "text": str(h.get("text", ""))[:8000],
+                    "course_id": cid_row,
+                    "material_id": mid_s,
+                    "material_title": titles.get(mid_s) if mid_s else None,
+                    "relevance_score": float(h.get("relevance_score", 0.0)),
+                },
+            )
 
     if sources in ("course", "all"):
         try:

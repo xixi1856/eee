@@ -1,13 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import {
   BookOpen, ChevronLeft, FileText, GraduationCap, LayoutList,
   MessageSquare, BarChart3, Loader2, Trash2, AlertCircle,
-  CheckCircle2, Clock, Cpu, BookMarked, Pencil
+  CheckCircle2, Clock, Cpu, BookMarked, Pencil, FileQuestion, Sparkles, Copy,
 } from "lucide-react";
+import type { AssignmentSummaryDto } from "@/lib/dto/assignment.dto";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import MaterialUpload from "@/components/MaterialUpload";
@@ -16,17 +17,42 @@ import { cn } from "@/lib/utils";
 type Course = {
   id: string; name: string; description: string | null;
   cover_image_url: string | null; status: string;
+  share_code?: string | null;
 };
 type Material = {
   id: string; filename: string; file_type: string;
   lesson_id: string | null;
-  status: string; indexed_chunk_count: number; status_message: string | null;
+  status: string;
+  preview_pdf_status: "NA" | "PENDING" | "READY" | "FAILED";
+  indexed_chunk_count: number; status_message: string | null;
 };
 type Lesson = {
   id: string; title: string; description: string | null; order_index: number;
 };
 
-type Tab = "overview" | "materials" | "lessons";
+type Tab = "overview" | "materials" | "lessons" | "assignments";
+
+const ASSIGNMENT_STATUS_LABELS: Record<string, string> = {
+  GENERATING: "生成中", FAILED: "失败", DRAFT: "草稿", PUBLISHED: "已发布", ARCHIVED: "已归档",
+};
+const ASSIGNMENT_STATUS_CLASSES: Record<string, string> = {
+  GENERATING: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300",
+  FAILED: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300",
+  DRAFT: "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300",
+  PUBLISHED: "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300",
+  ARCHIVED: "bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400",
+};
+function AssignmentStatusBadge({ status }: { status: string }) {
+  return (
+    <span className={cn("inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold", ASSIGNMENT_STATUS_CLASSES[status] ?? "")}>
+      {status === "GENERATING" && <Loader2 size={10} className="animate-spin" />}
+      {status === "FAILED" && <AlertCircle size={10} />}
+      {status === "PUBLISHED" && <CheckCircle2 size={10} />}
+      {status === "DRAFT" && <Clock size={10} />}
+      {ASSIGNMENT_STATUS_LABELS[status] ?? status}
+    </span>
+  );
+}
 
 function StatusBadge({ status }: { status: string }) {
   const map: Record<string, string> = {
@@ -114,6 +140,7 @@ function MaterialRow({
 
 export default function CourseDetailPage() {
   const params = useParams();
+  const router = useRouter();
   const courseId = typeof params?.courseId === "string" ? params.courseId : null;
   const [course, setCourse] = useState<Course | null>(null);
   const [materials, setMaterials] = useState<Material[]>([]);
@@ -122,6 +149,8 @@ export default function CourseDetailPage() {
   const [accessError, setAccessError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>("overview");
   const [notification, setNotification] = useState<{type:"success"|"error"; msg:string} | null>(null);
+  const [assignments, setAssignments] = useState<AssignmentSummaryDto[]>([]);
+  const [assignmentsLoaded, setAssignmentsLoaded] = useState(false);
 
   function notify(type: "success" | "error", msg: string) {
     setNotification({ type, msg });
@@ -164,17 +193,42 @@ export default function CourseDetailPage() {
     return () => clearInterval(t);
   }, [courseId, load]);
 
-  async function doAction(action: "publish" | "archive" | "join") {
+  async function doAction(action: "publish" | "archive") {
     if (!courseId) return;
-    const urlMap = { publish: "publish", archive: "archive", join: "join" };
+    const urlMap = { publish: "publish", archive: "archive" };
     const res = await fetch(`/api/v1/courses/${courseId}/${urlMap[action]}`, {
       method: "POST", credentials: "include",
     });
     if (!res.ok) { notify("error", `操作失败`); return; }
-    const msgMap = { publish: "课程已发布", archive: "课程已归档", join: "已加入课程" };
+    const msgMap = { publish: "课程已发布", archive: "课程已归档" };
     notify("success", msgMap[action]);
     void load(courseId);
   }
+
+  // Lazy-load assignments when tab is first activated
+  useEffect(() => {
+    if (activeTab !== "assignments" || !courseId || assignmentsLoaded) return;
+    void fetch(`/api/v1/courses/${courseId}/assignments`, { credentials: "include" })
+      .then((r) => r.json())
+      .then((d: { assignments?: AssignmentSummaryDto[] }) => {
+        setAssignments(d.assignments ?? []);
+        setAssignmentsLoaded(true);
+      });
+  }, [activeTab, courseId, assignmentsLoaded]);
+
+  // Poll while any assignment is GENERATING
+  useEffect(() => {
+    if (activeTab !== "assignments" || !courseId) return;
+    if (!assignments.some((a) => a.status === "GENERATING")) return;
+    const id = setInterval(() => {
+      void fetch(`/api/v1/courses/${courseId}/assignments`, { credentials: "include" })
+        .then((r) => r.json())
+        .then((d: { assignments?: AssignmentSummaryDto[] }) => {
+          setAssignments(d.assignments ?? []);
+        });
+    }, 5000);
+    return () => clearInterval(id);
+  }, [activeTab, courseId, assignments]);
 
   async function deleteMaterial(mid: string) {
     if (!courseId) return;
@@ -204,6 +258,7 @@ export default function CourseDetailPage() {
     { id: "overview", label: "概览", icon: BookOpen },
     { id: "materials", label: "材料", icon: FileText },
     { id: "lessons", label: "课时", icon: LayoutList },
+    { id: "assignments", label: "作业", icon: FileQuestion },
   ];
 
   return (
@@ -246,6 +301,33 @@ export default function CourseDetailPage() {
               {course.description && (
                 <p className="text-sm text-muted-foreground">{course.description}</p>
               )}
+              {isTeacher && course.status === "PUBLISHED" && course.share_code && (
+                <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-border bg-muted/25 px-3 py-2 text-sm">
+                  <span className="text-muted-foreground shrink-0">课程分享码</span>
+                  <code className="font-mono text-sm font-semibold tracking-widest text-foreground">
+                    {course.share_code}
+                  </code>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 gap-1 px-2"
+                    onClick={() => {
+                      void navigator.clipboard.writeText(course.share_code ?? "").then(() => {
+                        notify("success", "分享码已复制");
+                      });
+                    }}
+                  >
+                    <Copy size={13} />
+                    复制
+                  </Button>
+                </div>
+              )}
+              {isStudent && (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  加入新课程请在「课程列表」页输入教师提供的分享码。
+                </p>
+              )}
             </div>
             {/* Action buttons */}
             <div className="flex items-center gap-2 shrink-0 flex-wrap">
@@ -253,10 +335,14 @@ export default function CourseDetailPage() {
                 <Button size="sm" onClick={() => void doAction("publish")}>发布课程</Button>
               )}
               {isTeacher && course.status === "PUBLISHED" && (
-                <Button size="sm" variant="outline" onClick={() => void doAction("archive")}>归档</Button>
-              )}
-              {isStudent && course.status === "PUBLISHED" && (
-                <Button size="sm" onClick={() => void doAction("join")}>加入课程</Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    if (!window.confirm("确定将此课程归档？归档后学生可能无法访问此课程。")) return;
+                    void doAction("archive");
+                  }}
+                >归档</Button>
               )}
               {(isStudent || isTeacher) && course.status === "PUBLISHED" && (
                 <Button size="sm" variant="outline" asChild>
@@ -307,6 +393,11 @@ export default function CourseDetailPage() {
                 {id === "lessons" && lessons.length > 0 && (
                   <span className="ml-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-muted-foreground">
                     {lessons.length}
+                  </span>
+                )}
+                {id === "assignments" && assignmentsLoaded && assignments.length > 0 && (
+                  <span className="ml-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-muted-foreground">
+                    {assignments.length}
                   </span>
                 )}
               </button>
@@ -519,6 +610,63 @@ export default function CourseDetailPage() {
                       )}
                     </div>
                   </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Assignments */}
+        {activeTab === "assignments" && (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <p className="text-sm text-muted-foreground">
+                {!assignmentsLoaded ? "加载中…"
+                  : assignments.length > 0 ? `共 ${assignments.length} 份作业`
+                  : "暂无作业"}
+              </p>
+              {isTeacher && (
+                <Button
+                  size="sm"
+                  className="gap-1.5"
+                  onClick={() => courseId && router.push(`/courses/${courseId}/assignments/new`)}
+                >
+                  <Sparkles size={14} />新建作业
+                </Button>
+              )}
+            </div>
+
+            {!assignmentsLoaded ? (
+              <div className="space-y-3">
+                {[1, 2, 3].map((i) => <Skeleton key={i} className="h-16 rounded-lg" />)}
+              </div>
+            ) : assignments.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-16 rounded-xl border border-dashed border-border text-center">
+                <FileQuestion size={28} className="text-muted-foreground mb-3" />
+                <p className="text-sm font-medium text-foreground mb-1">暂无作业</p>
+                {isTeacher && (
+                  <p className="text-xs text-muted-foreground">点击「新建作业」生成第一份作业</p>
+                )}
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {assignments.map((a) => (
+                  <Link
+                    key={a.id}
+                    href={`/courses/${courseId}/assignments/${a.id}`}
+                    className="flex items-center gap-4 rounded-xl border bg-card px-4 py-3 hover:bg-muted/20 transition-colors"
+                  >
+                    <FileQuestion size={16} className="shrink-0 text-muted-foreground" />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium truncate">{a.title}</p>
+                      <p className="text-xs text-muted-foreground mt-0.5">
+                        {a.questionCount > 0 ? `${a.questionCount} 题` : "暂无题目"}
+                        {a.qualityScore !== null && ` · ${a.qualityScore} 分`}
+                        {a.deadline && ` · 截止 ${new Date(a.deadline).toLocaleDateString("zh-CN")}`}
+                      </p>
+                    </div>
+                    <AssignmentStatusBadge status={a.status} />
+                  </Link>
                 ))}
               </div>
             )}

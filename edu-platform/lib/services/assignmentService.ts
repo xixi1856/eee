@@ -148,6 +148,7 @@ export async function triggerAssignmentGeneration(
       assignment_id: assignment.id,
       course_id: courseId,
       teacher_request: body.teacherRequest.trim(),
+      structured_params: body.structuredParams ? JSON.stringify(body.structuredParams) : "",
     });
   } catch (err) {
     // Roll back DB record if we can't push to Redis

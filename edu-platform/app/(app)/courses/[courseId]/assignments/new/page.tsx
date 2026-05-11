@@ -1,0 +1,470 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { useParams, useRouter } from "next/navigation";
+import Link from "next/link";
+import {
+  ChevronLeft,
+  Sparkles,
+  Settings2,
+  AlertCircle,
+  CheckCircle2,
+  Loader2,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
+import type { StructuredGenerationParams } from "@/lib/dto/assignment.dto";
+
+type Mode = "nlp" | "structured";
+type Difficulty = "easy" | "medium" | "hard";
+
+const QUESTION_TYPES = [
+  { key: "single_choice", label: "单选题" },
+  { key: "multi_choice", label: "多选题" },
+  { key: "fill_blank", label: "填空题" },
+  { key: "short_answer", label: "简答题" },
+] as const;
+
+const OBJECTIVES = [
+  { key: "knowledge", label: "记忆" },
+  { key: "comprehension", label: "理解" },
+  { key: "application", label: "应用" },
+  { key: "synthesis", label: "综合" },
+  { key: "innovation", label: "创新" },
+] as const;
+
+type Lesson = { id: string; title: string; order_index: number };
+
+export default function NewAssignmentPage() {
+  const { courseId } = useParams<{ courseId: string }>();
+  const router = useRouter();
+
+  // ── Shared state ──────────────────────────────────────────────────────────
+  const [mode, setMode] = useState<Mode>("nlp");
+  const [title, setTitle] = useState("");
+  const [deadline, setDeadline] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // ── NLP mode ──────────────────────────────────────────────────────────────
+  const [teacherRequest, setTeacherRequest] = useState("");
+
+  // ── Structured mode ───────────────────────────────────────────────────────
+  const [lessons, setLessons] = useState<Lesson[]>([]);
+  const [selectedLessons, setSelectedLessons] = useState<string[]>([]);
+  const [knowledgeTags, setKnowledgeTags] = useState<string[]>([]);
+  const [tagInput, setTagInput] = useState("");
+  const [difficulty, setDifficulty] = useState<Difficulty>("medium");
+  const [count, setCount] = useState(20);
+  const [selectedTypes, setSelectedTypes] = useState<string[]>(["single_choice", "fill_blank", "short_answer"]);
+  const [selectedObjectives, setSelectedObjectives] = useState<string[]>(["knowledge", "comprehension", "application"]);
+
+  useEffect(() => {
+    void fetch(`/api/v1/courses/${courseId}/lessons`, { credentials: "include" })
+      .then((r) => r.json())
+      .then((d: { lessons?: Lesson[] }) =>
+        setLessons((d.lessons ?? []).sort((a, b) => a.order_index - b.order_index))
+      );
+  }, [courseId]);
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  function toggleLesson(id: string) {
+    setSelectedLessons((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
+  }
+  function toggleType(key: string) {
+    setSelectedTypes((prev) =>
+      prev.includes(key) ? (prev.length > 1 ? prev.filter((x) => x !== key) : prev) : [...prev, key]
+    );
+  }
+  function toggleObjective(key: string) {
+    setSelectedObjectives((prev) =>
+      prev.includes(key) ? (prev.length > 1 ? prev.filter((x) => x !== key) : prev) : [...prev, key]
+    );
+  }
+  function addTag(raw: string) {
+    const tags = raw.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+    setKnowledgeTags((prev) => {
+      const next = [...prev];
+      tags.forEach((t) => { if (!next.includes(t)) next.push(t); });
+      return next;
+    });
+    setTagInput("");
+  }
+
+  // ── Submit ────────────────────────────────────────────────────────────────
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+
+    if (!title.trim()) { setError("请填写作业标题"); return; }
+
+    let finalRequest = teacherRequest.trim();
+    let structuredParams: StructuredGenerationParams | undefined;
+
+    if (mode === "nlp") {
+      if (finalRequest.length < 10) {
+        setError("需求描述至少需要 10 个字符");
+        return;
+      }
+    } else {
+      if (selectedTypes.length === 0 || selectedObjectives.length === 0) {
+        setError("请至少选择一种题型和一个认知目标");
+        return;
+      }
+      // Normalise weights: equal split among selected
+      const typeWeights: Record<string, number> = {};
+      selectedTypes.forEach((k) => { typeWeights[k] = 1 / selectedTypes.length; });
+      const objectiveWeights: Record<string, number> = {};
+      selectedObjectives.forEach((k) => { objectiveWeights[k] = 1 / selectedObjectives.length; });
+
+      const lessonNames = selectedLessons
+        .map((id) => lessons.find((l) => l.id === id)?.title ?? "")
+        .filter(Boolean);
+
+      structuredParams = {
+        lessonIds: selectedLessons,
+        lessonNames,
+        knowledgePoints: knowledgeTags,
+        difficulty,
+        count,
+        typeWeights,
+        objectiveWeights,
+      };
+
+      // Auto-generate a request string if not provided
+      if (!finalRequest) {
+        const diffMap: Record<Difficulty, string> = { easy: "简单", medium: "中等", hard: "困难" };
+        const parts: string[] = [];
+        if (lessonNames.length) parts.push(`课时：${lessonNames.join("、")}`);
+        if (knowledgeTags.length) parts.push(`知识点：${knowledgeTags.join("、")}`);
+        parts.push(`难度：${diffMap[difficulty]}`);
+        parts.push(`共 ${count} 道题`);
+        finalRequest = parts.join("；");
+      }
+    }
+
+    setSubmitting(true);
+    try {
+      const res = await fetch(`/api/v1/courses/${courseId}/assignments`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: title.trim(),
+          teacherRequest: finalRequest,
+          deadline: deadline || undefined,
+          structuredParams,
+        }),
+      });
+      if (!res.ok) {
+        const d = (await res.json()) as { message?: string };
+        setError(d.message ?? "提交失败，请重试");
+        return;
+      }
+      const d = (await res.json()) as { assignment?: { id: string } };
+      const aid = d.assignment?.id;
+      if (aid) {
+        router.push(`/courses/${courseId}/assignments/${aid}`);
+      } else {
+        router.push(`/courses/${courseId}?tab=assignments`);
+      }
+    } catch {
+      setError("网络错误，请重试");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="h-full overflow-auto">
+      <div className="max-w-4xl mx-auto w-full px-6 py-8 space-y-6">
+      {/* Back */}
+      <Link
+        href={`/courses/${courseId}`}
+        className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
+      >
+        <ChevronLeft size={15} />
+        返回课程
+      </Link>
+
+      <div className="space-y-1">
+        <h1 className="text-xl font-semibold">新建作业</h1>
+        <p className="text-sm text-muted-foreground">AI 将根据课程知识库自动生成题目，生成后可编辑</p>
+      </div>
+
+      <form onSubmit={(e) => void handleSubmit(e)} className="space-y-6">
+        {/* Mode switcher */}
+        <div className="flex gap-2 p-1 rounded-xl bg-muted w-fit">
+          <button
+            type="button"
+            onClick={() => setMode("nlp")}
+            className={cn(
+              "flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors",
+              mode === "nlp"
+                ? "bg-background text-foreground shadow-sm"
+                : "text-muted-foreground hover:text-foreground"
+            )}
+          >
+            <Sparkles size={13} />
+            自然语言
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode("structured")}
+            className={cn(
+              "flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors",
+              mode === "structured"
+                ? "bg-background text-foreground shadow-sm"
+                : "text-muted-foreground hover:text-foreground"
+            )}
+          >
+            <Settings2 size={13} />
+            结构化参数
+          </button>
+        </div>
+
+        {/* Shared: title + deadline */}
+        <div className="space-y-4 rounded-xl border border-border bg-card p-5">
+          <h2 className="text-sm font-semibold text-foreground">基本信息</h2>
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">作业标题 *</label>
+            <input
+              type="text"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="例：第三章 运输层 综合练习"
+              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-colors"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">截止时间（选填）</label>
+            <input
+              type="datetime-local"
+              value={deadline}
+              onChange={(e) => setDeadline(e.target.value)}
+              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-colors"
+            />
+          </div>
+        </div>
+
+        {/* NLP mode */}
+        {mode === "nlp" && (
+          <div className="space-y-4 rounded-xl border border-border bg-card p-5">
+            <h2 className="text-sm font-semibold text-foreground">需求描述</h2>
+            <textarea
+              value={teacherRequest}
+              onChange={(e) => setTeacherRequest(e.target.value)}
+              rows={5}
+              placeholder="描述你的作业需求，例如：针对运输层TCP协议，生成15道中等难度题目，侧重三次握手和流量控制，包含单选题和简答题。"
+              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground resize-none focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-colors"
+            />
+            <p className="text-xs text-muted-foreground">至少 10 个字符</p>
+          </div>
+        )}
+
+        {/* Structured mode */}
+        {mode === "structured" && (
+          <div className="space-y-5">
+            {/* Lessons */}
+            {lessons.length > 0 && (
+              <div className="rounded-xl border border-border bg-card p-5 space-y-3">
+                <h2 className="text-sm font-semibold text-foreground">选择课时（可多选，空 = 全课程）</h2>
+                <div className="flex flex-wrap gap-2">
+                  {lessons.map((l) => (
+                    <button
+                      key={l.id}
+                      type="button"
+                      onClick={() => toggleLesson(l.id)}
+                      className={cn(
+                        "px-3 py-1 rounded-full text-xs font-medium border transition-colors",
+                        selectedLessons.includes(l.id)
+                          ? "bg-primary text-primary-foreground border-primary"
+                          : "border-border text-muted-foreground hover:border-primary hover:text-foreground"
+                      )}
+                    >
+                      {l.order_index + 1}. {l.title}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Knowledge points */}
+            <div className="rounded-xl border border-border bg-card p-5 space-y-3">
+              <h2 className="text-sm font-semibold text-foreground">知识点标签（选填）</h2>
+              <div className="flex flex-wrap gap-2 min-h-[28px]">
+                {knowledgeTags.map((tag) => (
+                  <span
+                    key={tag}
+                    className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-primary/10 text-primary text-xs font-medium"
+                  >
+                    {tag}
+                    <button
+                      type="button"
+                      onClick={() => setKnowledgeTags((p) => p.filter((t) => t !== tag))}
+                      className="hover:text-destructive"
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
+              <input
+                type="text"
+                value={tagInput}
+                onChange={(e) => setTagInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") { e.preventDefault(); addTag(tagInput); }
+                  if (e.key === ",") { e.preventDefault(); addTag(tagInput); }
+                }}
+                onBlur={() => tagInput.trim() && addTag(tagInput)}
+                placeholder="输入知识点后按 Enter 或逗号添加"
+                className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-colors"
+              />
+            </div>
+
+            {/* Count + difficulty */}
+            <div className="grid grid-cols-2 gap-4">
+              <div className="rounded-xl border border-border bg-card p-5 space-y-3">
+                <h2 className="text-sm font-semibold text-foreground">
+                  题目数量
+                  <span className="ml-2 text-primary font-bold">{count}</span>
+                </h2>
+                <input
+                  type="range"
+                  min={5}
+                  max={50}
+                  step={5}
+                  value={count}
+                  onChange={(e) => setCount(Number(e.target.value))}
+                  className="w-full accent-primary"
+                />
+                <div className="flex justify-between text-xs text-muted-foreground">
+                  <span>5</span><span>50</span>
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-border bg-card p-5 space-y-3">
+                <h2 className="text-sm font-semibold text-foreground">难度</h2>
+                <div className="flex flex-col gap-2">
+                  {(["easy", "medium", "hard"] as Difficulty[]).map((d) => (
+                    <label key={d} className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="radio"
+                        name="difficulty"
+                        value={d}
+                        checked={difficulty === d}
+                        onChange={() => setDifficulty(d)}
+                        className="accent-primary"
+                      />
+                      <span className="text-sm">
+                        {{ easy: "简单", medium: "中等", hard: "困难" }[d]}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Type weights */}
+            <div className="rounded-xl border border-border bg-card p-5 space-y-3">
+              <h2 className="text-sm font-semibold text-foreground">
+                题型分布
+                <span className="ml-2 text-xs font-normal text-muted-foreground">（勾选 = 均等分配）</span>
+              </h2>
+              <div className="flex flex-wrap gap-2">
+                {QUESTION_TYPES.map(({ key, label }) => (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => toggleType(key)}
+                    className={cn(
+                      "px-3 py-1 rounded-full text-xs font-medium border transition-colors",
+                      selectedTypes.includes(key)
+                        ? "bg-primary text-primary-foreground border-primary"
+                        : "border-border text-muted-foreground hover:border-primary hover:text-foreground"
+                    )}
+                  >
+                    {label}
+                    {selectedTypes.includes(key) && (
+                      <span className="ml-1 opacity-70">
+                        {Math.round((1 / selectedTypes.length) * 100)}%
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Objective weights */}
+            <div className="rounded-xl border border-border bg-card p-5 space-y-3">
+              <h2 className="text-sm font-semibold text-foreground">
+                认知目标
+                <span className="ml-2 text-xs font-normal text-muted-foreground">（勾选 = 均等分配）</span>
+              </h2>
+              <div className="flex flex-wrap gap-2">
+                {OBJECTIVES.map(({ key, label }) => (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => toggleObjective(key)}
+                    className={cn(
+                      "px-3 py-1 rounded-full text-xs font-medium border transition-colors",
+                      selectedObjectives.includes(key)
+                        ? "bg-primary text-primary-foreground border-primary"
+                        : "border-border text-muted-foreground hover:border-primary hover:text-foreground"
+                    )}
+                  >
+                    {label}
+                    {selectedObjectives.includes(key) && (
+                      <span className="ml-1 opacity-70">
+                        {Math.round((1 / selectedObjectives.length) * 100)}%
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Optional extra request */}
+            <div className="rounded-xl border border-border bg-card p-5 space-y-3">
+              <h2 className="text-sm font-semibold text-foreground">补充说明（选填）</h2>
+              <textarea
+                value={teacherRequest}
+                onChange={(e) => setTeacherRequest(e.target.value)}
+                rows={3}
+                placeholder="如有额外要求可在此说明，留空则自动生成需求描述"
+                className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground resize-none focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-colors"
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Error */}
+        {error && (
+          <div className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+            <AlertCircle size={14} className="shrink-0" />
+            {error}
+          </div>
+        )}
+
+        {/* Actions */}
+        <div className="flex items-center justify-end gap-3">
+          <Button type="button" variant="outline" size="sm" asChild>
+            <Link href={`/courses/${courseId}`}>取消</Link>
+          </Button>
+          <Button type="submit" size="sm" disabled={submitting} className="gap-1.5">
+            {submitting ? (
+              <><Loader2 size={13} className="animate-spin" />提交中…</>
+            ) : (
+              <><CheckCircle2 size={13} />开始生成</>
+            )}
+          </Button>
+        </div>
+      </form>
+      </div>
+    </div>
+  );
+}

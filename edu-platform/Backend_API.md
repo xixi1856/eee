@@ -777,7 +777,7 @@ UPLOADED → PARSING → PARSED → INDEXING → READY
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `file` | `File` | ✓ | 上传文件，支持格式：`pdf`、`md`、`txt` |
+| `file` | `File` | ✓ | 上传文件，支持格式：`pdf`、`md`、`txt`、`ppt`、`pptx`、`doc`、`docx` |
 | `lesson_id` | `string (UUID)` | 否 | 关联的课时 ID |
 
 **请求示例**：
@@ -810,7 +810,7 @@ Content-Type: application/pdf
 
 | 状态码 | code | 说明 |
 |---|---|---|
-| 400 | `VALIDATION_ERROR` | 文件类型不支持（仅限 pdf/md/txt）或文件为空 |
+| 400 | `VALIDATION_ERROR` | 文件类型不支持（仅限 pdf/md/txt/ppt/pptx/doc/docx）或文件为空 |
 | 400 | `VALIDATION_ERROR` | 文件大小超过限制（`MATERIAL_MAX_UPLOAD_BYTES`） |
 | 404 | `NOT_FOUND` | `lesson_id` 不存在 |
 | 503 | `SERVICE_UNAVAILABLE` | MinIO 或 Redis 不可用 |

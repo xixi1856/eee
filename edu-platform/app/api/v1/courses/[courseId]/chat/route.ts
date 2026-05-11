@@ -24,11 +24,19 @@ export async function POST(req: NextRequest, ctx: Ctx) {
         "Bind an agent identity before using course chat",
       );
     }
-    const body = (await req.json()) as { message?: string; lesson_id?: string };
+    const body = (await req.json()) as {
+      message?: string;
+      lesson_id?: string;
+      attachments?: { id: string; key: string; presigned_url: string; mime_type: string; name: string }[];
+    };
     const message = typeof body.message === "string" ? body.message.trim() : "";
-    if (!message) {
-      throw new ApiError(400, "VALIDATION_ERROR", "message is required");
+    if (!message && (!Array.isArray(body.attachments) || body.attachments.length === 0)) {
+      throw new ApiError(400, "VALIDATION_ERROR", "message or attachments is required");
     }
+    const rawAttachments = Array.isArray(body.attachments) ? body.attachments.slice(0, 10) : [];
+    const attachments = rawAttachments
+      .filter((a) => a && typeof a.id === "string" && typeof a.presigned_url === "string")
+      .map(({ id, key, presigned_url, mime_type, name }) => ({ id, key, presigned_url, mime_type, name }));
     let lessonId: string | null = null;
     if (body.lesson_id) {
       assertUuid(body.lesson_id, "lesson_id");
@@ -46,6 +54,7 @@ export async function POST(req: NextRequest, ctx: Ctx) {
       agentUserId: auth.agent_user_id,
       message,
       lessonId,
+      attachments,
     });
   } catch (e) {
     if (e instanceof ApiError) return jsonError(e);

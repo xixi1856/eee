@@ -1,4 +1,8 @@
-"""Course material pipeline: MinIO → engine.parse_file → LightRAG PG (workspace)."""
+"""Course material pipeline: MinIO → engine.parse_file → LightRAG PG (workspace).
+
+If PostgreSQL reports ``another operation is in progress`` during indexing, try
+lowering ``MAX_PARALLEL_INSERT`` or ``EMBEDDING_MAX_ASYNC`` in ``rag_mvp`` settings.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import boto3
+from botocore.config import Config as BotocoreConfig
 import psycopg
 from loguru import logger
 
@@ -27,12 +32,15 @@ def _s3_client():
     if not endpoint.startswith("http"):
         use_ssl = os.environ.get("MINIO_USE_SSL", "true").lower() == "true"
         endpoint = ("https://" if use_ssl else "http://") + endpoint
-    return boto3.client(
+    # Bypass any system HTTP proxy (e.g. Clash on 7890) for local MinIO connections.
+    session = boto3.session.Session()
+    return session.client(
         "s3",
         endpoint_url=endpoint,
         aws_access_key_id=os.environ["MINIO_ACCESS_KEY"].strip(),
         aws_secret_access_key=os.environ["MINIO_SECRET_KEY"].strip(),
         region_name=os.environ.get("MINIO_REGION", "us-east-1").strip(),
+        config=BotocoreConfig(proxies={}),  # disable system proxy (e.g. Clash) for local MinIO
     )
 
 
@@ -50,11 +58,11 @@ def _material_stale_seconds() -> int:
     return int(os.environ.get("RAG_MATERIAL_STALE_SEC", "1800"))
 
 
-_OFFICE_SUFFIXES = frozenset({".pptx", ".docx"})
+_OFFICE_SUFFIXES = frozenset({".ppt", ".pptx", ".doc", ".docx"})
 
 
 def _convert_to_pdf(local_file: Path, out_dir: Path) -> Path:
-    """Convert PPTX/DOCX to PDF via LibreOffice (required by MinerU). Returns PDF path."""
+    """Convert PPT/PPTX/DOC/DOCX to PDF via LibreOffice (required by MinerU). Returns PDF path."""
     out_dir.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
         [

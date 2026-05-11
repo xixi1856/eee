@@ -114,6 +114,29 @@ class WeixinChannelSettings(BaseModel):
     route_tag: str = ""
 
 
+class FeishuChannelSettings(BaseModel):
+    """Feishu (Lark) enterprise bot via WebSocket long connection (official ``lark-oapi``).
+
+    Create a *custom app* in Feishu Developer Console, enable *bot* + *im:message* scope,
+    subscribe to ``im.message.receive_v1``, and choose **long connection** delivery.
+
+    ``encrypt_key`` / ``verification_token`` must match the app console when encryption
+    or URL verification is enabled (pass empty strings when disabled).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = False
+    app_id: str = ""
+    app_secret: str = ""
+    encrypt_key: str = ""
+    verification_token: str = ""
+    # API + WS base domain (Feishu CN default; use https://open.larksuite.com for intl).
+    domain: str = "https://open.feishu.cn"
+    allow_from: list[str] = Field(default_factory=list)
+    route_tag: str = ""
+
+
 class ChannelsSettings(BaseModel):
     """``runtime.channels`` in ``edu_agent.yaml``."""
 
@@ -122,6 +145,7 @@ class ChannelsSettings(BaseModel):
     http_enabled: bool = True
     websocket_enabled: bool = True
     weixin: WeixinChannelSettings = Field(default_factory=WeixinChannelSettings)
+    feishu: FeishuChannelSettings = Field(default_factory=FeishuChannelSettings)
 
 
 class RuntimeSettings(BaseModel):
@@ -143,3 +167,9 @@ class EduSettings(BaseModel):
     tools: ToolsSettings = Field(default_factory=ToolsSettings)
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
     toolsets: ToolsetsSettings = Field(default_factory=ToolsetsSettings)
+    # Platform binding — connect this Agent instance to an edu-platform user
+    platform_base_url: str = "http://localhost:3000"
+    platform_bind_key: str | None = None  # env: PLATFORM_BIND_KEY
+    # agent_user_id uniquely identifies this Agent instance on the Platform.
+    # Leave empty to auto-generate a UUID on first bind (persisted in identity.json).
+    agent_user_id: str | None = None

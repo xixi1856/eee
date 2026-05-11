@@ -10,6 +10,7 @@ from typing import Any
 
 from edu_agent.auth.checker import AuthorizationChecker, AuthorizationError
 from edu_agent.auth.models import AuthContext
+from edu_agent.auth import bind_client, token_store
 from edu_agent.bus.models import (
     InboundMessage,
     OutboundContentType,
@@ -39,6 +40,7 @@ class Gateway:
         runner_idle_timeout_sec: float = 1800.0,
         max_runners: int = 256,
         require_http_key: bool = False,
+        require_binding: bool = False,
     ) -> None:
         self._settings = settings
         self._session_store = session_store
@@ -50,6 +52,7 @@ class Gateway:
         self._max_runners = max(1, max_runners)
         self._require_http_key = require_http_key
 
+        self._require_binding = require_binding
         self._runners: OrderedDict[str, SessionRunner] = OrderedDict()
         self._adapters: list[Any] = []
         self._closing = False
@@ -133,6 +136,134 @@ class Gateway:
                 metadata={"code": "unauthorized"},
             )
             return
+
+        # --- Binding verification + automatic token refresh ---
+        if not self._require_binding:
+            # Binding enforcement disabled — skip identity check.
+            try:
+                sess = self._session_store.get_session(inbound.session_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("get_session failed: %s", exc)
+                sess = None
+            if sess is None:
+                yield OutboundMessage(
+                    message_id=new_message_id(),
+                    in_reply_to=inbound.message_id,
+                    session_id=inbound.session_id,
+                    user_id=auth.user_id,
+                    content="session not found",
+                    content_type=OutboundContentType.ERROR,
+                    is_final=True,
+                    metadata={"code": "session_not_found"},
+                )
+                return
+            try:
+                self._auth.require_session_user(auth, session_user_id=sess.metadata.user_id)
+            except AuthorizationError:
+                yield OutboundMessage(
+                    message_id=new_message_id(),
+                    in_reply_to=inbound.message_id,
+                    session_id=inbound.session_id,
+                    user_id=auth.user_id,
+                    content="forbidden",
+                    content_type=OutboundContentType.ERROR,
+                    is_final=True,
+                    metadata={"code": "forbidden"},
+                )
+                return
+            runner = await self._ensure_runner(inbound.session_id)
+            try:
+                async for ob in runner.enqueue_and_stream(inbound):
+                    yield ob
+            except SessionRunnerBusyError:
+                yield OutboundMessage(
+                    message_id=new_message_id(),
+                    in_reply_to=inbound.message_id,
+                    session_id=inbound.session_id,
+                    user_id=auth.user_id,
+                    content="session queue full",
+                    content_type=OutboundContentType.ERROR,
+                    is_final=True,
+                    metadata={"code": "queue_full"},
+                )
+            return
+
+        identity = token_store.load()
+        if identity is None or not identity.get("channel_token"):
+            yield OutboundMessage(
+                message_id=new_message_id(),
+                in_reply_to=inbound.message_id,
+                session_id=inbound.session_id,
+                user_id=auth.user_id,
+                content="agent not bound to platform user — run `edu bind` first",
+                content_type=OutboundContentType.ERROR,
+                is_final=True,
+                metadata={"code": "identity_not_bound"},
+            )
+            return
+
+        channel_token: str = identity["channel_token"]
+        try:
+            AuthorizationChecker.validate_channel_token(channel_token)
+        except AuthorizationError as _tok_err:
+            if str(_tok_err) == "channel_token_expired":
+                # Auto-refresh via /bind/refresh
+                bind_key = (self._settings.platform_bind_key or "").strip()
+                agent_uid = identity.get("agent_user_id", "")
+                if bind_key and agent_uid:
+                    try:
+                        channel_token = await bind_client.refresh_token(
+                            self._settings.platform_base_url, bind_key, agent_uid
+                        )
+                        identity["channel_token"] = channel_token
+                        token_store.save(identity)
+                        logger.info("channel_token refreshed for agent_user_id=%s", agent_uid)
+                    except Exception as _ref_exc:  # noqa: BLE001
+                        logger.warning("channel_token refresh failed: %s", _ref_exc)
+                        yield OutboundMessage(
+                            message_id=new_message_id(),
+                            in_reply_to=inbound.message_id,
+                            session_id=inbound.session_id,
+                            user_id=auth.user_id,
+                            content="channel token expired and refresh failed — run `edu bind` again",
+                            content_type=OutboundContentType.ERROR,
+                            is_final=True,
+                            metadata={"code": "channel_token_refresh_failed"},
+                        )
+                        return
+                else:
+                    yield OutboundMessage(
+                        message_id=new_message_id(),
+                        in_reply_to=inbound.message_id,
+                        session_id=inbound.session_id,
+                        user_id=auth.user_id,
+                        content="channel token expired — run `edu bind` again",
+                        content_type=OutboundContentType.ERROR,
+                        is_final=True,
+                        metadata={"code": "channel_token_expired"},
+                    )
+                    return
+            else:
+                yield OutboundMessage(
+                    message_id=new_message_id(),
+                    in_reply_to=inbound.message_id,
+                    session_id=inbound.session_id,
+                    user_id=auth.user_id,
+                    content="invalid channel token",
+                    content_type=OutboundContentType.ERROR,
+                    is_final=True,
+                    metadata={"code": "invalid_channel_token"},
+                )
+                return
+
+        # Inject platform identity into auth context
+        auth = auth.model_copy(
+            update={
+                "token": channel_token,
+                "platform_user_id": identity.get("platform_user_id"),
+            }
+        )
+        # --- End binding verification ---
 
         try:
             sess = self._session_store.get_session(inbound.session_id)

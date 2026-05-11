@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
-import { AlertCircle, CheckCircle2, Key, ShieldAlert, RefreshCw, Copy, Trash2 } from "lucide-react";
+import { AlertCircle, CheckCircle2, Key, RefreshCw, Copy, Trash2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 type Me = { role: string };
@@ -82,7 +82,7 @@ export default function CredentialsPage() {
 
   useEffect(() => {
     if (!role) return;
-    if (role === "STUDENT") void loadMine();
+    if (role === "STUDENT" || role === "TEACHER") void loadMine();
     if (role === "ADMIN") void loadAdmin();
   }, [role, loadMine, loadAdmin]);
 
@@ -131,18 +131,6 @@ export default function CredentialsPage() {
 
   if (!role) return null;
 
-  if (role === "TEACHER") return (
-    <div className="max-w-2xl mx-auto px-6 py-8">
-      <div className="flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800/40 px-4 py-4">
-        <ShieldAlert size={18} className="text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
-        <div>
-          <p className="text-sm font-semibold text-amber-900 dark:text-amber-200 mb-0.5">教师账号不含凭证功能</p>
-          <p className="text-xs text-amber-700 dark:text-amber-400">如需绑定 Agent，请联系管理员或由学生使用注册时获得的凭证码。</p>
-        </div>
-      </div>
-    </div>
-  );
-
   return (
     <div className="flex flex-col h-full overflow-auto">
       {notification && (
@@ -161,12 +149,14 @@ export default function CredentialsPage() {
             <Key size={20} className="text-primary" />凭证管理
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            {role === "STUDENT" ? "查看你的凭证状态与有效期" : "管理员：为用户生成和管理凭证"}
+            {role === "STUDENT" || role === "TEACHER"
+              ? "查看你的凭证状态与有效期"
+              : "管理员：为用户生成和管理凭证"}
           </p>
         </div>
 
         {/* Student: view own credentials */}
-        {role === "STUDENT" && (
+        {(role === "STUDENT" || role === "TEACHER") && (
           <div className="space-y-3">
             <p className="text-xs text-muted-foreground">
               凭证码在注册时由平台一次性发放。如需补发，请联系管理员。

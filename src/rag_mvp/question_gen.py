@@ -694,3 +694,11 @@ def save_output(result: dict[str, Any], output_dir: Path) -> tuple[Path, Path]:
 
     md_path.write_text("\n".join(lines), encoding="utf-8")
     return json_path, md_path
+
+
+# ---------------------------------------------------------------------------
+# Public aliases for assignment_gen (avoid duplicating implementation)
+# ---------------------------------------------------------------------------
+
+generate_one = _generate_one
+assign_objective_format_pairs = _assign_objective_format_pairs

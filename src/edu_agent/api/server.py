@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from edu_agent.auth.checker import AuthorizationError
 from edu_agent.auth.models import AuthContext
-from edu_agent.bus.models import ChannelKind, InboundMessage, OutboundContentType
+from edu_agent.bus.models import AttachmentMeta, ChannelKind, InboundMessage, OutboundContentType
 from edu_agent.runner.gateway import Gateway
 from edu_agent.sessions.store import SessionStore
 from edu_agent.toolsets.registry import discover_builtin_tools, toolset_registry
@@ -30,10 +30,27 @@ class ChatMessage(BaseModel):
     content: str | None = None
 
 
+class AttachmentPayload(BaseModel):
+    id: str
+    presigned_url: str
+    mime_type: str
+    name: str
+
+
 class ChatCompletionBody(BaseModel):
     model: str = ""
     messages: list[ChatMessage] = Field(default_factory=list)
     stream: bool = False
+    attachments: list[AttachmentPayload] = Field(default_factory=list)
+
+
+class RegenerateQuestionBody(BaseModel):
+    course_id: str
+    entity_name: str
+    q_type: str
+    objective: str
+    q_id: int
+    extra_requirements: str = ""
 
 
 def _verify_or_401(gateway: Gateway, auth: AuthContext) -> None:
@@ -199,6 +216,15 @@ def create_app(
             user_id=user_id,
             content=text.strip(),
             metadata=_platform_chat_metadata(request, user_id=user_id, auth_api_key=auth.api_key),
+            attachments=tuple(
+                AttachmentMeta(
+                    id=a.id,
+                    presigned_url=a.presigned_url,
+                    mime_type=a.mime_type,
+                    name=a.name,
+                )
+                for a in payload.attachments
+            ),
         )
 
         if payload.stream:
@@ -286,5 +312,30 @@ def create_app(
         from edu_agent.channels.websocket import websocket_chat_loop
 
         await websocket_chat_loop(ws, gw)
+
+    @app.post("/v1/assignment/regenerate-question")
+    async def regenerate_question(
+        request: Request,
+        payload: RegenerateQuestionBody = Body(...),
+        gw: Gateway = Depends(gw_dep),
+    ) -> JSONResponse:
+        auth = _auth_from_request(request)
+        _verify_or_401(gw, auth)
+        from rag_mvp.assignment_gen import regenerate_one_question
+
+        result = await regenerate_one_question(
+            course_id=payload.course_id,
+            entity_name=payload.entity_name,
+            q_type=payload.q_type,
+            objective=payload.objective,
+            q_id=payload.q_id,
+            extra_requirements=payload.extra_requirements,
+        )
+        if result is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Could not regenerate question: no usable context found in course RAG",
+            )
+        return JSONResponse(result)
 
     return app

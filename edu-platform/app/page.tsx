@@ -37,7 +37,7 @@ export default function HomePage() {
               <Link href="/login">登录</Link>
             </Button>
             <Button size="sm" asChild>
-              <Link href="/register">免费注册</Link>
+              <Link href="/register">注册</Link>
             </Button>
           </div>
         </div>

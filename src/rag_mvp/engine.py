@@ -17,7 +17,7 @@ from .course_workspace import course_id_to_workspace
 from .llm import (
     _filtered_vision_model_func,
     build_data_uri_from_image_path,
-    embedding_func,
+    build_embedding_func,
     llm_model_func,
     vision_model_func,
 )
@@ -74,6 +74,30 @@ _QUERY_IMAGE_TOP_K = 60
 _QUERY_IMAGE_CHUNK_TOP_K = 40
 _QUERY_IMAGE_MAX_PARSED_CHARS = 100_000
 
+async def _ensure_lightrag_storages(rag: RAGAnything) -> None:
+    """Initialise LightRAG storages on the **current** asyncio loop (must not cross ``asyncio.run``)."""
+    lr = rag.lightrag
+    if lr is None:
+        return
+    await lr.initialize_storages()
+
+
+def _invalidate_personal_rag_cache() -> None:
+    """Drop cached personal RAG so the next ``asyncio.run`` gets a fresh LightRAG + embedding workers."""
+    global _rag_instance
+    _rag_instance = None
+
+
+def _invalidate_course_rag_cache_for(course_id: str) -> None:
+    """Drop cached course RAG for this course (sync wrappers use one-shot event loops)."""
+    ws = course_id_to_workspace(course_id)
+    _course_cache.pop(ws, None)
+
+
+_course_cache: dict[str, RAGAnything] = {}
+_course_init_lock = asyncio.Lock()
+
+
 _VISION_QUERY_SYSTEM = (
     "You are a careful assistant. Answer using ONLY: (1) the retrieved knowledge base excerpts, "
     "(2) the user-provided image(s) when relevant, (3) the user's question. "
@@ -90,24 +114,24 @@ _TEXT_IMAGE_FALLBACK_SYSTEM = (
 def _build_rag() -> RAGAnything:
     """Instantiate and return a configured RAGAnything instance.
 
-    A LightRAG instance is created and its storages initialised before being
-    handed to RAGAnything.  This ensures aquery() works even when no documents
-    have been ingested yet.
+    LightRAG storages are **not** initialised here; callers must
+    ``await _ensure_lightrag_storages(rag)`` inside the same ``asyncio.run``
+    as ingest/query so embedding workers stay on one event loop.
     """
     _check_metadata()  # abort early if embedding dim has changed
     settings.working_dir.mkdir(parents=True, exist_ok=True)
     settings.output_dir.mkdir(parents=True, exist_ok=True)
 
+    emb = build_embedding_func()
     lightrag = LightRAG(
         working_dir=str(settings.working_dir),
         llm_model_func=llm_model_func,
-        embedding_func=embedding_func,
+        embedding_func=emb,
         llm_model_max_async=settings.llm_max_async,
         embedding_func_max_async=settings.embedding_max_async,
         max_parallel_insert=settings.max_parallel_insert,
     )
-    asyncio.run(lightrag.initialize_storages())
-    _write_metadata()  # persist / refresh after successful init
+    _write_metadata()
 
     config = RAGAnythingConfig(
         working_dir=str(settings.working_dir),
@@ -124,7 +148,7 @@ def _build_rag() -> RAGAnything:
         config=config,
         llm_model_func=llm_model_func,
         vision_model_func=_filtered_vision_model_func if settings.enable_image_filter else vision_model_func,
-        embedding_func=embedding_func,
+        embedding_func=emb,
     )
 
 
@@ -179,7 +203,15 @@ def ingest_file(file_path: str | Path) -> None:
 
     logger.info(f"Ingesting file: {file_path}")
     rag = get_rag()
-    asyncio.run(_aingest_file(rag, file_path))
+
+    async def _main() -> None:
+        await _ensure_lightrag_storages(rag)
+        await _aingest_file(rag, file_path)
+
+    try:
+        asyncio.run(_main())
+    finally:
+        _invalidate_personal_rag_cache()
 
 
 def ingest_folder(folder_path: str | Path) -> None:
@@ -197,10 +229,14 @@ def ingest_folder(folder_path: str | Path) -> None:
     rag = get_rag()
 
     async def _process_all():
+        await _ensure_lightrag_storages(rag)
         for f in files:
             await _aingest_file(rag, f)
 
-    asyncio.run(_process_all())
+    try:
+        asyncio.run(_process_all())
+    finally:
+        _invalidate_personal_rag_cache()
     logger.success(f"Folder ingested: {folder_path} ({len(files)} files)")
 
 
@@ -251,6 +287,7 @@ async def _aquery_data_for_image_query(
     from lightrag import QueryParam
 
     rag = get_rag()
+    await _ensure_lightrag_storages(rag)
     lightrag = rag.lightrag
     assert lightrag is not None, "LightRAG instance not initialised"
     m = cast(
@@ -315,7 +352,6 @@ async def _answer_with_images_async(
         for img_path in image_paths:
             parse_file(img_path)
             stem_dir = settings.output_dir / img_path.stem
-            parse_dirs.append(stem_dir)
             md_blob = _collect_parsed_markdown_under([stem_dir])
             label = img_path.name
             parsed_sections.append(f"### Parsed from {label}\n{md_blob or '(no markdown produced)'}")
@@ -375,17 +411,29 @@ def query(
         if not paths:
             raise ValueError("image_paths must not be empty when provided")
         _validate_image_paths_for_query(paths)
-        return asyncio.run(
-            _answer_with_images_async(question, mode, paths, with_refs=with_refs)
-        )
+        try:
+            return asyncio.run(
+                _answer_with_images_async(question, mode, paths, with_refs=with_refs)
+            )
+        finally:
+            _invalidate_personal_rag_cache()
 
     if not with_refs:
-        return asyncio.run(rag.aquery(question, mode=mode))
+
+        async def _plain_query() -> str:
+            await _ensure_lightrag_storages(rag)
+            return await rag.aquery(question, mode=mode)
+
+        try:
+            return asyncio.run(_plain_query())
+        finally:
+            _invalidate_personal_rag_cache()
 
     lightrag = rag.lightrag
     assert lightrag is not None, "LightRAG instance not initialised"
 
     async def _run():
+        await _ensure_lightrag_storages(rag)
         result = await lightrag.aquery_llm(
             question,
             param=QueryParam(mode=_mode, include_references=True),
@@ -400,7 +448,10 @@ def query(
             "references": data.get("references", []),
         }
 
-    return asyncio.run(_run())
+    try:
+        return asyncio.run(_run())
+    finally:
+        _invalidate_personal_rag_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +529,7 @@ def reindex_from_cache(
     rag = get_rag()
 
     async def _rebuild():
+        await _ensure_lightrag_storages(rag)
         for json_path in json_files:
             stem = json_path.stem.replace("_content_list", "")
             logger.info(f"Re-indexing: {stem}")
@@ -489,7 +541,10 @@ def reindex_from_cache(
             )
             logger.success(f"Re-indexed: {stem} ({len(content_list)} blocks)")
 
-    asyncio.run(_rebuild())
+    try:
+        asyncio.run(_rebuild())
+    finally:
+        _invalidate_personal_rag_cache()
     logger.success("Reindex complete.")
 
 
@@ -505,6 +560,7 @@ def clear_storage() -> None:
         logger.success(f"Deleted: {wd}")
     else:
         logger.info(f"Nothing to delete: {wd} does not exist")
+    _invalidate_personal_rag_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -528,7 +584,7 @@ def _build_parser() -> RAGAnything:
         config=config,
         llm_model_func=llm_model_func,
         vision_model_func=vision_model_func,
-        embedding_func=embedding_func,
+        embedding_func=build_embedding_func(),
     )
 
 
@@ -582,9 +638,6 @@ def parse_folder(folder_path: str | Path) -> None:
 # Course RAG (Phase 7) — single factory for PG-backed LightRAG + RAGAnything
 # ---------------------------------------------------------------------------
 
-_course_cache: dict[str, RAGAnything] = {}
-_course_init_lock = asyncio.Lock()
-
 
 def material_stable_doc_id(material_id: str) -> str:
     """Deterministic LightRAG document id for a platform material row."""
@@ -606,21 +659,28 @@ async def get_course_rag_anything(course_id: str) -> RAGAnything:
 
         ensure_postgres_env_from_database_url()
 
-        work = str(settings.working_dir / "course_pg_layout")
+        # NetworkXStorage stores graph files locally, so each course needs its own
+        # working directory to prevent graph data from being mixed across courses.
+        # PGGraphStorage shares state via workspace= so a shared dir is fine.
+        if settings.graph_storage == "NetworkXStorage":
+            work = str(settings.working_dir / "course_graphs" / workspace)
+        else:
+            work = str(settings.working_dir / "course_pg_layout")
         Path(work).mkdir(parents=True, exist_ok=True)
         settings.output_dir.mkdir(parents=True, exist_ok=True)
 
+        emb = build_embedding_func()
         lightrag = LightRAG(
             working_dir=work,
             workspace=workspace,
             llm_model_func=llm_model_func,
-            embedding_func=embedding_func,
+            embedding_func=emb,
             llm_model_max_async=settings.llm_max_async,
             embedding_func_max_async=settings.embedding_max_async,
             max_parallel_insert=settings.max_parallel_insert,
             kv_storage="PGKVStorage",
             vector_storage="PGVectorStorage",
-            graph_storage="PGGraphStorage",
+            graph_storage=settings.graph_storage,
             doc_status_storage="PGDocStatusStorage",
         )
         await lightrag.initialize_storages()
@@ -640,7 +700,7 @@ async def get_course_rag_anything(course_id: str) -> RAGAnything:
             config=cfg,
             llm_model_func=llm_model_func,
             vision_model_func=_vision_for_course_rag(),
-            embedding_func=embedding_func,
+            embedding_func=emb,
         )
         init = await rag._ensure_lightrag_initialized()
         if not init.get("success"):
@@ -721,6 +781,7 @@ async def personal_aquery_data(
     top_k: int,
 ) -> dict[str, Any]:
     rag = get_rag()
+    await _ensure_lightrag_storages(rag)
     m = cast(
         "Literal['local', 'global', 'hybrid', 'naive', 'mix', 'bypass']",
         mode if mode in ("local", "global", "hybrid", "naive", "mix", "bypass") else "hybrid",
@@ -743,7 +804,10 @@ def course_retrieval_hits_sync(
         chunks = data.get("chunks") or []
         return _hits_from_aquery_chunks(chunks, origin="course")
 
-    return asyncio.run(_run())
+    try:
+        return asyncio.run(_run())
+    finally:
+        _invalidate_course_rag_cache_for(course_id)
 
 
 def personal_retrieval_hits_sync(
@@ -758,7 +822,10 @@ def personal_retrieval_hits_sync(
         chunks = data.get("chunks") or []
         return _hits_from_aquery_chunks(chunks, origin="personal")
 
-    return asyncio.run(_run())
+    try:
+        return asyncio.run(_run())
+    finally:
+        _invalidate_personal_rag_cache()
 
 
 async def ingest_parsed_material_into_course_async(
@@ -801,9 +868,12 @@ def ingest_parsed_material_into_course_sync(
     material_id: str,
     source_file: Path,
 ) -> int:
-    return asyncio.run(
-        ingest_parsed_material_into_course_async(course_id, material_id, source_file),
-    )
+    try:
+        return asyncio.run(
+            ingest_parsed_material_into_course_async(course_id, material_id, source_file),
+        )
+    finally:
+        _invalidate_course_rag_cache_for(course_id)
 
 
 async def delete_material_course_async(course_id: str, material_id: str) -> None:
@@ -815,7 +885,10 @@ async def delete_material_course_async(course_id: str, material_id: str) -> None
 
 
 def delete_material_course_sync(course_id: str, material_id: str) -> None:
-    asyncio.run(delete_material_course_async(course_id, material_id))
+    try:
+        asyncio.run(delete_material_course_async(course_id, material_id))
+    finally:
+        _invalidate_course_rag_cache_for(course_id)
 
 
 async def get_lightrag_for_course(course_id: str) -> LightRAG:

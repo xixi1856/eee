@@ -1,6 +1,13 @@
 import { getEduAgentApiKey, getEduAgentBaseUrl } from "@/lib/config";
 import { ApiError } from "@/lib/http/api-error";
 
+export type AgentAttachment = {
+  id: string;
+  presigned_url: string;
+  mime_type: string;
+  name: string;
+};
+
 export type AgentChatRequest = {
   agentUserId: string;
   courseId: string;
@@ -8,6 +15,7 @@ export type AgentChatRequest = {
   sessionId: string;
   userMessage: string;
   stream: boolean;
+  attachments?: AgentAttachment[];
 };
 
 function agentHeaders(agentUserId: string, courseId: string, lessonId?: string | null): Headers {
@@ -80,6 +88,7 @@ export async function postChatCompletionsStream(
       model: "",
       messages: [{ role: "user", content: req.userMessage }],
       stream: req.stream,
+      ...(req.attachments?.length ? { attachments: req.attachments } : {}),
     }),
   });
   return res;

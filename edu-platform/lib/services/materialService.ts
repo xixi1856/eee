@@ -17,6 +17,7 @@ import { assertTeacherOfCourse, getCourseIfMember, assertUuid } from "@/lib/cour
 import { deleteObject, putObjectStream } from "@/lib/minio";
 import { enqueueRagTask, type RagQueueTask } from "@/lib/queue/ragTask";
 import type { MaterialCreatedDto, MaterialSummaryDto } from "@/lib/dto/material.dto";
+import { MATERIAL_UPLOAD_ALLOWED_EXT_SET } from "@/lib/material-upload-allowed";
 
 async function enqueueRagTaskWithRetry(task: RagQueueTask, maxAttempts = 5): Promise<void> {
   let last: unknown;
@@ -33,12 +34,14 @@ async function enqueueRagTaskWithRetry(task: RagQueueTask, maxAttempts = 5): Pro
 }
 
 /** Must match worker `parse_material` (see review_phase7 H4). */
-const ALLOWED_EXT = new Set(["pdf", "md", "txt", "pptx", "docx"]);
+const ALLOWED_EXT = MATERIAL_UPLOAD_ALLOWED_EXT_SET;
 
 function extToFileType(ext: string): string {
   const e = ext.toLowerCase();
   if (e === "jpg" || e === "jpeg" || e === "png" || e === "webp") return "image";
+  if (e === "ppt") return "ppt";
   if (e === "pptx") return "pptx";
+  if (e === "doc") return "doc";
   if (e === "docx") return "docx";
   return e;
 }
@@ -137,7 +140,7 @@ export async function uploadMaterialStream(params: {
   const ext = parseExtension(params.originalFilename);
   if (!ext || !ALLOWED_EXT.has(ext.toLowerCase())) {
     throw new ApiError(400, "VALIDATION_ERROR", "Unsupported file type", {
-      allowed: [...ALLOWED_EXT],
+      allowed: [...ALLOWED_EXT].sort(),
     });
   }
   const fileType = extToFileType(ext);

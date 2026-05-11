@@ -10,6 +10,7 @@ __pycache__/
 
 # Storage (large auto-generated data)
 rag_storage/
+rag_storage_deprecated/
 output
 logs.txt
 .edu_agent_tool_execute_ws/
@@ -28,3 +29,7 @@ memory/
 Thumbs.db
 
 
+Dockerfile_minerU
+uv.lock
+edu-platform/postgres/*
+scripts/truncate_except_prisma.sql

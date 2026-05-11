@@ -7,7 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from openai import AsyncOpenAI
-from lightrag.llm.openai import openai_complete_if_cache, openai_embed
+from lightrag.llm.openai import openai_complete_if_cache
+from lightrag.llm.ollama import ollama_embed
 from lightrag.utils import EmbeddingFunc
 from loguru import logger
 
@@ -148,6 +149,7 @@ async def vision_model_func(
 # Image filter statistics (accumulated in-process for the current session)
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class _ImageFilterStats:
     total: int = 0
@@ -254,24 +256,27 @@ async def _filtered_vision_model_func(
     )
 
 
-async def _embedding_func_with_label(texts, **kwargs):
-    """Wrapper that sets the LLM role contextvar for rate-limit log labeling."""
+async def _ollama_embedding_func_with_label(texts: list[str], **kwargs):
+    """Ollama embeddings via LightRAG's ``ollama_embed.func`` (use .func to avoid double-wrap)."""
     token = _llm_role.set(f"embedding/{settings.embedding_model}")
     try:
-        return await openai_embed.func(
+        key = settings.ollama_api_key.strip() or None
+        return await ollama_embed.func(
             texts,
-            model=settings.embedding_model,
-            api_key=settings.llm_api_key,
-            base_url=settings.llm_base_url,
+            embed_model=settings.embedding_model,
+            host=settings.ollama_base_url.rstrip("/"),
+            api_key=key,
             **kwargs,
         )
     finally:
         _llm_role.reset(token)
 
 
-# openai_embed is an EmbeddingFunc instance; use .func to get the raw async callable.
-embedding_func = EmbeddingFunc(
-    embedding_dim=settings.embedding_dim,
-    max_token_size=settings.embedding_max_tokens,
-    func=_embedding_func_with_label,
-)
+def build_embedding_func() -> EmbeddingFunc:
+    """Return a new ``EmbeddingFunc`` bound to current settings (fresh LightRAG worker queues)."""
+    return EmbeddingFunc(
+        embedding_dim=settings.embedding_dim,
+        max_token_size=settings.embedding_max_tokens,
+        func=_ollama_embedding_func_with_label,
+        model_name=settings.embedding_model,
+    )

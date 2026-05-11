@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import tempfile
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -36,11 +37,13 @@ from edu_agent.memory.output_scrubber import sanitize_completed_assistant_output
 from edu_agent.memory.provider import BuiltinFilesystemMemoryProvider
 from edu_agent.paths import build_paths
 from edu_agent.bus.models import (
+    AttachmentMeta,
     OutboundContentType,
     OutboundMessage,
     ensure_aware_utc,
     new_message_id,
 )
+from edu_agent.providers.vision import detect_vision_support
 from edu_agent.providers.runtime import (
     build_async_openai_client,
     build_openai_client,
@@ -404,6 +407,7 @@ class EduAgent:
         user_input: str,
         *,
         in_reply_to: UUID,
+        attachments: tuple[AttachmentMeta, ...] = (),
     ) -> AsyncIterator[OutboundMessage]:
         """Stream outbound chunks for one user turn (A5); uses async LLM streaming."""
         self._reset_b3_turn_metrics()
@@ -425,7 +429,11 @@ class EduAgent:
         )
         token = set_current_runtime(ctx)
         try:
-            async for ob in self._run_turn_inner_stream(user_input, in_reply_to=in_reply_to):
+            async for ob in self._run_turn_inner_stream(
+                user_input,
+                in_reply_to=in_reply_to,
+                attachments=attachments,
+            ):
                 yield ob
         finally:
             reset_current_runtime(token)
@@ -439,11 +447,142 @@ class EduAgent:
                 last = ob.content or ""
         return last
 
+    # ------------------------------------------------------------------
+    # Multimodal helpers
+    # ------------------------------------------------------------------
+
+    async def _prepare_user_turn(
+        self,
+        user_input: str,
+        attachments: tuple[AttachmentMeta, ...],
+    ) -> dict:
+        """Build the OpenAI-compatible user message dict for this turn.
+
+        - No attachments → plain string content.
+        - Vision model + image attachments → content array with image_url parts.
+        - Non-vision model or non-image files → prepend OCR/parse context prefix.
+        """
+        if not attachments:
+            return {"role": "user", "content": user_input}
+
+        vision = await detect_vision_support(self._main_runtime)
+        image_atts = [a for a in attachments if a.mime_type.startswith("image/")]
+        other_atts = [a for a in attachments if not a.mime_type.startswith("image/")]
+
+        context_parts: list[str] = []
+
+        # Non-image files always go through text extraction regardless of vision.
+        for att in other_atts:
+            extracted = await self._preprocess_attachment_for_context(att)
+            context_parts.append(extracted)
+
+        if vision and image_atts:
+            # Build multimodal content array for vision-capable models.
+            content: list[dict] = []
+            if context_parts or user_input:
+                combined_text = "\n\n".join(context_parts + [user_input]) if context_parts else user_input
+                content.append({"type": "text", "text": combined_text})
+            for att in image_atts:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": att.presigned_url},
+                })
+            return {"role": "user", "content": content}
+
+        # Non-vision path: OCR images too and prepend everything as context.
+        for att in image_atts:
+            extracted = await self._preprocess_attachment_for_context(att)
+            context_parts.append(extracted)
+
+        prefix = "\n\n".join(context_parts)
+        combined = f"{prefix}\n\n{user_input}" if prefix else user_input
+        return {"role": "user", "content": combined}
+
+    async def _preprocess_attachment_for_context(
+        self,
+        att: AttachmentMeta,
+    ) -> str:
+        """Download an attachment and extract a text snippet (max 800 chars)."""
+        import httpx
+
+        _MIME_TO_SUFFIX = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+            "application/pdf": ".pdf",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+            "text/plain": ".txt",
+            "text/markdown": ".md",
+        }
+        suffix = _MIME_TO_SUFFIX.get(att.mime_type, "")
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(att.presigned_url)
+                resp.raise_for_status()
+                raw = resp.content
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to download attachment %s: %s", att.name, exc)
+            return f"[附件 {att.name} 下载失败，无法提取内容]"
+
+        text = ""
+        try:
+            if att.mime_type in ("text/plain", "text/markdown") or suffix in (".txt", ".md"):
+                text = raw.decode("utf-8", errors="replace")
+            elif att.mime_type == "application/pdf" or suffix == ".pdf":
+                from io import BytesIO
+                import pypdf
+                reader = pypdf.PdfReader(BytesIO(raw))
+                parts = [page.extract_text() or "" for page in reader.pages]
+                text = "\n".join(parts)
+            else:
+                # For DOCX/PPTX/XLSX/images we write to a tempfile and use
+                # RAGAnything's document parser — result is returned as plain text.
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    tmp.write(raw)
+                    tmp_path = Path(tmp.name)
+                try:
+                    from rag_mvp.engine import _build_parser  # type: ignore[import]
+                    import asyncio
+                    rag = _build_parser()
+                    out_dir = str(tmp_path.parent / tmp_path.stem)
+                    await rag.parse_document(
+                        file_path=str(tmp_path),
+                        output_dir=out_dir,
+                    )
+                    # Collect .txt output files written by MinerU.
+                    out_texts = list(Path(out_dir).rglob("*.txt"))
+                    if out_texts:
+                        text = "\n".join(p.read_text(errors="replace") for p in out_texts)
+                except Exception as exc2:  # noqa: BLE001
+                    logger.warning(
+                        "RAGAnything parse failed for %s: %s; skipping content", att.name, exc2
+                    )
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Text extraction failed for %s: %s", att.name, exc)
+            return f"[附件 {att.name} 内容提取失败]"
+
+        MAX_CHARS = 800
+        total_len = len(text)
+        snippet = text[:MAX_CHARS]
+        truncated = total_len > MAX_CHARS
+        header = f"[附件: {att.name} | 共 {total_len} 字符"
+        if truncated:
+            header += f"，以下仅展示前 {MAX_CHARS} 字符"
+        header += "]"
+        return f"{header}\n{snippet}"
+
     async def _run_turn_inner_stream(
         self,
         user_input: str,
         *,
         in_reply_to: UUID,
+        attachments: tuple[AttachmentMeta, ...] = (),
     ) -> AsyncIterator[OutboundMessage]:
         await self._ensure_mcp_tools_registered()
 
@@ -476,7 +615,7 @@ class EduAgent:
             )
             return
 
-        user_msg = {"role": "user", "content": user_input}
+        user_msg = await self._prepare_user_turn(user_input, attachments)
         self.messages.append(user_msg)
         self._persist_message(user_msg)
 
@@ -514,11 +653,19 @@ class EduAgent:
         _disabled = frozenset(self.config.disabled_tools)
         _specs = toolset_registry.list_specs(self._settings, disabled_names=_disabled)
         _openai_tools = tool_specs_to_openai_tools(_specs)
+        # Conditionally activate the multimodal_attachments skill for this turn.
+        if attachments:
+            _skill_entries = [
+                e._replace(always_inject=True) if e.name == "multimodal_attachments" else e
+                for e in self._skill_entries
+            ]
+        else:
+            _skill_entries = self._skill_entries
         system_prompt = build_system_prompt(
             skills_dir=self._skills_dir,
             learner_profile_summary=self._profile_summary,
             available_tools={s.name for s in _specs},
-            skill_entries=self._skill_entries,
+            skill_entries=_skill_entries,
             memory_context=memory_context,
         )
 

@@ -19,6 +19,7 @@ class ChannelKind(str, Enum):
     HTTP = "http"
     WEBSOCKET = "websocket"
     WEIXIN = "weixin"
+    FEISHU = "feishu"
 
 
 class InboundKind(str, Enum):
@@ -52,6 +53,17 @@ def ensure_aware_utc(dt: datetime | None = None) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+class AttachmentMeta(BaseModel):
+    """Metadata for a user-uploaded file attachment (presigned URL, temporary)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    presigned_url: str
+    mime_type: str
+    name: str
+
+
 class InboundMessage(BaseModel):
     """Immutable inbound envelope (transport + routing)."""
 
@@ -65,6 +77,7 @@ class InboundMessage(BaseModel):
     kind: InboundKind = InboundKind.USER_TEXT
     content: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
+    attachments: tuple["AttachmentMeta", ...] = Field(default=())
 
     @classmethod
     def user_text(
@@ -77,7 +90,8 @@ class InboundMessage(BaseModel):
         metadata: dict[str, Any] | None = None,
         message_id: UUID | None = None,
         timestamp: datetime | None = None,
-    ) -> InboundMessage:
+        attachments: tuple["AttachmentMeta", ...] = (),
+    ) -> "InboundMessage":
         return cls(
             message_id=message_id or new_message_id(),
             channel=channel,
@@ -87,6 +101,7 @@ class InboundMessage(BaseModel):
             kind=InboundKind.USER_TEXT,
             content=content,
             metadata=dict(metadata or {}),
+            attachments=attachments,
         )
 
     @classmethod

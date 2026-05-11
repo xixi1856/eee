@@ -223,12 +223,21 @@ export function createB3SseTransformFromAgent(
   });
 }
 
+export type AttachmentParam = {
+  id: string;
+  key: string;
+  presigned_url: string;
+  mime_type: string;
+  name: string;
+};
+
 export type CourseChatParams = {
   courseId: string;
   platformStudentId: string;
   agentUserId: string;
   message: string;
   lessonId?: string | null;
+  attachments?: AttachmentParam[];
 };
 
 /**
@@ -256,6 +265,7 @@ export async function courseChatSseResponse(
     sessionId,
     userMessage: p.message,
     stream: true,
+    attachments: p.attachments,
   });
   if (!agentRes.ok) {
     const t = await agentRes.text();

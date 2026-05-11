@@ -42,7 +42,7 @@ type UserInfo = {
 
 const navItems = [
   { label: "课程空间", href: "/courses", icon: BookOpen },
-  { label: "我的凭证", href: "/credentials", icon: Key, roles: ["STUDENT", "ADMIN"] },
+  { label: "我的凭证", href: "/credentials", icon: Key, roles: ["STUDENT", "TEACHER", "ADMIN"] },
   { label: "个人中心", href: "/user", icon: User },
   { label: "学习进度", href: "/me/progress", icon: TrendingUp, roles: ["STUDENT"] },
   { label: "隐私与数据", href: "/me/privacy", icon: Shield },

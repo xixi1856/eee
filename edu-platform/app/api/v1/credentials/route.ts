@@ -9,9 +9,6 @@ import { UserRole } from "@prisma/client";
 export const dynamic = "force-dynamic";
 
 function assertCredentialAccess(role: UserRole): void {
-  if (role === UserRole.TEACHER) {
-    throw new ApiError(403, "FORBIDDEN", "Teachers do not have credential access");
-  }
   if (role === UserRole.ADMIN) {
     throw new ApiError(
       403,
@@ -19,7 +16,7 @@ function assertCredentialAccess(role: UserRole): void {
       "Admins manage credentials via /api/v1/admin/credentials only",
     );
   }
-  if (role !== UserRole.STUDENT) {
+  if (role !== UserRole.STUDENT && role !== UserRole.TEACHER) {
     throw new ApiError(403, "FORBIDDEN", "Credential access denied");
   }
 }
@@ -43,7 +40,7 @@ export async function POST() {
     new ApiError(
       403,
       "FORBIDDEN",
-      "Self-service credential creation is disabled; codes are issued at registration (students) or by an administrator",
+      "Self-service credential creation is disabled; codes are issued at registration (students and teachers) or by an administrator",
     ),
   );
 }

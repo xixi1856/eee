@@ -10,12 +10,7 @@ import sys
 
 from edu_agent.agent import EduAgent
 from edu_agent.auth.checker import AuthorizationChecker
-from edu_agent.channels.http import HTTPChannelAdapter
-from edu_agent.channels.weixin import (
-    WeixinChannelAdapter,
-    account_json_has_token,
-    resolve_weixin_state_dir,
-)
+from edu_agent.channels.registry import register_channel_adapters
 from edu_agent.config_loader import load_settings
 from edu_agent.context.manager import ContextManager
 from edu_agent.context.models import ContextConfig
@@ -57,32 +52,14 @@ async def _async_main(host: str | None, port: int | None) -> None:
         max_runners=int(gw_raw.get("max_runners", 256)),
         require_http_key=bool(gw_raw.get("require_http_key", False)),
     )
-    http = HTTPChannelAdapter(
+    register_channel_adapters(
         gateway,
-        store,
+        settings=settings,
+        paths=paths,
+        session_store=store,
         host=eff_host,
         port=eff_port,
     )
-    gateway.register_adapter(http)
-
-    wx_cfg = settings.runtime.channels.weixin
-    if wx_cfg.enabled:
-        wx_state = resolve_weixin_state_dir(settings, paths)
-        if (wx_cfg.token or "").strip() or account_json_has_token(wx_state):
-            gateway.register_adapter(
-                WeixinChannelAdapter(
-                    gateway,
-                    store,
-                    weixin=wx_cfg,
-                    state_dir=wx_state,
-                )
-            )
-            logger.info("Weixin channel enabled (ilinkai long-poll, default base_url)")
-        else:
-            logger.warning(
-                "Weixin enabled but no token — run `uv run edu channels login weixin` "
-                "or set runtime.channels.weixin.token in edu_agent.yaml"
-            )
 
     stop = asyncio.Event()
 

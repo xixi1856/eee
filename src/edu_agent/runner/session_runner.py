@@ -251,6 +251,7 @@ class SessionRunner:
         async def _turn() -> None:
             async for ob in self._agent.run_turn_stream(
                 inbound.content,
+                attachments=inbound.attachments,
                 in_reply_to=inbound.message_id,
             ):
                 await out_q.put(ob)

@@ -19,7 +19,7 @@ import type {
 } from "@/lib/dto/auth.dto";
 import { assertPasswordPolicy } from "@/lib/validation/password-policy";
 import { toPublicUser } from "@/lib/services/userService";
-import { allocateStudentCredentialInTransaction } from "@/lib/services/credentialService";
+import { allocateRegistrationCredentialInTransaction } from "@/lib/services/credentialService";
 
 async function loadAgentUserIdForUser(
   platformUserId: string,
@@ -51,10 +51,13 @@ export async function registerUser(
         },
       });
       let credential: RegisterResponseDto["credential"];
-      if (body.role === UserRole.STUDENT) {
+      if (
+        body.role === UserRole.STUDENT ||
+        body.role === UserRole.TEACHER
+      ) {
         const maxMin = getSelfCredentialMaxExpiresMinutes();
         const expiresAt = new Date(Date.now() + maxMin * 60 * 1000);
-        credential = await allocateStudentCredentialInTransaction(
+        credential = await allocateRegistrationCredentialInTransaction(
           tx,
           user.id,
           expiresAt,

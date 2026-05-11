@@ -7,9 +7,9 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
-import { Send, User, Bot, AlertCircle } from "lucide-react";
+import { Send, User, Bot, AlertCircle, Paperclip, X, FileText, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { useChatStream } from "@/lib/hooks/useChatStream";
+import { useChatStream, type AttachmentRef } from "@/lib/hooks/useChatStream";
 
 type UserMe = {
   qa_collection_enabled?: boolean;
@@ -18,7 +18,20 @@ type UserMe = {
 
 export default function ChatComponent({ courseId }: { courseId: string }) {
   const [input, setInput] = useState("");
-  const { msgs, streaming, busy, citations, lastMeta, errorMsg, sendMessage } = useChatStream(courseId);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const {
+    msgs,
+    streaming,
+    busy,
+    citations,
+    lastMeta,
+    errorMsg,
+    sendMessage,
+    pendingAttachments,
+    attachmentUploading,
+    addAttachment,
+    removeAttachment,
+  } = useChatStream(courseId);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const loadUser = useCallback(async () => {
@@ -58,7 +71,7 @@ export default function ChatComponent({ courseId }: { courseId: string }) {
   }, [msgs, streaming]);
 
   const handleSend = () => {
-    if (!input.trim() || busy) return;
+    if ((!input.trim() && pendingAttachments.length === 0) || busy) return;
     sendMessage(input);
     setInput("");
   };
@@ -68,6 +81,12 @@ export default function ChatComponent({ courseId }: { courseId: string }) {
       e.preventDefault();
       handleSend();
     }
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    files.forEach((f) => void addAttachment(f));
+    e.target.value = "";
   };
 
   return (
@@ -98,6 +117,13 @@ export default function ChatComponent({ courseId }: { courseId: string }) {
                   msg.role === "user" ? "items-end" : "items-start"
                 )}
               >
+                {msg.attachments && msg.attachments.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 mb-1.5 justify-end">
+                    {msg.attachments.map((att) => (
+                      <AttachmentBubble key={att.id} att={att} />
+                    ))}
+                  </div>
+                )}
                 <div
                   className={cn(
                     "px-4 py-3 rounded-2xl",
@@ -177,30 +203,97 @@ export default function ChatComponent({ courseId }: { courseId: string }) {
 
       <div className="absolute bottom-4 left-0 right-0 w-full px-4 md:px-8 bg-gradient-to-t from-background via-background to-transparent pt-6">
         <div className="max-w-3xl mx-auto relative rounded-2xl bg-muted/40 border border-border shadow-sm focus-within:ring-1 focus-within:ring-ring focus-within:bg-background transition-colors overflow-hidden">
-          <Textarea
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="消息 Eduardo..."
-            className="min-h-[52px] max-h-48 resize-none border-0 shadow-none bg-transparent py-4 text-sm focus-visible:ring-0"
-            disabled={busy}
-            rows={1}
-          />
-          <div className="absolute right-2 bottom-2">
-            <Button
-              size="icon"
-              className={cn("h-8 w-8 rounded-full", !input.trim() || busy ? "opacity-50" : "")}
-              onClick={handleSend}
-              disabled={!input.trim() || busy}
-            >
-              <Send size={16} />
-            </Button>
+          {pendingAttachments.length > 0 && (
+            <div className="flex flex-wrap gap-2 px-4 pt-3 pb-1">
+              {pendingAttachments.map((att) => (
+                <div key={att.id} className="relative group flex-shrink-0">
+                  {att.mime_type.startsWith("image/") && att.localPreviewUrl ? (
+                    <img
+                      src={att.localPreviewUrl}
+                      alt={att.name}
+                      className="w-16 h-16 object-cover rounded-lg border border-border"
+                    />
+                  ) : (
+                    <div className="w-16 h-16 flex flex-col items-center justify-center rounded-lg border border-border bg-muted text-xs text-muted-foreground gap-1 px-1">
+                      <FileText size={20} className="shrink-0" />
+                      <span className="truncate w-full text-center leading-tight">{att.name}</span>
+                    </div>
+                  )}
+                  <button
+                    onClick={() => removeAttachment(att.id)}
+                    className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-foreground text-background flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                    aria-label="移除附件"
+                  >
+                    <X size={10} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="flex items-end">
+            <div className="pl-2 pb-2 flex-shrink-0">
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept="image/*,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.md"
+                className="hidden"
+                onChange={handleFileChange}
+              />
+              <Button
+                size="icon"
+                variant="ghost"
+                className={cn("h-8 w-8 rounded-full text-muted-foreground hover:text-foreground", attachmentUploading && "opacity-50")}
+                onClick={() => fileInputRef.current?.click()}
+                disabled={attachmentUploading || busy}
+                aria-label="上传附件"
+              >
+                {attachmentUploading ? <Loader2 size={16} className="animate-spin" /> : <Paperclip size={16} />}
+              </Button>
+            </div>
+            <Textarea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="消息 Eduardo..."
+              className="min-h-[52px] max-h-48 resize-none border-0 shadow-none bg-transparent py-4 text-sm focus-visible:ring-0 flex-1"
+              disabled={busy}
+              rows={1}
+            />
+            <div className="pr-2 pb-2 flex-shrink-0">
+              <Button
+                size="icon"
+                className={cn("h-8 w-8 rounded-full", (!input.trim() && pendingAttachments.length === 0) || busy ? "opacity-50" : "")}
+                onClick={handleSend}
+                disabled={(!input.trim() && pendingAttachments.length === 0) || busy}
+              >
+                <Send size={16} />
+              </Button>
+            </div>
           </div>
         </div>
         <div className="text-center mt-2 text-xs text-muted-foreground">
           EduAgent 可能会犯错。请补充核实。
         </div>
       </div>
+    </div>
+  );
+}
+
+function AttachmentBubble({ att }: { att: AttachmentRef }) {
+  if (att.mime_type.startsWith("image/") && att.localPreviewUrl) {
+    return (
+      <img
+        src={att.localPreviewUrl}
+        alt={att.name}
+        className="max-w-[200px] max-h-[200px] rounded-xl object-cover border border-border"
+      />
+    );
+  }
+  return (
+    <div className="flex items-center gap-2 rounded-xl border border-border bg-muted px-3 py-2 text-sm text-muted-foreground max-w-[200px]">
+      <FileText size={16} className="shrink-0" />
+      <span className="truncate">{att.name}</span>
     </div>
   );
 }

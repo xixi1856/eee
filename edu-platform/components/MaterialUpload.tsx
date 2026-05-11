@@ -3,6 +3,12 @@
 import { useRef, useState } from "react";
 import { Upload, CheckCircle2, AlertCircle, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { formatApiErrorFromResponse } from "@/lib/http/format-api-error";
+import {
+  MATERIAL_UPLOAD_ACCEPT,
+  MATERIAL_UPLOAD_ALLOWED_EXT_SET,
+  materialUploadAllowedLabel,
+} from "@/lib/material-upload-allowed";
 
 type Props = {
   courseId: string;
@@ -10,7 +16,11 @@ type Props = {
   onUploaded?: () => void;
 };
 
-const ACCEPT = ".pdf,.pptx,.docx,.md,.txt,.jpg,.jpeg,.png,.webp";
+function parseExtension(filename: string): string {
+  const i = filename.lastIndexOf(".");
+  if (i < 0) return "";
+  return filename.slice(i + 1).toLowerCase();
+}
 
 export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
@@ -30,6 +40,12 @@ export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props
     let done = 0;
     try {
       for (const file of list) {
+        const ext = parseExtension(file.name);
+        if (!ext || !MATERIAL_UPLOAD_ALLOWED_EXT_SET.has(ext)) {
+          throw new Error(
+            `不支持的文件格式${ext ? `（.${ext}）` : "（缺少扩展名）"}。当前支持：${materialUploadAllowedLabel()}`,
+          );
+        }
         const fd = new FormData();
         fd.set("file", file);
         if (lessonId) fd.set("lesson_id", lessonId);
@@ -41,10 +57,15 @@ export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props
             if (ev.lengthComputable) setPct(Math.round((ev.loaded / ev.total) * 100));
           };
           xhr.onload = () => {
-            if (xhr.status >= 200 && xhr.status < 300) { done++; resolve(); }
-            else reject(new Error(`上传失败 (${xhr.status})`));
+            if (xhr.status >= 200 && xhr.status < 300) {
+              done++;
+              resolve();
+            } else {
+              const detail = formatApiErrorFromResponse(xhr.status, xhr.responseText || "");
+              reject(new Error(detail));
+            }
           };
-          xhr.onerror = () => reject(new Error("网络错误"));
+          xhr.onerror = () => reject(new Error("网络错误，请检查连接后重试"));
           xhr.send(fd);
         });
       }
@@ -87,7 +108,7 @@ export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props
           ref={inputRef}
           type="file"
           multiple
-          accept={ACCEPT}
+          accept={MATERIAL_UPLOAD_ACCEPT}
           className="hidden"
           onChange={(e) => void handleFiles(e.target.files)}
         />
@@ -103,7 +124,9 @@ export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props
           <div className="flex flex-col items-center gap-2">
             <Upload size={20} className="text-muted-foreground" />
             <p className="text-sm font-medium text-foreground">拖放文件或点击选择</p>
-            <p className="text-xs text-muted-foreground">支持 PDF · PPTX · DOCX · MD · TXT · 图片</p>
+            <p className="text-xs text-muted-foreground">
+              支持 {materialUploadAllowedLabel().replace(/、/g, " · ")}
+            </p>
           </div>
         )}
       </button>

@@ -19,7 +19,10 @@ class Settings(BaseSettings):
     llm_model: str = "qwen-plus-2025-04-28"
     refine_model: str = "qwen-long"   # long-context model for structure-refine phase
     vision_model: str = "qwen-vl-max"
-    embedding_model: str = "text-embedding-v3"
+    # Ollama embeddings (LightRAG ollama_embed); e.g. ollama pull bge-m3
+    ollama_base_url: str = "http://127.0.0.1:11434"
+    embedding_model: str = "bge-m3"
+    # Must match Ollama model output and PostgreSQL ``vector(N)`` on LightRAG tables (Phase 7: 1024).
     embedding_dim: int = 1024
     embedding_max_tokens: int = 8192
 
@@ -74,6 +77,10 @@ class Settings(BaseSettings):
         "只有包含完整或可理解的图表、流程图、表格、电路图或技术示意图才回答 USEFUL。"
         "只回答 USEFUL 或 USELESS，不要有其他任何内容。"
     )
+
+    # Graph storage backend: "NetworkXStorage" (no extra deps) or
+    # "PGGraphStorage" (requires Apache AGE PostgreSQL extension)
+    graph_storage: str = "NetworkXStorage"
 
     ollama_api_key: str = ""
     tavily_api_key: str = ""

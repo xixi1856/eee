@@ -35,7 +35,7 @@ export type PublicUserDto = {
   qa_collection_notice_accepted_at: string | null;
 };
 
-/** Registration returns the new user; students also receive a one-time platform-issued credential code. */
+/** Registration returns the new user; students and teachers receive a one-time platform-issued credential code. */
 export type RegisterResponseDto = {
   user: PublicUserDto;
   credential?: CredentialCreatedDto;

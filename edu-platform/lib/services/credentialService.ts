@@ -105,7 +105,8 @@ async function allocateUniqueCredentialCore(
   };
 }
 
-export async function allocateStudentCredentialInTransaction(
+/** Registration-time code (student or teacher); skips per-hour gen limit like legacy student path. */
+export async function allocateRegistrationCredentialInTransaction(
   tx: Prisma.TransactionClient,
   userId: string,
   expiresAt: Date,
@@ -206,7 +207,7 @@ export async function adminRevokeCredential(
 }
 
 type BindTxOk = { ok: true; platformUserId: string };
-type BindTxFail = { ok: false };
+type BindTxFail = { ok: false; reason?: "agent_user_bound_elsewhere" };
 
 async function performBindTransaction(
   codeHash: string,
@@ -234,7 +235,7 @@ async function performBindTransaction(
       where: { agentUserId },
     });
     if (existingAgent && existingAgent.platformUserId !== cred.userId) {
-      return { ok: false as const };
+      return { ok: false as const, reason: "agent_user_bound_elsewhere" };
     }
     const updated = await tx.credential.updateMany({
       where: {
@@ -300,6 +301,24 @@ export async function startBindCredential(
   return { bind_challenge_token };
 }
 
+/** Refresh channel token for an already-bound agent_user_id (no credential code needed). */
+export async function refreshChannelToken(
+  agentUserId: string,
+): Promise<{ channel_token: string }> {
+  const mapping = await prisma.agentIdentityMapping.findUnique({
+    where: { agentUserId: agentUserId.trim() },
+  });
+  if (!mapping) {
+    throw new ApiError(404, "BIND_NOT_FOUND", "No binding found for agent_user_id");
+  }
+  const channel_token = await signChannelToken({
+    platform_user_id: mapping.platformUserId,
+    agent_user_id: mapping.agentUserId,
+    channel: mapping.channel,
+  });
+  return { channel_token };
+}
+
 /** Step 3: consume challenge and finalize bind + channel token. */
 export async function completeBindCredential(
   bindChallengeToken: string,
@@ -319,6 +338,14 @@ export async function completeBindCredential(
     channel.trim(),
   );
   if (!txResult.ok) {
+    if (txResult.reason === "agent_user_bound_elsewhere") {
+      throw new ApiError(
+        409,
+        "CONFLICT",
+        "This agent_user_id is already bound to another platform account. " +
+          "Use a new agent_user_id (edu_agent.yaml / clear identity) or bind with a code from that same account.",
+      );
+    }
     await recordBindFailure(clientIp);
     throw new ApiError(400, "BIND_INVALID", "Invalid or expired credential");
   }

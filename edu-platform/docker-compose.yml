@@ -20,6 +20,29 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+# services:
+#   postgres:
+#     build:
+#       context: ./postgres
+#       dockerfile: Dockerfile
+#     image: edu-platform-postgres:pg16-age-pgvector
+#     container_name: edu-platform-postgres
+#     restart: unless-stopped
+#     environment:
+#       POSTGRES_USER: edu
+#       POSTGRES_PASSWORD: edu
+#       POSTGRES_DB: edu_platform
+#     ports:
+#       - "5432:5432"
+#     volumes:
+#       - edu_platform_pgdata:/var/lib/postgresql/data
+#       # 可选：挂载自定义初始化脚本
+#       # - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+#     healthcheck:
+#       test: ["CMD-SHELL", "pg_isready -U edu -d edu_platform"]
+#       interval: 5s
+#       timeout: 5s
+#       retries: 5
 
   redis:
     image: redis:7-alpine

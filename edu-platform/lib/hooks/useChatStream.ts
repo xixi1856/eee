@@ -2,7 +2,11 @@
 
 import { useCallback, useRef, useState } from "react";
 
-export type ChatMessage = { role: "user" | "assistant"; text: string };
+export type ChatMessage = {
+  role: "user" | "assistant";
+  text: string;
+  attachments?: AttachmentRef[];
+};
 export type Citation = {
   chunk_id?: string;
   material_id?: string;
@@ -15,6 +19,34 @@ export type DoneMeta = {
   error?: string;
 };
 
+export type AttachmentRef = {
+  id: string;
+  key: string;
+  presigned_url: string;
+  mime_type: string;
+  name: string;
+  size: number;
+  localPreviewUrl?: string;
+};
+
+const ALLOWED_MIME_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+  "application/pdf",
+  "text/plain",
+  "text/markdown",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.ms-powerpoint",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+]);
+
+const MAX_FILE_SIZE = 20 * 1024 * 1024;
+
 export function useChatStream(courseId: string) {
   const [msgs, setMsgs] = useState<ChatMessage[]>([]);
   const [streaming, setStreaming] = useState<string>("");
@@ -22,7 +54,56 @@ export function useChatStream(courseId: string) {
   const [citations, setCitations] = useState<Citation[]>([]);
   const [lastMeta, setLastMeta] = useState<DoneMeta | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [pendingAttachments, setPendingAttachments] = useState<AttachmentRef[]>([]);
+  const [attachmentUploading, setAttachmentUploading] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+
+  const addAttachment = useCallback(async (file: File) => {
+    if (!ALLOWED_MIME_TYPES.has(file.type)) {
+      alert(`不支持的文件类型：${file.type || "未知"}`);
+      return;
+    }
+    if (file.size > MAX_FILE_SIZE) {
+      alert("文件大小不能超过 20 MB");
+      return;
+    }
+    const localPreviewUrl = file.type.startsWith("image/")
+      ? URL.createObjectURL(file)
+      : undefined;
+
+    setAttachmentUploading(true);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const res = await fetch("/api/v1/attachments", {
+        method: "POST",
+        credentials: "include",
+        body: form,
+      });
+      if (!res.ok) {
+        const j = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
+        throw new Error(j.error?.message ?? `上传失败 (${res.status})`);
+      }
+      const data = (await res.json()) as AttachmentRef;
+      setPendingAttachments((prev) => [
+        ...prev,
+        { ...data, localPreviewUrl },
+      ]);
+    } catch (e) {
+      if (localPreviewUrl) URL.revokeObjectURL(localPreviewUrl);
+      alert(e instanceof Error ? e.message : "上传失败");
+    } finally {
+      setAttachmentUploading(false);
+    }
+  }, []);
+
+  const removeAttachment = useCallback((id: string) => {
+    setPendingAttachments((prev) => {
+      const att = prev.find((a) => a.id === id);
+      if (att?.localPreviewUrl) URL.revokeObjectURL(att.localPreviewUrl);
+      return prev.filter((a) => a.id !== id);
+    });
+  }, []);
 
   const sendMessage = useCallback(
     async (text: string, lessonId?: string) => {
@@ -32,12 +113,28 @@ export function useChatStream(courseId: string) {
       setCitations([]);
       setLastMeta(null);
       setErrorMsg(null);
-      setMsgs((prev) => [...prev, { role: "user", text }]);
+
+      // Snapshot and clear pending attachments optimistically
+      const snapshotAttachments = pendingAttachments.slice();
+      setPendingAttachments([]);
+
+      setMsgs((prev) => [
+        ...prev,
+        { role: "user", text, attachments: snapshotAttachments.length ? snapshotAttachments : undefined },
+      ]);
 
       abortRef.current?.abort();
       abortRef.current = new AbortController();
 
       try {
+        const attachmentsPayload = snapshotAttachments.map(({ id, key, presigned_url, mime_type, name }) => ({
+          id,
+          key,
+          presigned_url,
+          mime_type,
+          name,
+        }));
+
         const res = await fetch(`/api/v1/courses/${courseId}/chat`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -45,6 +142,7 @@ export function useChatStream(courseId: string) {
           body: JSON.stringify({
             message: text,
             ...(lessonId ? { lesson_id: lessonId } : {}),
+            ...(attachmentsPayload.length ? { attachments: attachmentsPayload } : {}),
           }),
           signal: abortRef.current.signal,
         });
@@ -132,8 +230,20 @@ export function useChatStream(courseId: string) {
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [courseId, busy]
+    [courseId, busy, pendingAttachments]
   );
 
-  return { msgs, streaming, busy, citations, lastMeta, errorMsg, sendMessage };
+  return {
+    msgs,
+    streaming,
+    busy,
+    citations,
+    lastMeta,
+    errorMsg,
+    sendMessage,
+    pendingAttachments,
+    attachmentUploading,
+    addAttachment,
+    removeAttachment,
+  };
 }

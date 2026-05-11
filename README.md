@@ -151,6 +151,18 @@ uv run edu chat --gateway-mode
 2. 在 `edu_agent.yaml` 中设 `runtime.channels.weixin.enabled: true`，按需设 `allow_from: ["*"]` 或允许的 ilink 用户 id。
 3. `uv run edu-gateway`（与 HTTP 同进程拉起 `WeixinChannelAdapter`）。详见 [`docs/deployment.md`](docs/deployment.md) 第 5.1 节。
 
+### 飞书 / Lark（企业自建应用，WebSocket 长连接）
+
+依赖 **`lark-oapi`**（已写入 `pyproject.toml`）。`edu-gateway` 在独立线程内跑飞书官方 `ws.Client`，避免与 uvicorn 的 asyncio 循环冲突；收/发 IM 仍走同一套 **Gateway → SessionRunner**。
+
+1. 在飞书开放平台创建**企业自建应用**，启用机器人，订阅事件 **`im.message.receive_v1`**，连接方式选 **长连接**。
+2. 在 `edu_agent.yaml` 的 `runtime.channels.feishu` 中设置 `enabled: true`、`app_id`、`app_secret`；若控制台开启了加密 / 校验，填写 `encrypt_key`、`verification_token`。
+3. 设置 **`allow_from`**：允许的飞书用户 `open_id` 列表，或 `["*"]` 表示不限制（空列表会拒绝启动 adapter，避免误开全网）。
+4. 国际版将 `domain` 设为 `https://open.larksuite.com`（国内默认 `https://open.feishu.cn`）。
+5. `uv run edu-gateway`。当前 MVP 仅处理 **P2P 文本**消息；群聊与非文本类型会被忽略。
+
+IM 渠道（微信 / 飞书）与 **Next.js 教育平台** 调 Agent 的 HTTP 是并行的：平台侧用环境变量里的 `EDU_AGENT_BASE_URL` 等连接网关；见 [`edu-platform/README.md`](edu-platform/README.md)。适配器注册入口：[`src/edu_agent/channels/registry.py`](src/edu_agent/channels/registry.py)。
+
 ### 长期记忆（A3）
 
 - 数据落在工作区 **`memory/`** 下（`facts/` JSONL、`concepts/`、`profiles/`，按用户隔离）。设计说明见 [`docs/phase3.md`](docs/phase3.md)（文末有与 [Hermes-agent](https://github.com/NousResearch/hermes-agent) 记忆分层的简要对照）；与 Hermes `MemoryManager` / `MemoryProvider` 的 API 与能力矩阵见 [`review_docs/hermes_memory_gap.md`](review_docs/hermes_memory_gap.md)。

@@ -147,6 +147,9 @@ def load_settings_from_file(path: Path) -> EduSettings:
         tools=tools,
         runtime=runtime,
         toolsets=toolsets,
+        platform_base_url=str(raw.get("platform_base_url") or "http://localhost:3000"),
+        platform_bind_key=str(raw["platform_bind_key"]) if raw.get("platform_bind_key") else None,
+        agent_user_id=str(raw["agent_user_id"]) if raw.get("agent_user_id") else None,
     )
 
 

@@ -149,3 +149,197 @@ toolset_registry.register(
         emoji="📂",
     )
 )
+
+# ---------------------------------------------------------------------------
+# Attachment tools (multimodal)
+# ---------------------------------------------------------------------------
+
+_SCHEMA_PARSE_ATTACHMENT = {
+    "name": "parse_attachment",
+    "description": (
+        "从用户上传的附件（图片/PDF/DOCX 等）中提取完整文本内容。"
+        "与系统自动提供的 800 字符预览不同，此工具会返回文件的完整文本（最多 16000 字符）。"
+        "不会将内容存入知识库。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "presigned_url": {
+                "type": "string",
+                "description": "附件的预签名 URL（由消息中的附件元数据提供）",
+            },
+            "name": {
+                "type": "string",
+                "description": "附件文件名（用于记录日志和确定文件类型）",
+            },
+            "mime_type": {
+                "type": "string",
+                "description": "附件 MIME 类型，如 application/pdf、image/png 等",
+            },
+        },
+        "required": ["presigned_url", "name"],
+    },
+}
+
+_SCHEMA_INGEST_ATTACHMENT = {
+    "name": "ingest_attachment",
+    "description": (
+        "将用户上传的附件完整解析并存入个人知识库（RAG 索引）。"
+        "此操作是持久化的，之后可通过 search_rag 工具查询文档内容。"
+        "**必须在用户明确要求时才调用此工具**。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "presigned_url": {
+                "type": "string",
+                "description": "附件的预签名 URL",
+            },
+            "name": {
+                "type": "string",
+                "description": "附件文件名",
+            },
+            "mime_type": {
+                "type": "string",
+                "description": "附件 MIME 类型",
+            },
+        },
+        "required": ["presigned_url", "name"],
+    },
+}
+
+
+_MIME_TO_SUFFIX = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "application/pdf": ".pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "text/plain": ".txt",
+    "text/markdown": ".md",
+}
+
+
+async def _download_to_tempfile(url: str, suffix: str) -> Path | None:
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(resp.content)
+                return Path(tmp.name)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Attachment download failed: %s", exc)
+        return None
+
+
+async def _extract_text_from_file(file_path: Path, mime_type: str, max_chars: int) -> str:
+    """Extract text from a local file. Returns the extracted text."""
+    try:
+        if mime_type in ("text/plain", "text/markdown"):
+            return file_path.read_text(errors="replace")[:max_chars]
+        if mime_type == "application/pdf":
+            from io import BytesIO
+            import pypdf
+            reader = pypdf.PdfReader(BytesIO(file_path.read_bytes()))
+            parts = [page.extract_text() or "" for page in reader.pages]
+            return "\n".join(parts)[:max_chars]
+        # Fallback: RAGAnything parse_document for DOCX/PPTX/XLSX/images
+        from rag_mvp.engine import _build_parser  # type: ignore[import]
+        rag = _build_parser()
+        out_dir = str(file_path.parent / file_path.stem)
+        await rag.parse_document(file_path=str(file_path), output_dir=out_dir)
+        out_texts = list(Path(out_dir).rglob("*.txt"))
+        text = "\n".join(p.read_text(errors="replace") for p in out_texts)
+        return text[:max_chars]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Text extraction failed: %s", exc)
+        return ""
+
+
+async def _handle_parse_attachment(args: dict) -> str:
+    url = args.get("presigned_url", "")
+    name = args.get("name", "attachment")
+    mime_type = args.get("mime_type", "application/octet-stream")
+    if not url:
+        return tool_error("缺少必要参数：presigned_url")
+
+    suffix = _MIME_TO_SUFFIX.get(mime_type, "")
+    tmp_path = await _download_to_tempfile(url, suffix)
+    if tmp_path is None:
+        return tool_error(f"无法下载附件：{name}")
+
+    try:
+        text = await _extract_text_from_file(tmp_path, mime_type, max_chars=16000)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    if not text.strip():
+        return tool_error(f"无法从 {name} 中提取文本内容（可能是扫描件或加密文档）")
+
+    total = len(text)
+    truncated = total >= 16000
+    header = f"[文件: {name} | 共 {total} 字符"
+    if truncated:
+        header += "（已截断至 16000 字符）"
+    header += "]"
+    return tool_result(f"{header}\n{text}", payload={"name": name, "chars": total})
+
+
+async def _handle_ingest_attachment(args: dict) -> str:
+    url = args.get("presigned_url", "")
+    name = args.get("name", "attachment")
+    mime_type = args.get("mime_type", "application/octet-stream")
+    if not url:
+        return tool_error("缺少必要参数：presigned_url")
+
+    suffix = _MIME_TO_SUFFIX.get(mime_type, "")
+    tmp_path = await _download_to_tempfile(url, suffix)
+    if tmp_path is None:
+        return tool_error(f"无法下载附件：{name}")
+
+    try:
+        from rag_mvp.engine import ingest_file  # type: ignore[import]
+        import asyncio
+        await asyncio.to_thread(ingest_file, tmp_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Ingest failed for %s: %s", name, exc)
+        return tool_error(f"文档 {name} 存入知识库失败：{exc}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    return tool_result(
+        f"文档《{name}》已成功存入个人知识库，现在可以通过 search_rag 查询其内容。",
+        payload={"name": name, "status": "ingested"},
+    )
+
+
+toolset_registry.register(
+    ToolSpec(
+        name=_SCHEMA_PARSE_ATTACHMENT["name"],
+        description=_SCHEMA_PARSE_ATTACHMENT["description"],
+        input_schema=_SCHEMA_PARSE_ATTACHMENT["parameters"],
+        handler=_handle_parse_attachment,
+        toolset="files",
+        permissions=[ToolPermission.READ],
+        emoji="📎",
+    )
+)
+toolset_registry.register(
+    ToolSpec(
+        name=_SCHEMA_INGEST_ATTACHMENT["name"],
+        description=_SCHEMA_INGEST_ATTACHMENT["description"],
+        input_schema=_SCHEMA_INGEST_ATTACHMENT["parameters"],
+        handler=_handle_ingest_attachment,
+        toolset="files",
+        permissions=[ToolPermission.READ, ToolPermission.WRITE],
+        approval_required=True,
+        emoji="📥",
+    )
+)
+

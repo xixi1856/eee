@@ -73,6 +73,15 @@ def _parse_autoclaim_messages(resp: Any) -> list[tuple[str, dict[str, str]]]:
 
 def _process_one(conn: Any, fields: dict[str, str]) -> None:
     op = fields.get("operation")
+    if op == "assignment.generate":
+        from rag_mvp.assignment_gen import generate_assignment
+        assignment_id = (fields.get("assignment_id") or "").strip()
+        course_id = (fields.get("course_id") or "").strip()
+        teacher_request = fields.get("teacher_request", "")
+        if not assignment_id or not course_id:
+            raise ValueError("missing assignment_id or course_id")
+        generate_assignment(assignment_id, course_id, teacher_request, conn)
+        return
     material_id = (fields.get("material_id") or "").strip()
     if not material_id:
         raise ValueError("missing material_id")
@@ -104,7 +113,12 @@ def _handle_entries(
 
 
 def main() -> None:
-    load_dotenv()
+    # Load root-level .env first, then edu-platform/.env as fallback (override=False keeps
+    # already-set values, so system env vars always win).
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _root = os.path.abspath(os.path.join(_here, "..", ".."))
+    load_dotenv(os.path.join(_root, ".env"))
+    load_dotenv(os.path.join(_root, "edu-platform", ".env"))
     redis_url = os.environ.get("REDIS_URL", "").strip()
     if not redis_url:
         logger.error("REDIS_URL is required")

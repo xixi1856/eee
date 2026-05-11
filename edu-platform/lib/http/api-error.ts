@@ -7,6 +7,7 @@ export type ApiErrorCode =
   | "RATE_LIMITED"
   | "INTERNAL_ERROR"
   | "BIND_INVALID"
+  | "BIND_NOT_FOUND"
   | "SERVICE_UNAVAILABLE"
   | "AGENT_NOT_BOUND"
   | "AGENT_UNAVAILABLE"

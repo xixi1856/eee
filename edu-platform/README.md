@@ -109,7 +109,7 @@ BIND_CREDENTIAL_API_KEY="paste-third-string-for-agent-only"
 - `EDU_PLATFORM_INTERNAL_API_KEY`：与 **`INTERNAL_API_KEY` 相同**
 - Agent 进程还需能连同一 **`DATABASE_URL`**（与 Worker 相同：LightRAG 通过 `DATABASE_URL` 推导 **`POSTGRES_*`** 连接 PG；`knowledge_query` 可选地用其查询 `materials.original_filename` 填充返回中的 **`material_title`**）
 
-嵌入模型与维度由 **仓库根 `src/rag_mvp/config.py` / `.env`** 与 `rag_mvp.llm.embedding_func` 统一配置（与 CLI 个人库一致）；课程与个人共用同一套嵌入，课程向量写入 **`LIGHTRAG_*`**（`workspace` 隔离）。
+嵌入模型与维度由 **仓库根 `src/rag_mvp/config.py` / `.env`** 与 `rag_mvp.llm.build_embedding_func`（默认 **Ollama** `bge-m3`，1024 维）统一配置（与 CLI 个人库一致）；课程与个人共用同一套嵌入，课程向量写入 **`LIGHTRAG_*`**（`workspace` 隔离）。
 
 ### Phase 8（B3）：EduAgent HTTP 网关与平台环境变量
 

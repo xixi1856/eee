@@ -44,3 +44,14 @@ runtime:
       # state_dir: ".edu_agent/weixin"
       # allow_from: ["*"]
       # route_tag: ""
+    # Feishu / Lark enterprise bot (WebSocket long connection; requires dependency ``lark-oapi``).
+    # Console: custom app → Bot → subscribe ``im.message.receive_v1`` → long connection mode.
+    feishu:
+      enabled: false
+      # app_id: ""
+      # app_secret: ""
+      # encrypt_key: ""           # from app console if event encryption is on
+      # verification_token: ""      # from app console (can be empty if encryption off)
+      # domain: "https://open.feishu.cn"   # or https://open.larksuite.com (intl)
+      # allow_from: ["*"]          # open_id allowlist; "*" allows all
+      # route_tag: ""

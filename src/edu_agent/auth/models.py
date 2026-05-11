@@ -24,3 +24,4 @@ class AuthContext(BaseModel):
     token: str | None = None
     permissions: list[Permission] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    platform_user_id: str | None = None

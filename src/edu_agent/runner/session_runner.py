@@ -234,6 +234,11 @@ class SessionRunner:
         if inbound.kind != InboundKind.USER_TEXT:
             return
 
+        cid = str(inbound.metadata.get("platform_course_id") or "").strip()
+        lid = str(inbound.metadata.get("platform_lesson_id") or "").strip()
+        self._agent.config.course_id = cid
+        self._agent.config.lesson_id = lid
+
         if inbound.channel == ChannelKind.CLI:
             from edu_agent.cli import build_callbacks
 

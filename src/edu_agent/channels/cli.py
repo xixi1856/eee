@@ -8,6 +8,10 @@ from collections.abc import Callable
 from typing import Any
 
 import click
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.shortcuts import radiolist_dialog
 
 from edu_agent.auth.models import AuthContext
 from edu_agent.bus.models import ChannelKind, InboundMessage, OutboundContentType
@@ -15,6 +19,15 @@ from edu_agent.channels.base import ChannelAdapter
 from edu_agent.runner.gateway import Gateway
 
 logger = logging.getLogger(__name__)
+
+_MODE_SELECT_SENTINEL = "\x00__TAB_MODE__"
+_PROGRESS_MODES = ("off", "new", "all", "verbose")
+_MODE_DESCRIPTIONS = {
+    "off": "只显示最终回答，不显示工具调用",
+    "new": "显示工具名称（推荐新用户）",
+    "all": "显示工具名称和耗时",
+    "verbose": "显示完整参数和返回摘要（调试用）",
+}
 
 
 class CLIChannelAdapter(ChannelAdapter):
@@ -36,6 +49,7 @@ class CLIChannelAdapter(ChannelAdapter):
         initial_session_id: str,
         get_progress_mode: Callable[[], str],
         on_mode_cycle: Callable[[], None],
+        on_mode_select: Callable[[str], None] | None = None,
         gateway_mode_label: bool = False,
     ) -> None:
         """Read lines from stdin; print assistant output from outbound stream."""
@@ -45,21 +59,55 @@ class CLIChannelAdapter(ChannelAdapter):
                 "EduAgent（Gateway 模式）。" if gateway_mode_label else "EduAgent。",
                 fg="green",
             )
-            + " /quit /exit 退出；/reset 新会话；/verbose 切换进度；/compress-context 压缩上下文。"
+            + " /quit \\quit /exit 退出；/reset 新会话；Tab 切换进度模式；/compress-context 压缩上下文。"
         )
         click.echo(click.style(f"会话 ID: {session_id}", dim=True))
 
+        # Tab key binding: exit prompt with sentinel so we can show the mode dialog
+        kb = KeyBindings()
+
+        @kb.add("tab")
+        def _tab_handler(event) -> None:
+            if not event.app.current_buffer.text:
+                event.app.exit(result=_MODE_SELECT_SENTINEL)
+
+        pt_session: PromptSession[str] = PromptSession(key_bindings=kb)
+
         while True:
             try:
-                user_input = click.prompt(click.style("你", fg="cyan"), prompt_suffix=" > ")
-            except (EOFError, KeyboardInterrupt):
+                user_input = await pt_session.prompt_async(
+                    HTML("<ansicyan>你</ansicyan> > "),
+                )
+            except KeyboardInterrupt:
                 click.echo("\n再见！")
                 break
+            except EOFError:
+                click.echo("\n再见！")
+                break
+
+            # Tab was pressed on an empty buffer → show interactive mode selector
+            if user_input == _MODE_SELECT_SENTINEL:
+                selected = await radiolist_dialog(
+                    title="切换进度模式",
+                    text="使用 ↑↓ 选择，Enter 确认，Esc 取消",
+                    values=[
+                        (m, f"{m}  —  {_MODE_DESCRIPTIONS[m]}")
+                        for m in _PROGRESS_MODES
+                    ],
+                    default=get_progress_mode(),
+                ).run_async()
+                if selected is not None:
+                    if on_mode_select is not None:
+                        on_mode_select(selected)
+                    else:
+                        while get_progress_mode() != selected:
+                            on_mode_cycle()
+                continue
 
             stripped = user_input.strip()
             if not stripped:
                 continue
-            if stripped in ("/quit", "/exit", "quit", "exit"):
+            if stripped in ("/quit", "/exit", "\\quit", "\\exit", "quit", "exit"):
                 click.echo("再见！")
                 break
             if stripped == "/reset":
@@ -108,10 +156,12 @@ class CLIChannelAdapter(ChannelAdapter):
                         break
                     if ob.content_type == OutboundContentType.TEXT:
                         if not ob.is_final:
-                            if not printed_header:
-                                click.echo(click.style("助手", fg="yellow") + " > ", nl=False)
-                                printed_header = True
-                            click.echo(ob.content, nl=False)
+                            # Streaming chunks are already written to stdout by the
+                            # on_text_chunk callback set in session_runner (build_callbacks).
+                            # Printing here again would duplicate every token.
+                            # Just mark that streaming has started so the final handler
+                            # knows to emit a newline rather than the full content.
+                            printed_header = True
                         else:
                             if printed_header:
                                 click.echo()

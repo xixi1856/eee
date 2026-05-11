@@ -40,6 +40,7 @@ class TestToolSchemas:
         schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "knowledge_query")
         required = schema["function"]["parameters"].get("required", [])
         assert "question" in required
+        assert "sources" in required
 
     def test_generate_quiz_no_required_params(self):
         schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "generate_quiz")
@@ -67,46 +68,148 @@ class TestExecuteTool:
 
 
 class TestKnowledgeQueryTool:
-    def test_success_path(self, mocker):
-        # Patch the engine.query import inside the handler
-        mocker.patch("rag_mvp.engine.query", return_value="知识库答案")
+    @pytest.fixture(autouse=True)
+    def _runtime(self, mocker):
+        ctx = mocker.MagicMock()
+        ctx.user_id = "00000000-0000-4000-8000-000000000001"
+        ctx.course_id = None
+        mocker.patch("edu_agent.tools.rag.get_current_runtime", return_value=ctx)
 
-        result = execute_tool("knowledge_query", {"question": "什么是TCP？"})
+    def test_success_path(self, mocker):
+        mocker.patch(
+            "rag_mvp.engine.personal_retrieval_hits_sync",
+            return_value=[
+                {
+                    "chunk_id": "x",
+                    "text": "知识库答案",
+                    "metadata": {},
+                    "relevance_score": 1.0,
+                    "origin": "personal",
+                },
+            ],
+        )
+
+        result = execute_tool(
+            "knowledge_query",
+            {"question": "什么是TCP？", "sources": "personal"},
+        )
         assert isinstance(result, ToolResult)
         assert result.tool_name == "knowledge_query"
         assert result.success is True
         assert "知识库答案" in result.summary
 
     def test_engine_raises_returns_error(self, mocker):
-        mocker.patch("rag_mvp.engine.query", side_effect=RuntimeError("RAG not initialised"))
+        mocker.patch(
+            "rag_mvp.engine.personal_retrieval_hits_sync",
+            side_effect=RuntimeError("RAG not initialised"),
+        )
 
-        result = execute_tool("knowledge_query", {"question": "测试"})
+        result = execute_tool(
+            "knowledge_query",
+            {"question": "测试", "sources": "personal"},
+        )
         assert result.success is False
         assert "RAG not initialised" in result.error
 
     def test_empty_answer_returns_no_info_message(self, mocker):
-        mocker.patch("rag_mvp.engine.query", return_value="")
+        mocker.patch("rag_mvp.engine.personal_retrieval_hits_sync", return_value=[])
 
-        result = execute_tool("knowledge_query", {"question": "测试"})
+        result = execute_tool(
+            "knowledge_query",
+            {"question": "测试", "sources": "personal"},
+        )
         assert result.success is True
         assert "暂无" in result.summary
 
     def test_dict_answer_extracts_answer_key(self, mocker):
-        mocker.patch("rag_mvp.engine.query", return_value={"answer": "字典答案", "refs": []})
+        mocker.patch(
+            "rag_mvp.engine.personal_retrieval_hits_sync",
+            return_value=[
+                {
+                    "chunk_id": "c1",
+                    "text": "字典答案",
+                    "metadata": {},
+                    "relevance_score": 0.9,
+                    "origin": "personal",
+                },
+            ],
+        )
 
-        result = execute_tool("knowledge_query", {"question": "测试"})
+        result = execute_tool(
+            "knowledge_query",
+            {"question": "测试", "sources": "personal"},
+        )
         assert result.success is True
         assert "字典答案" in result.summary
 
     def test_default_mode_is_hybrid(self, mocker):
-        mock_query = mocker.patch("rag_mvp.engine.query", return_value="answer")
-        execute_tool("knowledge_query", {"question": "test"})
-        mock_query.assert_called_once_with(question="test", mode="hybrid", with_refs=False)
+        mock_query = mocker.patch(
+            "rag_mvp.engine.personal_retrieval_hits_sync",
+            return_value=[
+                {"chunk_id": "a", "text": "answer", "metadata": {}, "relevance_score": 1.0, "origin": "personal"},
+            ],
+        )
+        execute_tool(
+            "knowledge_query",
+            {"question": "test", "sources": "personal"},
+        )
+        mock_query.assert_called_once_with("test", mode="hybrid", top_k=5)
 
     def test_explicit_mode_passed_through(self, mocker):
-        mock_query = mocker.patch("rag_mvp.engine.query", return_value="answer")
-        execute_tool("knowledge_query", {"question": "test", "mode": "local"})
-        mock_query.assert_called_once_with(question="test", mode="local", with_refs=False)
+        mock_query = mocker.patch(
+            "rag_mvp.engine.personal_retrieval_hits_sync",
+            return_value=[
+                {"chunk_id": "a", "text": "answer", "metadata": {}, "relevance_score": 1.0, "origin": "personal"},
+            ],
+        )
+        execute_tool(
+            "knowledge_query",
+            {"question": "test", "mode": "local", "sources": "personal"},
+        )
+        mock_query.assert_called_once_with("test", mode="local", top_k=5)
+
+    def test_sources_array_personal_only(self, mocker):
+        mocker.patch(
+            "rag_mvp.engine.personal_retrieval_hits_sync",
+            return_value=[
+                {"chunk_id": "z", "text": "arr", "metadata": {}, "relevance_score": 1.0, "origin": "personal"},
+            ],
+        )
+        result = execute_tool(
+            "knowledge_query",
+            {"question": "x", "sources": ["personal"]},
+        )
+        assert result.success is True
+        assert "arr" in result.summary
+
+    def test_sources_array_course_personal_is_all(self, mocker):
+        ctx = mocker.MagicMock()
+        ctx.user_id = "00000000-0000-4000-8000-000000000001"
+        ctx.course_id = "00000000-0000-4000-8000-000000000099"
+        mocker.patch("edu_agent.tools.rag.get_current_runtime", return_value=ctx)
+        mocker.patch(
+            "edu_agent.tools.rag._sync_verify_and_query_course",
+            return_value=[
+                {
+                    "chunk_id": "c1",
+                    "text": "c",
+                    "metadata": {"material_id": "00000000-0000-4000-8000-000000000088"},
+                    "relevance_score": 1.0,
+                },
+            ],
+        )
+        mocker.patch(
+            "rag_mvp.engine.personal_retrieval_hits_sync",
+            return_value=[
+                {"chunk_id": "p1", "text": "p", "metadata": {}, "relevance_score": 0.9, "origin": "personal"},
+            ],
+        )
+        mocker.patch("edu_agent.tools.rag._fetch_material_titles", return_value={})
+        result = execute_tool(
+            "knowledge_query",
+            {"question": "both", "sources": ["course", "personal"]},
+        )
+        assert result.success is True
 
 
 class TestGenerateQuizTool:

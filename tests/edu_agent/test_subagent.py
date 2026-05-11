@@ -122,7 +122,11 @@ class TestSubAgentRun:
 
         from edu_agent.types import ToolResult
 
-        tc = TC(id="tc1", type="function", function=Function(name="knowledge_query", arguments='{"question":"q"}'))
+        tc = TC(
+            id="tc1",
+            type="function",
+            function=Function(name="knowledge_query", arguments='{"question":"q","sources":"personal"}'),
+        )
         mock_client = MagicMock()
         mock_client.chat.completions.create.side_effect = [
             _make_response([_make_choice(tool_calls=[tc], finish_reason="tool_calls")]),

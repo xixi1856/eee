@@ -30,6 +30,22 @@ class Settings(BaseSettings):
     # Paths
     working_dir: Path = Path("rag_storage")
     output_dir: Path = Path("output/parsed")
+    transcript_output_dir: Path = Path("output/transcripts")
+
+    # Video → Whisper (CLI `rag video-ingest`; requires `uv sync --extra video` + ffmpeg)
+    ffmpeg_path: str = "ffmpeg"
+    whisper_model_size: str = "base"
+    whisper_device: str = "cpu"
+    # Empty string = auto language detection in faster-whisper
+    whisper_language: str = ""
+
+    # Video structured summary (before RAG ingest; LLM segments → .summary.md)
+    video_summary_target_segment_seconds: int = 300
+    video_summary_max_segment_seconds: int = 600
+    # Empty = use refine_model for per-chunk JSON summaries
+    video_summary_llm_model: str = ""
+    # Empty = use built-in prompt in video_transcript_summary.py
+    video_summary_system_prompt: str = ""
 
     # MinerU
     mineru_backend: str = "pipeline"

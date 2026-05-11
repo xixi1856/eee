@@ -130,11 +130,22 @@ class TestRunTurnWithToolCalls:
         """LLM calls knowledge_query once; real ToolRuntime + stubbed RAG query."""
         factory = stream_factory_tool_then_text(
             tool_name="knowledge_query",
-            tool_arguments_json='{"question": "什么是TCP？"}',
+            tool_arguments_json='{"question": "什么是TCP？", "sources": "personal"}',
             assistant_after_tool="TCP 是传输控制协议。",
         )
         attach_offline_openai_clients(agent, stream_factory=factory)
-        with patch("rag_mvp.engine.query", return_value="TCP 相关段落"):
+        with patch(
+            "rag_mvp.engine.personal_retrieval_hits_sync",
+            return_value=[
+                {
+                    "chunk_id": "c1",
+                    "text": "TCP 相关段落",
+                    "metadata": {},
+                    "relevance_score": 1.0,
+                    "origin": "personal",
+                },
+            ],
+        ):
             reply = _run_turn(agent, "什么是TCP？")
         assert reply == "TCP 是传输控制协议。"
         assert agent._async_client.chat.completions.create.call_count == 2
@@ -168,23 +179,30 @@ class TestRunTurnWithToolCalls:
     def test_failed_tool_result_content_includes_error(self, agent):
         factory = stream_factory_tool_then_text(
             tool_name="knowledge_query",
-            tool_arguments_json='{"question": "test"}',
+            tool_arguments_json='{"question": "test", "sources": "personal"}',
             assistant_after_tool="抱歉无法回答",
         )
         attach_offline_openai_clients(agent, stream_factory=factory)
-        with patch("rag_mvp.engine.query", side_effect=RuntimeError("DB error")):
+        with patch(
+            "rag_mvp.engine.personal_retrieval_hits_sync",
+            side_effect=RuntimeError("DB error"),
+        ):
             _run_turn(agent, "test")
         tool_messages = [m for m in agent.messages if m.get("role") == "tool"]
         assert "DB error" in tool_messages[0]["content"]
 
     def test_invalid_json_in_tool_args_does_not_crash(self, agent):
         factory = stream_factory_tool_then_text(
-            tool_name="knowledge_query",
+            tool_name="generate_quiz",
             tool_arguments_json="INVALID JSON {{",
             assistant_after_tool="fallback",
         )
         attach_offline_openai_clients(agent, stream_factory=factory)
-        with patch("rag_mvp.engine.query", return_value="stub"):
+        canned = {
+            "questions": [{"type": "x", "question": "q", "options": [], "answer": "", "explanation": ""}],
+            "total": 1,
+        }
+        with patch("rag_mvp.question_gen.generate", return_value=canned):
             reply = _run_turn(agent, "test")
         assert reply == "fallback"
 

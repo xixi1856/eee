@@ -19,32 +19,34 @@ B3 完成后，教育平台应该具备以下特征：
 
 ## 架构决策
 
+**RAG 契约与演进**（本阶段不重复展开实现细节）：课程 / 个人 **双源**、`knowledge_query` 的 **`sources` 与 `course_id` 边界**（**`course_id` 仅 session runtime，非工具参数**）以 **[Phase 7（B2）](./phase7.md)** 的决策 3、决策 5 与 **「实现边界与工程清单」** 为准。
+
 ### 决策 1：聊天交互的数据流
 
 ```
-前端 (React)
-  ├─ 学生输入问题 → POST /api/v1/courses/{course_id}/chat
+Next.js 客户端（Client Component）
+  ├─ 学生输入问题 → POST /api/v1/courses/{course_id}/chat（或 EventSource 连到同源 chat-stream）
   │
-Java 后端
+Next.js 服务端（Route Handler / lib）
   ├─ 验证学生身份与课程权限
   ├─ 创建或获取 Agent session
   ├─ 获取 course_id，作为 context 传递给 Agent
   ├─ 调用 Agent HTTP API（POST /v1/chat/completions?stream=true）
-  ├─ 记录 question record 到数据库
+  ├─ 记录 question record 到数据库（可选：流开始前先落库 question 占位）
   │
 Agent (Python)
-  ├─ 收到消息，创建/加载 session（带 course_id context）
-  ├─ 调用 knowledge_query（sources="all", course_id）
+  ├─ 收到消息，创建/加载 session（**runtime** 含 **course_id**，由平台 header 注入，见决策 3）
+  ├─ 调用 knowledge_query（如 sources="all"；**不传 course_id 参数**，课程边界仅 runtime，见 Phase 7 决策 5）
   ├─ 生成回答，逐条 yield OutboundMessage（SSE）
   │
-Java 后端
-  ├─ 接收 Agent 的 SSE 事件流
-  ├─ 实时转发给前端（WebSocket 或长轮询）
-  ├─ 处理完成后，解析回答内容，提取命中的 chunk_id、耗时、token 使用
-  ├─ 创建 qa_log record 记录完整交互
+Next.js 服务端
+  ├─ 接收 Agent 的 SSE 事件流（`fetch` ReadableStream 或 HTTP 客户端）
+  ├─ 以 **SSE（text/event-stream）** 转发给浏览器（Route Handler 中 `TransformStream` 等）
+  ├─ 流结束后解析回答内容，提取命中的 chunk_id、耗时、token 使用
+  ├─ 写入 `qa_logs`（若用户未关闭采集）
   │
-前端 (React)
-  └─ 实时显示回答文本，点击资料链接可展开原文
+Next.js 客户端
+  └─ `EventSource` 或 `fetch` + ReadableStream 更新 UI；点击资料链接展开原文
 ```
 
 ### 决策 2：问答日志数据模型
@@ -83,7 +85,7 @@ CREATE INDEX ON qa_logs(hit_materials) USING GIN;
 
 ### 决策 3：Agent 侧的 session context 与权限
 
-当 Java 后端调用 Agent HTTP API 时，在 header 中传递：
+当 **Next.js 服务端**调用 Agent HTTP API 时，在 header 中传递：
 
 ```http
 POST /v1/chat/completions
@@ -131,7 +133,7 @@ Agent 在 runtime context 中记录这些信息，供工具（如 `knowledge_que
 
 ```
 每天或每周：
-1. Java 后端聚合该学生的最近 qa_logs
+1. **Next.js 定时任务**（如外部 cron 调 `app/api/internal/...`）或独立脚本聚合该学生的最近 `qa_logs`
 2. 调用 Agent 的 analyze_learning_progress API（或直接算法分析）
 3. 提取：
    - 提问最多的主题
@@ -156,7 +158,7 @@ Agent 在 runtime context 中记录这些信息，供工具（如 `knowledge_que
 
 ### 决策 7：WebSocket vs 长轮询
 
-前端与 Java 后端之间的通信方案：
+浏览器与 **Next.js Route Handler** 之间的通信方案：
 
 **方案 A：WebSocket**
 - 优点：双向、低延迟、适合流式数据
@@ -200,78 +202,56 @@ eventSource.onerror = () => {
 
 ## 文件清单
 
-### 新建文件（Java 后端）
+### 新建 / 扩展（Next.js + Prisma，`edu-platform/`）
 
-- [edu-platform/src/main/java/com/eduagent/entity/QALog.java](file:///edu-platform/src/main/java/com/eduagent/entity/QALog.java)
-  职责：JPA QALog 实体。
+- [edu-platform/prisma/schema.prisma](file:///edu-platform/prisma/schema.prisma)（扩展）
+  职责：`QALog`、`LearningProgress`（若采用独立聚合表）等；**Prisma Migrate**。
 
-- [edu-platform/src/main/java/com/eduagent/entity/LearningProgress.java](file:///edu-platform/src/main/java/com/eduagent/entity/LearningProgress.java)
-  职责：JPA LearningProgress 实体（聚合数据）。
+- [edu-platform/lib/services/chatService.ts](file:///edu-platform/lib/services/chatService.ts)
+  职责：调用 Agent `/v1/chat/completions`（stream）、解析 SSE、写 `qa_logs`、尊重用户「关闭采集」标志。
 
-- [edu-platform/src/main/java/com/eduagent/repository/QALogRepository.java](file:///edu-platform/src/main/java/com/eduagent/repository/QALogRepository.java)
-  职责：QALog 数据访问接口。
+- [edu-platform/lib/services/analyticsService.ts](file:///edu-platform/lib/services/analyticsService.ts)
+  职责：教师看板与学生进度的 SQL 聚合（或通过 Prisma `$queryRaw`）。
 
-- [edu-platform/src/main/java/com/eduagent/dto/ChatRequest.java](file:///edu-platform/src/main/java/com/eduagent/dto/ChatRequest.java)
-  职责：聊天请求 DTO。
+- [edu-platform/lib/agentClient.ts](file:///edu-platform/lib/agentClient.ts)
+  职责：对 Agent 的 HTTP 客户端（base URL、密钥、header 模板）。
 
-- [edu-platform/src/main/java/com/eduagent/dto/ChatStreamEvent.java](file:///edu-platform/src/main/java/com/eduagent/dto/ChatStreamEvent.java)
-  职责：聊天流事件 DTO（SSE 格式）。
+- [edu-platform/app/api/v1/courses/[courseId]/chat/route.ts](file:///edu-platform/app/api/v1/courses/[courseId]/chat/route.ts)
+  职责：`POST` 聊天并返回 **`text/event-stream`**（代理 Agent SSE）。
 
-- [edu-platform/src/main/java/com/eduagent/dto/AnalyticsResponse.java](file:///edu-platform/src/main/java/com/eduagent/dto/AnalyticsResponse.java)
-  职责：教师数据面板的响应 DTO。
+- [edu-platform/app/api/v1/courses/[courseId]/chat/history/route.ts](file:///edu-platform/app/api/v1/courses/[courseId]/chat/history/route.ts)
+  职责：`GET` 历史（权限见本文接口契约）。
 
-- [edu-platform/src/main/java/com/eduagent/service/ChatService.java](file:///edu-platform/src/main/java/com/eduagent/service/ChatService.java)
-  职责：聊天业务逻辑，包括调用 Agent API、记录日志。
+- [edu-platform/app/api/v1/courses/[courseId]/analytics/route.ts](file:///edu-platform/app/api/v1/courses/[courseId]/analytics/route.ts)
+  职责：`GET /api/v1/courses/{course_id}/analytics`。
 
-- [edu-platform/src/main/java/com/eduagent/service/AnalyticsService.java](file:///edu-platform/src/main/java/com/eduagent/service/AnalyticsService.java)
-  职责：数据分析业务逻辑（聚合、薄弱点识别）。
+- [edu-platform/app/api/v1/students/[studentId]/learning-progress/route.ts](file:///edu-platform/app/api/v1/students/[studentId]/learning-progress/route.ts)
+  职责：`GET` 学生学习进度。
 
-- [edu-platform/src/main/java/com/eduagent/service/AgentApiClient.java](file:///edu-platform/src/main/java/com/eduagent/service/AgentApiClient.java)
-  职责：HTTP client，调用 Agent /v1/chat/completions。
+### 新建（Next.js 客户端 UI）
 
-- [edu-platform/src/main/java/com/eduagent/controller/ChatController.java](file:///edu-platform/src/main/java/com/eduagent/controller/ChatController.java)
-  职责：聊天端点：
-  - `POST /api/v1/courses/{course_id}/chat` — 发送问题（返回 SSE stream）
-  - `GET /api/v1/courses/{course_id}/chat/history` — 问答历史
+- [edu-platform/components/ChatComponent.tsx](file:///edu-platform/components/ChatComponent.tsx)
+  职责：聊天 Client 组件（`"use client"`）：消息气泡、输入框、SSE 消费、历史侧栏。
 
-- [edu-platform/src/main/java/com/eduagent/controller/AnalyticsController.java](file:///edu-platform/src/main/java/com/eduagent/controller/AnalyticsController.java)
-  职责：数据分析端点：
-  - `GET /api/v1/courses/{course_id}/analytics` — 课程聚合数据
-  - `GET /api/v1/students/{student_id}/learning-progress` — 学生进度
-
-- [edu-platform/src/main/resources/db/migration/V3__qa_logs_analytics.sql](file:///edu-platform/src/main/resources/db/migration/V3__qa_logs_analytics.sql)
-  职责：Flyway 迁移脚本，建 QALog 和 LearningProgress 表。
-
-### 新建文件（React 前端）
-
-- [edu-platform-web/src/components/ChatComponent.tsx](file:///edu-platform-web/src/components/ChatComponent.tsx)
-  职责：聊天组件，包含消息气泡、输入框、历史记录侧边栏。
-
-- [edu-platform-web/src/components/MaterialPreview.tsx](file:///edu-platform-web/src/components/MaterialPreview.tsx)
+- [edu-platform/components/MaterialPreview.tsx](file:///edu-platform/components/MaterialPreview.tsx)
   职责：资料预览面板。
 
-- [edu-platform-web/src/pages/CourseChat/index.tsx](file:///edu-platform-web/src/pages/CourseChat/index.tsx)
-  职责：课程聊天页面（集成聊天组件与资料预览）。
+- [edu-platform/app/(app)/courses/[courseId]/chat/page.tsx](file:///edu-platform/app/(app)/courses/[courseId]/chat/page.tsx)
+  职责：课程聊天页（组合 `ChatComponent` 与 `MaterialPreview`）。
 
-- [edu-platform-web/src/pages/CourseAnalytics/index.tsx](file:///edu-platform-web/src/pages/CourseAnalytics/index.tsx)
-  职责：教师数据面板页面，展示聚合数据与图表。
+- [edu-platform/app/(app)/courses/[courseId]/analytics/page.tsx](file:///edu-platform/app/(app)/courses/[courseId]/analytics/page.tsx)
+  职责：教师数据面板（图表可用 Recharts / ECharts 等）。
 
-- [edu-platform-web/src/services/chatService.ts](file:///edu-platform-web/src/services/chatService.ts)
-  职责：聊天 API 调用、EventSource 管理。
-
-- [edu-platform-web/src/services/analyticsService.ts](file:///edu-platform-web/src/services/analyticsService.ts)
-  职责：数据分析 API 调用。
-
-- [edu-platform-web/src/pages/StudentProgress/index.tsx](file:///edu-platform-web/src/pages/StudentProgress/index.tsx)
-  职责：学生个人学习进度页面。
+- [edu-platform/app/(app)/me/progress/page.tsx](file:///edu-platform/app/(app)/me/progress/page.tsx)
+  职责：学生个人学习进度页。
 
 ### 新建文件（配置与部署）
 
 - [docker-compose.yml](file:///docker-compose.yml)
-  职责：完整系统的 Docker Compose 配置（PostgreSQL、Redis、MinIO、Java 后端、Python Agent、前端）。
+  职责：完整系统的 Docker Compose 配置（PostgreSQL、Redis、MinIO、**Next.js** 应用、Python Agent）。
 
 - [docs/deployment.md](file:///docs/deployment.md)
-  职责：完整的部署指南。
+  职责：完整的部署指南（`next build` + Node 生产镜像或 `output: standalone`）。
 
 ## 接口契约
 
@@ -381,29 +361,25 @@ data: {"type": "done", "tokens": 150, "exec_time_ms": 2500}
 
 ## 实施顺序
 
-### 后端（Java）
+### Next.js（数据模型 + API）
 
-1. 新增数据库迁移脚本。
-2. 实现 JPA 实体与 Repository。
-3. 实现 ChatService（调用 Agent API、记录日志）。
-4. 实现 AnalyticsService（数据聚合分析）。
-5. 实现 ChatController 与 AnalyticsController。
-6. 测试与集成。
+1. 扩展 Prisma schema，**migrate** 建 `qa_logs`（及 `LearningProgress` 若需要）。
+2. 实现 `lib/agentClient.ts`、`lib/services/chatService.ts`（流式代理 + 落库）。
+3. 实现 `lib/services/analyticsService.ts` 与 **`app/api/v1/**` Route Handlers**。
+4. Vitest 单测 + 与 Agent mock 的集成测试。
 
-### 前端（React）
+### Next.js（UI）
 
-1. 聊天组件与输入框。
-2. SSE 流接收与实时显示。
-3. 资料预览面板。
-4. 教师数据面板（图表、表格）。
-5. 学生进度页面。
-6. 样式与 UX。
+1. `ChatComponent`（SSE / fetch stream）与输入区。
+2. `MaterialPreview` 与引用高亮。
+3. 教师 analytics 页、学生 progress 页。
+4. 样式与 UX（含采集告知弹窗）。
 
 ### 集成
 
-1. Java 后端与 Agent HTTP API 的通信。
-2. 前端与 Java 后端的 SSE 通信。
-3. E2E：学生提问 → Java 后端调用 Agent → 前端实时显示 → 数据记录 → 教师查看面板。
+1. Next.js 与 Agent HTTP API（真实或 staging）联调。
+2. 浏览器 ↔ Next.js **同源 SSE** 验证（代理缓冲、断开重连策略）。
+3. E2E：学生提问 → Route Handler 调 Agent → 前端流式显示 → `qa_logs` 写入 → 教师看板可读。
 
 ## 注意事项
 
@@ -418,11 +394,11 @@ SSE 在现代浏览器中广泛支持，但旧版 IE 不支持。若需兼容，
 - 每一轮问答是独立记录（`qa_logs`），还是作为一个会话的一部分？
 - 多轮对话时，Agent 是否保持上下文（引用前面的问题）？
 
-建议：多轮对话作为同一 `session_id` 的不同 messages，Java 后端将整个会话传给 Agent。
+建议：多轮对话作为同一 `session_id` 的不同 messages，**Next.js 服务端**在调用 Agent 时携带完整 messages 数组（或 Agent 侧已持久化则只传增量，二选一需在实现中固定）。
 
 ### 3. 资料引用的准确性
 
-当前方案中，Agent 返回的 `hit_materials` 由 Agent 侧的 `knowledge_query` 决定。但 Agent 的回答可能引用多个资料但没有显式标注。
+当前方案中，Agent 返回的 `hit_materials` 由 Agent 侧的 `knowledge_query` 决定（**`sources` 与租户边界** 以 Phase 7 为准）。但 Agent 的回答可能引用多个资料但没有显式标注。
 
 改进方案（后续）：Agent 在生成回答时同时返回 `citations`（引文信息），格式如 `[1] ... [2] ... with reference [1][2]`。
 

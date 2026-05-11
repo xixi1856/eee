@@ -90,6 +90,8 @@ class AgentConfig:
     """Session override: allow tools that declare EXTERNAL."""
     course_id: str = ""
     """Optional course scope for RAG routing (injected into turn runtime context)."""
+    lesson_id: str = ""
+    """Optional lesson scope (platform runtime; qa_logs / analytics)."""
 
 
 @dataclass

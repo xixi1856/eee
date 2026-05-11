@@ -2,12 +2,18 @@
 
 Usage examples:
     # 知识库
+    ## 视频转录 + 结构化摘要入库（默认 ingest .summary.md；需 ffmpeg + uv sync --extra video + LLM）
+    uv run rag video-ingest path/to/lecture.mp4
+    uv run rag video-ingest clip.wav --ingest-source raw --skip-structured-summary
+    uv run rag video-ingest talk.mp4 --summary-mode rag --no-summary
     ## 预处理和生成
     uv run rag ingest data/input/report.pdf
     uv run rag ingest data/input/
     uv run rag query "What are the main findings?"
     uv run rag query "Summarise the tables" --mode local
     uv run rag query "What are the main findings?" --refs
+    uv run rag query "What is in this diagram?" --image data/input/figure.png
+    uv run rag query "Compare" --image a.png --image b.jpg --refs
     ## 清除
     uv run rag clear-storage
     uv run rag reindex data/input/report.pdf
@@ -28,6 +34,7 @@ Usage examples:
     uv run mindmap render <md文件路径>
 """
 
+import asyncio
 import atexit
 from pathlib import Path
 from typing import IO
@@ -114,6 +121,219 @@ def ingest(path: Path) -> None:
         raise SystemExit(1) from exc
 
 
+@cli.command("video-ingest")
+@click.argument("media_path", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--no-ingest",
+    is_flag=True,
+    default=False,
+    help="Only write transcript / summary files; skip RAG ingest.",
+)
+@click.option(
+    "--no-summary",
+    is_flag=True,
+    default=False,
+    help="Skip optional post-ingest summaries (--summary-mode).",
+)
+@click.option(
+    "--summary-mode",
+    type=click.Choice(["none", "direct", "rag", "both"], case_sensitive=False),
+    default="none",
+    show_default=True,
+    help=(
+        "After ingest: none=only structured pipeline; direct=LLM on raw transcript; "
+        "rag=query KB; both=direct+rag. Structured time-segment JSON runs unless "
+        "--skip-structured-summary (separate from this flag)."
+    ),
+)
+@click.option(
+    "--transcript-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Override transcript output directory (default: output/transcripts from config).",
+)
+@click.option(
+    "--ingest-source",
+    type=click.Choice(["summary", "raw", "both"], case_sensitive=False),
+    default="summary",
+    show_default=True,
+    help="What to ingest: summary=.summary.md (default), raw=Whisper .txt, both=two docs.",
+)
+@click.option(
+    "--skip-structured-summary",
+    is_flag=True,
+    default=False,
+    help="Skip LLM time-segment JSON step (cannot combine with --ingest-source summary/both).",
+)
+@click.option(
+    "--summary-segment-seconds",
+    type=int,
+    default=None,
+    help="Target chunk length in seconds for structured summary (default: config).",
+)
+@click.option(
+    "--summary-max-segment-seconds",
+    type=int,
+    default=None,
+    help="Max chunk length in seconds before forced split (default: config).",
+)
+def video_ingest(
+    media_path: Path,
+    no_ingest: bool,
+    no_summary: bool,
+    summary_mode: str,
+    transcript_dir: Path | None,
+    ingest_source: str,
+    skip_structured_summary: bool,
+    summary_segment_seconds: int | None,
+    summary_max_segment_seconds: int | None,
+) -> None:
+    """Transcribe with Whisper, optionally build structured time-segment summaries, then ingest.
+
+    \b
+    Default: writes ``<stem>.txt``, runs LLM to produce ``<stem>.summary.json`` +
+    ``<stem>.summary.md``, ingests the Markdown summary (cleaner for LightRAG than raw ASR).
+
+    \b
+    Requires:
+      - ffmpeg on PATH (or FFMPEG_PATH in .env)
+      - uv sync --extra video (faster-whisper)
+      - LLM credentials for structured summary (unless --skip-structured-summary and ingest raw only)
+    """
+    from lightrag.llm.openai import openai_complete_if_cache
+
+    from .config import settings as _cfg
+    from .engine import ingest_file, query
+    from .video_transcribe import is_video_or_audio_file, transcribe_media_to_txt_file
+    from .video_transcript_summary import (
+        build_structured_summary_from_transcript_text,
+        parse_timestamped_transcript,
+    )
+
+    if not is_video_or_audio_file(media_path):
+        raise click.BadParameter(
+            f"Not a supported video/audio extension: {media_path.suffix}", param_hint="MEDIA_PATH"
+        )
+
+    src = ingest_source.lower()
+    if skip_structured_summary and src in ("summary", "both"):
+        raise click.UsageError(
+            "--ingest-source summary|both requires structured summary; "
+            "omit --skip-structured-summary or use --ingest-source raw."
+        )
+
+    async def _direct_summary(transcript: str) -> str:
+        system = (
+            "你是助教。请阅读视频转录全文，输出简洁的结构化总结（中文）："
+            "1) 主题与目标 2) 关键论点或步骤 3) 术语表（如有）4) 延伸问题。"
+            "避免空话，时间戳标记可忽略。"
+        )
+        model = _cfg.refine_model if len(transcript) > 12_000 else _cfg.llm_model
+        return await openai_complete_if_cache(
+            model,
+            transcript,
+            system_prompt=system,
+            history_messages=[],
+            api_key=_cfg.llm_api_key,
+            base_url=_cfg.llm_base_url,
+            max_tokens=_cfg.llm_max_tokens,
+            temperature=_cfg.llm_temperature,
+        )
+
+    try:
+        txt_path = transcribe_media_to_txt_file(
+            media_path,
+            transcript_dir=transcript_dir,
+        )
+        click.echo(f"Transcript: {txt_path.resolve()}")
+    except Exception as exc:
+        logger.error(str(exc))
+        raise SystemExit(1) from exc
+
+    stem = txt_path.stem
+    out_dir = txt_path.parent
+    transcript_body = txt_path.read_text(encoding="utf-8")
+    summary_md_path: Path | None = None
+
+    if not skip_structured_summary:
+        ts_lines = parse_timestamped_transcript(transcript_body)
+        if not ts_lines:
+            if src in ("summary", "both"):
+                raise click.UsageError(
+                    "Transcript has no [seconds]s timestamp lines; cannot build structured summary. "
+                    "Use --ingest-source raw or re-export Whisper with timestamps."
+                )
+            click.echo("[structured summary skipped: no [seconds]s lines in transcript]")
+        else:
+            try:
+                _, summary_json_path, summary_md_path = build_structured_summary_from_transcript_text(
+                    transcript_body,
+                    stem,
+                    out_dir,
+                    cfg=_cfg,
+                    target_seconds=float(summary_segment_seconds)
+                    if summary_segment_seconds is not None
+                    else None,
+                    max_seconds=float(summary_max_segment_seconds)
+                    if summary_max_segment_seconds is not None
+                    else None,
+                )
+                click.echo(f"Structured JSON: {summary_json_path.resolve()}")
+                click.echo(f"Structured MD  : {summary_md_path.resolve()}")
+            except Exception as exc:
+                logger.error(str(exc))
+                raise SystemExit(1) from exc
+    else:
+        summary_md_path = None
+
+    if not no_ingest:
+        try:
+            if src in ("raw", "both"):
+                ingest_file(txt_path)
+                click.echo(f"Ingested (raw): {txt_path.name}")
+            if src in ("summary", "both"):
+                if summary_md_path is None or not summary_md_path.exists():
+                    raise click.UsageError(
+                        "Structured summary file missing; run without --skip-structured-summary."
+                    )
+                ingest_file(summary_md_path)
+                click.echo(f"Ingested (summary): {summary_md_path.name}")
+        except Exception as exc:
+            logger.error(str(exc))
+            raise SystemExit(1) from exc
+
+    if no_summary:
+        return
+
+    mode = summary_mode.lower()
+    if mode == "none":
+        return
+
+    if mode in ("direct", "both"):
+        try:
+            click.echo("\n── Direct summary (LLM on raw transcript) ──")
+            direct = asyncio.run(_direct_summary(transcript_body))
+            click.echo(direct)
+        except Exception as exc:
+            logger.error(str(exc))
+            raise SystemExit(1) from exc
+
+    if mode in ("rag", "both") and not no_ingest:
+        try:
+            click.echo("\n── RAG summary (post-ingest query) ──")
+            rag_q = (
+                "请根据当前知识库中与本次讲座/口述相关的内容，用中文给出结构化摘要："
+                "核心主题、要点列表、重要术语、延伸讨论问题。若资料单一请据实归纳。"
+            )
+            rag_ans = query(rag_q, mode="global")
+            click.echo(rag_ans if isinstance(rag_ans, str) else str(rag_ans))
+        except Exception as exc:
+            logger.error(str(exc))
+            raise SystemExit(1) from exc
+    elif mode in ("rag", "both") and no_ingest:
+        click.echo("[rag summary skipped: nothing was ingested (--no-ingest).]")
+
+
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, path_type=Path))
 def parse(path: Path) -> None:
@@ -153,12 +373,25 @@ def parse(path: Path) -> None:
     default=False,
     help="Show source chunks, entities and file references used to answer.",
 )
-def query(question: str, mode: str, refs: bool) -> None:
-    """Query the knowledge base with a natural-language QUESTION."""
+@click.option(
+    "--image",
+    "images",
+    multiple=True,
+    type=click.Path(exists=True, path_type=Path),
+    help="Image file (.jpg / .jpeg / .png); repeat for multiple. Vision API first, else MinerU parse + text.",
+)
+def query(question: str, mode: str, refs: bool, images: tuple[Path, ...]) -> None:
+    """Query the knowledge base with a natural-language QUESTION.
+
+    With ``--image``, retrieval runs as usual, then the vision model sees the
+    retrieved passages plus your image(s); if that fails, MinerU parse output
+    is injected and a text-only LLM answers.
+    """
     from .engine import query as do_query
 
     try:
-        result = do_query(question, mode=mode, with_refs=refs)
+        image_paths = list(images) if images else None
+        result = do_query(question, mode=mode, with_refs=refs, image_paths=image_paths)
         if result is None:
             click.echo("[No answer returned – knowledge base may be empty or query failed.]")
             return

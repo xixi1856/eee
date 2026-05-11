@@ -46,16 +46,29 @@ _SCHEMA_KNOWLEDGE_QUERY = {
                 ),
             },
             "sources": {
-                "type": "string",
-                "enum": ["personal", "course", "all"],
-                "description": "personal=个人RAG | course=课程RAG(B2桩) | all=合并",
+                "description": (
+                    "必填。字符串：personal | course | all；或数组：仅含 course/personal "
+                    "（如 [\"course\",\"personal\"] 等价于 all）"
+                ),
+                "oneOf": [
+                    {
+                        "type": "string",
+                        "enum": ["personal", "course", "all"],
+                    },
+                    {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["course", "personal"]},
+                        "minItems": 1,
+                        "maxItems": 2,
+                    },
+                ],
             },
-            "course_id": {
-                "type": "string",
-                "description": "课程 ID（sources 含 course 时建议填写；B2 前为占位结果）",
+            "top_k": {
+                "type": "integer",
+                "description": "每个来源返回的最大片段数（默认 5，范围 1–20）",
             },
         },
-        "required": ["question"],
+        "required": ["question", "sources"],
     },
 }
 
@@ -133,72 +146,213 @@ _SCHEMA_BUILD_MINDMAP = {
 # Handlers
 # ---------------------------------------------------------------------------
 
+def _fetch_material_titles(material_ids: set[str]) -> dict[str, str]:
+    """Resolve original_filename for UUID material ids (DATABASE_URL)."""
+    import os
+
+    if not material_ids:
+        return {}
+    dsn = os.environ.get("DATABASE_URL", "").strip()
+    if not dsn:
+        return {}
+    try:
+        import psycopg
+    except ImportError:
+        return {}
+    out: dict[str, str] = {}
+    try:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                for mid in material_ids:
+                    cur.execute(
+                        "SELECT original_filename FROM materials WHERE id = %s::uuid",
+                        (mid,),
+                    )
+                    row = cur.fetchone()
+                    if row and row[0]:
+                        out[mid] = str(row[0])
+    except Exception:
+        logger.exception("material title lookup failed")
+    return out
+
+
+def _sync_verify_and_query_course(
+    user_id: str,
+    course_id: str,
+    question: str,
+    top_k: int,
+    mode: str,
+) -> list[dict[str, Any]]:
+    import os
+
+    import httpx
+    from rag_mvp.course_lightrag import course_retrieval_hits_sync
+
+    base = os.environ.get("EDU_PLATFORM_BASE_URL", "").rstrip("/")
+    key = os.environ.get("EDU_PLATFORM_INTERNAL_API_KEY", "").strip()
+    if not base or len(key) < 16:
+        raise RuntimeError(
+            "EDU_PLATFORM_BASE_URL and EDU_PLATFORM_INTERNAL_API_KEY (16+ chars) are required for course RAG",
+        )
+    with httpx.Client(timeout=120.0) as client:
+        r = client.get(
+            f"{base}/api/v1/internal/course-rag-access",
+            params={"course_id": course_id, "user_id": user_id},
+            headers={"X-Internal-Key": key},
+        )
+        r.raise_for_status()
+        body = r.json()
+        if not body.get("access"):
+            raise PermissionError("User has no access to this course")
+    return course_retrieval_hits_sync(course_id, question, mode=mode, top_k=top_k)
+
+
+def _normalize_knowledge_sources(raw: Any) -> tuple[str | None, str | None]:
+    """Map ``sources`` tool arg to personal|course|all. Returns (mode, error_message)."""
+    if raw is None:
+        return None, "缺少必要参数：sources（personal | course | all 或 [course, personal]）"
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if not s:
+            return None, "缺少必要参数：sources（personal | course | all 或 [course, personal]）"
+        if s in ("personal", "course", "all"):
+            return s, None
+        return None, f"非法 sources: {raw!r}（仅允许 personal、course、all）"
+    if isinstance(raw, list):
+        items: set[str] = set()
+        for x in raw:
+            if not isinstance(x, str) or not x.strip():
+                return None, f"非法 sources 列表元素: {x!r}"
+            v = x.strip().lower()
+            if v not in ("course", "personal"):
+                return None, f"非法 sources 列表元素: {x!r}（仅允许 course、personal）"
+            items.add(v)
+        if not items:
+            return None, "sources 数组不能为空"
+        if items == {"course", "personal"}:
+            return "all", None
+        if items == {"course"}:
+            return "course", None
+        if items == {"personal"}:
+            return "personal", None
+        return None, "非法 sources 数组"
+    return None, f"sources 类型非法: {type(raw).__name__}"
+
+
 async def _handle_knowledge_query(args: dict) -> str:
+    import asyncio
+
     question = args.get("question")
     if not question:
         return tool_error("缺少必要参数：question")
     mode = args.get("mode", "hybrid")
-    sources = (args.get("sources") or "all").strip().lower()
-    if sources not in ("personal", "course", "all"):
-        sources = "all"
-    course_id = (args.get("course_id") or "").strip()
-    if not course_id:
-        try:
-            ctx = get_current_runtime()
-            if ctx.course_id:
-                course_id = str(ctx.course_id).strip()
-        except RuntimeError:
-            pass
-    if sources == "all" and not course_id:
-        sources = "personal"
+    raw_sources = args.get("sources")
+    sources, src_err = _normalize_knowledge_sources(raw_sources)
+    if src_err or sources is None:
+        return tool_error(src_err or "非法 sources")
+
+    try:
+        ctx = get_current_runtime()
+        user_id = ctx.user_id
+        course_id = str(ctx.course_id).strip() if ctx.course_id else ""
+    except RuntimeError as exc:
+        return tool_error(f"缺少运行上下文: {exc}")
+
+    if sources in ("course", "all") and not course_id:
+        return tool_error("当前会话未绑定课程，无法使用 sources=course 或 all")
+
+    raw_top = args.get("top_k", 5)
+    try:
+        top_k = int(raw_top) if raw_top is not None else 5
+    except (TypeError, ValueError):
+        return tool_error(f"非法 top_k: {raw_top!r}（需为整数）")
+    if top_k < 1 or top_k > 20:
+        return tool_error("top_k 必须在 1 到 20 之间")
 
     results: list[dict[str, Any]] = []
-    personal_text = ""
+    leg_errors: list[str] = []
+
+    if sources in ("course", "all"):
+        try:
+            course_hits = await asyncio.to_thread(
+                _sync_verify_and_query_course,
+                user_id,
+                course_id,
+                str(question),
+                top_k,
+                str(mode),
+            )
+        except PermissionError as exc:
+            return tool_error(str(exc))
+        except Exception as exc:
+            logger.error("knowledge_query course leg failed: %s", exc)
+            leg_errors.append(f"course:{exc}")
+            course_hits = []
+        else:
+            mids: set[str] = set()
+            for h in course_hits:
+                meta = h.get("metadata") or {}
+                mid = meta.get("material_id")
+                if isinstance(mid, str) and mid:
+                    mids.add(mid)
+            titles = _fetch_material_titles(mids)
+            for h in course_hits:
+                meta = h.get("metadata") or {}
+                mid = meta.get("material_id")
+                mid_s = str(mid) if mid else None
+                results.append(
+                    {
+                        "origin": "course",
+                        "chunk_id": h.get("chunk_id", ""),
+                        "text": str(h.get("text", ""))[:8000],
+                        "course_id": course_id,
+                        "material_id": mid_s,
+                        "material_title": titles.get(mid_s) if mid_s else None,
+                        "relevance_score": float(h.get("relevance_score", 0.0)),
+                    },
+                )
 
     if sources in ("personal", "all"):
         try:
-            from rag_mvp.engine import query
+            from rag_mvp.engine import personal_retrieval_hits_sync
 
-            answer = query(question=question, mode=mode, with_refs=False)
-            if answer:
-                if isinstance(answer, dict):
-                    personal_text = str(answer.get("answer", answer))
-                else:
-                    personal_text = str(answer)
+            personal_hits = await asyncio.to_thread(
+                personal_retrieval_hits_sync,
+                str(question),
+                mode=str(mode),
+                top_k=top_k,
+            )
+        except Exception as exc:
+            logger.error("knowledge_query personal leg failed: %s", exc)
+            leg_errors.append(f"personal:{exc}")
+        else:
+            for h in personal_hits:
                 results.append(
                     {
                         "origin": "personal",
-                        "chunk_id": "rag-mvp",
-                        "text": personal_text[:8000],
-                        "document_title": None,
-                        "relevance_score": 1.0,
-                    }
+                        "chunk_id": h.get("chunk_id", ""),
+                        "text": str(h.get("text", ""))[:8000],
+                        "course_id": None,
+                        "material_id": None,
+                        "material_title": None,
+                        "relevance_score": float(h.get("relevance_score", 0.0)),
+                    },
                 )
-        except Exception as exc:
-            logger.error("knowledge_query personal leg failed: %s", exc)
-            return tool_error(str(exc))
 
-    if sources in ("course", "all"):
-        if not course_id and sources == "course":
-            return tool_error("sources=course 时必须提供 course_id")
-        if course_id:
-            results.append(
-                {
-                    "origin": "course",
-                    "chunk_id": "stub-course-chunk",
-                    "text": "[课程 RAG 占位：PostgreSQL 接入前由 B2 实现]",
-                    "course_id": course_id,
-                    "document_title": None,
-                    "relevance_score": 0.0,
-                }
-            )
+    if leg_errors and not results:
+        return tool_error("; ".join(leg_errors))
 
     if not results:
         return tool_result("知识库中暂无相关信息。")
 
-    summary = json.dumps(results, ensure_ascii=False, indent=2)
-    display = personal_text or results[0].get("text", summary)
-    return tool_result(display[:12000], payload=results)
+    display = next(
+        (str(r.get("text", "")) for r in results if str(r.get("text", "")).strip()),
+        json.dumps(results, ensure_ascii=False, indent=2),
+    )
+    extra: dict[str, Any] = {"payload": results}
+    if leg_errors:
+        extra["retrieval_warnings"] = leg_errors
+    return tool_result(display[:12000], **extra)
 
 
 async def _handle_generate_quiz(args: dict) -> str:

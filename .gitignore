@@ -12,12 +12,19 @@ __pycache__/
 rag_storage/
 output
 logs.txt
+.edu_agent_tool_execute_ws/
+.edu_agent/
 # Data (user documents, do not commit)
-data/input/
+data/
 docs/
 mindmap_storage/
 sessions.db
+sessions.db-shm
+sessions.db-wal
+.edu_agent/weixin
 memory/
 # OS
 .DS_Store
 Thumbs.db
+
+

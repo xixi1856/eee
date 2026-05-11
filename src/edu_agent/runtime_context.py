@@ -33,6 +33,8 @@ class TurnRuntimeContext(BaseModel):
     permission_checker: Any | None = None
     # Optional course scope for knowledge_query routing (phase4).
     course_id: str | None = None
+    # Optional lesson scope (B3 platform runtime; not passed to knowledge_query args).
+    lesson_id: str | None = None
 
 
 def set_current_runtime(ctx: TurnRuntimeContext) -> Token[Optional[TurnRuntimeContext]]:

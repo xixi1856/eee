@@ -66,7 +66,7 @@ from edu_agent.safety import check_input, check_output
 from edu_agent.sessions.models import SessionStatus
 from edu_agent.sessions.store import SessionArchivedError, SessionStore
 from edu_agent.skills_loader import load_skill_entries
-from edu_agent.types import AgentCallbacks, AgentConfig
+from edu_agent.types import AgentCallbacks, AgentConfig, ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +233,66 @@ class EduAgent:
             metadata=dict(metadata or {}),
         )
 
+    def _reset_b3_turn_metrics(self) -> None:
+        """Per user turn: timing, token usage (last LLM chunk), RAG hit lists for qa_logs / B3."""
+        self._b3_turn_t0 = time.monotonic()
+        self._b3_turn_prompt_tokens: int | None = None
+        self._b3_turn_completion_tokens: int | None = None
+        self._b3_hit_chunks: list[str] = []
+        self._b3_hit_materials: list[str] = []
+        self._b3_hit_sources: list[str] = []
+        self._b3_seen_chunk_ids: set[str] = set()
+        self._b3_seen_material_ids: set[str] = set()
+        self._b3_seen_source_labels: set[str] = set()
+
+    def _b3_turn_metadata(self) -> dict[str, Any]:
+        pt, ct = self._b3_turn_prompt_tokens, self._b3_turn_completion_tokens
+        total: int | None = None
+        if pt is not None and ct is not None:
+            total = pt + ct
+        elif pt is not None:
+            total = pt
+        elif ct is not None:
+            total = ct
+        return {
+            "execution_time_ms": int((time.monotonic() - self._b3_turn_t0) * 1000),
+            "model_used": self._model,
+            "prompt_tokens": pt,
+            "completion_tokens": ct,
+            "total_tokens": total,
+            "hit_chunks": list(self._b3_hit_chunks),
+            "hit_materials": list(self._b3_hit_materials),
+            "hit_sources": list(self._b3_hit_sources),
+        }
+
+    def _accumulate_knowledge_hits(self, tr: ToolResult) -> None:
+        if tr.tool_name != "knowledge_query" or not tr.success:
+            return
+        pl = tr.payload
+        if not isinstance(pl, list):
+            return
+        for item in pl:
+            if not isinstance(item, dict):
+                continue
+            origin = item.get("origin")
+            if isinstance(origin, str):
+                label = origin.strip().lower()
+                if label in ("course", "personal") and label not in self._b3_seen_source_labels:
+                    self._b3_seen_source_labels.add(label)
+                    self._b3_hit_sources.append(label)
+            cid = item.get("chunk_id")
+            if isinstance(cid, str):
+                c = cid.strip()
+                if c and c not in self._b3_seen_chunk_ids:
+                    self._b3_seen_chunk_ids.add(c)
+                    self._b3_hit_chunks.append(c)
+            mid = item.get("material_id")
+            if isinstance(mid, str):
+                m = mid.strip()
+                if m and m not in self._b3_seen_material_ids:
+                    self._b3_seen_material_ids.add(m)
+                    self._b3_hit_materials.append(m)
+
     async def _ensure_mcp_tools_registered(self) -> None:
         """Connect MCP servers once and register dynamic tools (best-effort)."""
         if self._mcp_registered:
@@ -346,7 +406,9 @@ class EduAgent:
         in_reply_to: UUID,
     ) -> AsyncIterator[OutboundMessage]:
         """Stream outbound chunks for one user turn (A5); uses async LLM streaming."""
+        self._reset_b3_turn_metrics()
         _cid = (self.config.course_id or "").strip()
+        _lid = (self.config.lesson_id or "").strip()
         ctx = TurnRuntimeContext(
             settings=self._settings,
             paths=self._paths,
@@ -359,6 +421,7 @@ class EduAgent:
             tool_runtime=self._tool_runtime,
             permission_checker=self._permissions,
             course_id=_cid or None,
+            lesson_id=_lid or None,
         )
         token = set_current_runtime(ctx)
         try:
@@ -409,6 +472,7 @@ class EduAgent:
                 content=block_msg,
                 content_type=OutboundContentType.TEXT,
                 is_final=True,
+                metadata=self._b3_turn_metadata(),
             )
             return
 
@@ -472,6 +536,11 @@ class EduAgent:
             ):
                 yield ob
 
+            if state.usage[0] is not None:
+                self._b3_turn_prompt_tokens = state.usage[0]
+            if state.usage[1] is not None:
+                self._b3_turn_completion_tokens = state.usage[1]
+
             if self._context is not None and state.usage[0] is not None:
                 self._context.update_from_llm_usage(
                     self.config.session_id,
@@ -513,6 +582,7 @@ class EduAgent:
                 content=content,
                 content_type=OutboundContentType.TEXT,
                 is_final=True,
+                metadata=self._b3_turn_metadata(),
             )
             return
 
@@ -532,6 +602,7 @@ class EduAgent:
             content=budget_msg,
             content_type=OutboundContentType.TEXT,
             is_final=True,
+            metadata=self._b3_turn_metadata(),
         )
 
     def reset(self) -> None:
@@ -743,6 +814,8 @@ class EduAgent:
                 len(result_content),
             )
             self._safe_cb(cb and cb.on_tool_end, tool_name, args, result_content, duration)
+
+            self._accumulate_knowledge_hits(tr)
 
             tool_msg = {
                 "role": "tool",

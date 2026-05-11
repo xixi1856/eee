@@ -1,8 +1,10 @@
 """Qwen LLM, Vision LLM, and Embedding functions for RAG-Anything / LightRAG."""
 
+import base64
 import contextvars
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from openai import AsyncOpenAI
 from lightrag.llm.openai import openai_complete_if_cache, openai_embed
@@ -35,6 +37,25 @@ class _RolePrefixFilter(logging.Filter):
 logging.getLogger("lightrag").addFilter(_RolePrefixFilter())
 
 
+def image_mime_type_for_suffix(suffix: str) -> str:
+    """Return an IANA image MIME type for a file suffix (e.g. ``.png`` → ``image/png``)."""
+    s = (suffix or "").lower()
+    if s in (".jpg", ".jpeg"):
+        return "image/jpeg"
+    if s == ".png":
+        return "image/png"
+    return "image/jpeg"
+
+
+def build_data_uri_from_image_path(path: Path | str) -> str:
+    """Read an image file and return a ``data:{mime};base64,...`` URL for multimodal APIs."""
+    p = Path(path)
+    mime = image_mime_type_for_suffix(p.suffix)
+    raw = p.read_bytes()
+    b64 = base64.standard_b64encode(raw).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
 async def llm_model_func(
     prompt: str,
     system_prompt: str | None = None,
@@ -65,6 +86,7 @@ async def vision_model_func(
     history_messages: list = [],
     image_data: str | None = None,
     messages: list | None = None,
+    image_mime: str | None = None,
     **kwargs,
 ) -> str:
     """Vision LLM backed by qwen-vl-max (async).
@@ -94,9 +116,10 @@ async def vision_model_func(
         return resp.choices[0].message.content or ""
 
     if image_data is not None:
+        mime = image_mime or "image/jpeg"
         content_parts: list = [
             {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_data}"}},
         ]
         msg_list: list = []
         if system_prompt:
@@ -151,11 +174,13 @@ async def _call_vision_raw(
     image_data: str,
     system_prompt: str | None = None,
     max_tokens: int = 20,
+    image_mime: str | None = None,
 ) -> str:
     """Low-level vision call with explicit token limit (used for cheap filter checks)."""
+    mime = image_mime or "image/jpeg"
     content_parts: list = [
         {"type": "text", "text": prompt},
-        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}},
+        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_data}"}},
     ]
     msg_list: list = []
     if system_prompt:
@@ -182,6 +207,7 @@ async def _filtered_vision_model_func(
     history_messages: list = [],
     image_data: str | None = None,
     messages: list | None = None,
+    image_mime: str | None = None,
     **kwargs,
 ) -> str:
     """vision_model_func wrapper that skips useless images via a cheap binary pre-check.
@@ -198,6 +224,7 @@ async def _filtered_vision_model_func(
                 prompt=settings.image_filter_prompt,
                 image_data=image_data,
                 max_tokens=20,
+                image_mime=image_mime,
             )
         except Exception as exc:  # noqa: BLE001
             _filter_stats.errors += 1
@@ -222,6 +249,7 @@ async def _filtered_vision_model_func(
         history_messages=history_messages,
         image_data=image_data,
         messages=messages,
+        image_mime=image_mime,
         **kwargs,
     )
 

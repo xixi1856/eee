@@ -1,0 +1,251 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  STUDENT
+  TEACHER
+  ADMIN
+}
+
+enum CredentialStatus {
+  ACTIVE
+  USED
+  EXPIRED
+  REVOKED
+}
+
+enum BindAttemptKeyType {
+  IP
+}
+
+enum CourseStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum MaterialStatus {
+  UPLOADED
+  PARSING
+  PARSED
+  INDEXING
+  READY
+  FAILED
+}
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  username     String   @unique @map("username")
+  email        String   @unique @map("email")
+  passwordHash String   @map("password_hash")
+  role         UserRole @map("role")
+  realName     String?  @map("real_name")
+  avatarUrl    String?  @map("avatar_url")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+  isActive     Boolean  @default(true) @map("is_active")
+
+  /// When false, chat still works but QaLog rows are not created (B3 privacy).
+  qaCollectionEnabled            Boolean   @default(true) @map("qa_collection_enabled")
+  qaCollectionNoticeAcceptedAt   DateTime? @map("qa_collection_notice_accepted_at")
+
+  credentials         Credential[]
+  refreshTokens       RefreshToken[]
+  agentMapping        AgentIdentityMapping?
+  teacherCourses      Course[]             @relation("TeacherCourses")
+  courseEnrollments   CourseEnrollment[]   @relation("StudentEnrollments")
+  qaLogs              QaLog[]              @relation("QaLogStudent")
+  courseChatSessions  CourseChatSession[]
+
+  @@map("users")
+}
+
+model Course {
+  id            String       @id @default(uuid()) @db.Uuid
+  teacherId     String       @map("teacher_id") @db.Uuid
+  name          String       @map("name")
+  description   String?      @map("description")
+  coverImageUrl String?      @map("cover_image_url")
+  status        CourseStatus @default(DRAFT) @map("status")
+  createdAt     DateTime     @default(now()) @map("created_at")
+  updatedAt     DateTime     @updatedAt @map("updated_at")
+  isDeleted     Boolean      @default(false) @map("is_deleted")
+
+  teacher     User                 @relation("TeacherCourses", fields: [teacherId], references: [id], onDelete: Cascade)
+  enrollments CourseEnrollment[]
+  lessons     Lesson[]
+  materials   Material[]
+  qaLogs      QaLog[]
+  chatSessions CourseChatSession[]
+
+  @@index([teacherId])
+  @@map("courses")
+}
+
+model Lesson {
+  id          String   @id @default(uuid()) @db.Uuid
+  courseId    String   @map("course_id") @db.Uuid
+  title       String   @map("title")
+  description String?  @map("description")
+  orderIndex  Int      @map("order_index")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  isDeleted   Boolean  @default(false) @map("is_deleted")
+
+  course    Course     @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  materials Material[]
+  qaLogs    QaLog[]
+
+  @@index([courseId])
+  @@map("lessons")
+}
+
+model CourseEnrollment {
+  id         String   @id @default(uuid()) @db.Uuid
+  courseId   String   @map("course_id") @db.Uuid
+  studentId  String   @map("student_id") @db.Uuid
+  enrolledAt DateTime @default(now()) @map("enrolled_at")
+
+  course  Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  student User   @relation("StudentEnrollments", fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@unique([courseId, studentId])
+  @@index([studentId])
+  @@map("course_enrollments")
+}
+
+model Material {
+  id                 String         @id @default(uuid()) @db.Uuid
+  courseId           String         @map("course_id") @db.Uuid
+  lessonId           String?        @map("lesson_id") @db.Uuid
+  originalFilename   String         @map("original_filename")
+  fileType           String         @map("file_type")
+  fileSize           Int            @map("file_size")
+  minioPath          String         @map("minio_path")
+  status             MaterialStatus @default(UPLOADED) @map("status")
+  statusMessage      String?        @map("status_message")
+  indexedChunkCount  Int            @default(0) @map("indexed_chunk_count")
+  createdAt          DateTime       @default(now()) @map("created_at")
+  updatedAt          DateTime       @updatedAt @map("updated_at")
+  isDeleted          Boolean        @default(false) @map("is_deleted")
+
+  course Course  @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  lesson Lesson? @relation(fields: [lessonId], references: [id], onDelete: SetNull)
+
+  @@index([courseId, status])
+  @@map("materials")
+}
+
+model Credential {
+  id               String            @id @default(uuid()) @db.Uuid
+  userId           String            @map("user_id") @db.Uuid
+  codeHash         String            @unique @map("code_hash")
+  status           CredentialStatus  @map("status")
+  createdAt        DateTime          @default(now()) @map("created_at")
+  expiresAt        DateTime?         @map("expires_at")
+  usedAt           DateTime?         @map("used_at")
+  boundAgentUserId String?           @map("bound_agent_user_id")
+  boundAt          DateTime?         @map("bound_at")
+  metadata         Json?             @map("metadata")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([codeHash, status])
+  @@index([userId, status])
+  @@map("credentials")
+}
+
+model AgentIdentityMapping {
+  id             String    @id @default(uuid()) @db.Uuid
+  platformUserId String    @unique @map("platform_user_id") @db.Uuid
+  agentUserId    String    @unique @map("agent_user_id")
+  channel        String    @map("channel")
+  boundAt        DateTime  @default(now()) @map("bound_at")
+  lastActiveAt   DateTime? @map("last_active_at")
+  metadata       Json?     @map("metadata")
+
+  user User @relation(fields: [platformUserId], references: [id], onDelete: Cascade)
+
+  @@map("agent_identity_mappings")
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("refresh_tokens")
+}
+
+model CredentialBindAttempt {
+  id        String             @id @default(uuid()) @db.Uuid
+  keyType   BindAttemptKeyType @map("key_type")
+  keyValue  String             @map("key_value")
+  createdAt DateTime           @default(now()) @map("created_at")
+
+  @@index([keyType, keyValue, createdAt])
+  @@map("credential_bind_attempts")
+}
+
+/// One Agent HTTP session per platform user per course (B3 isolation).
+model CourseChatSession {
+  id             String   @id @default(uuid()) @db.Uuid
+  courseId       String   @map("course_id") @db.Uuid
+  studentId      String   @map("student_id") @db.Uuid
+  agentSessionId String   @unique @map("agent_session_id") @db.VarChar(255)
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  course  Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  student User   @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@unique([courseId, studentId])
+  @@index([studentId])
+  @@map("course_chat_sessions")
+}
+
+model QaLog {
+  id                String    @id @default(uuid()) @db.Uuid
+  courseId          String    @map("course_id") @db.Uuid
+  studentId         String    @map("student_id") @db.Uuid
+  lessonId          String?   @map("lesson_id") @db.Uuid
+  sessionId         String    @map("session_id") @db.VarChar(255)
+  question          String    @map("question")
+  questionTokens    Int?      @map("question_tokens")
+  answer            String?   @map("answer")
+  answerTokens      Int?      @map("answer_tokens")
+  totalTokens       Int?      @map("total_tokens")
+  executionTimeMs   Int       @map("execution_time_ms")
+  modelUsed         String    @map("model_used") @db.VarChar(100)
+  hitChunks         String[]  @default([]) @map("hit_chunks")
+  hitMaterials      String[]  @default([]) @map("hit_materials")
+  hitSources        String[]  @default([]) @map("hit_sources")
+  responseQuality   Int?      @map("response_quality") @db.SmallInt
+  isHelpful         Boolean?  @map("is_helpful")
+  agentFeedback     String?   @map("agent_feedback")
+  metadata          Json?     @map("metadata")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  deletedAt         DateTime? @map("deleted_at")
+
+  course  Course  @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  student User    @relation("QaLogStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  lesson  Lesson? @relation(fields: [lessonId], references: [id], onDelete: SetNull)
+
+  @@index([courseId, createdAt(sort: Desc)])
+  @@index([studentId, createdAt(sort: Desc)])
+  @@index([sessionId])
+  @@map("qa_logs")
+}

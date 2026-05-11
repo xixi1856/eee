@@ -409,11 +409,16 @@ def chat(
                     mode_state[0] = _NEXT_MODE[mode_state[0]]
                     click.echo(click.style(f"[进度模式已切换为: {mode_state[0]}]", dim=True))
 
+                def _on_mode_select(mode: str) -> None:
+                    mode_state[0] = mode
+                    click.echo(click.style(f"[进度模式已切换为: {mode_state[0]}]", dim=True))
+
                 await adapter.run_chat_loop(
                     user_id=user,
                     initial_session_id=config.session_id,
                     get_progress_mode=lambda: mode_state[0],
                     on_mode_cycle=_on_verbose,
+                    on_mode_select=_on_mode_select,
                     gateway_mode_label=gateway_mode,
                 )
             finally:

@@ -1,0 +1,51 @@
+# Local PostgreSQL for edu-platform (optional).
+# Usage: docker compose up -d
+# Then set DATABASE_URL in .env to match POSTGRES_* below.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: edu-platform-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: edu
+      POSTGRES_PASSWORD: edu
+      POSTGRES_DB: edu_platform
+    ports:
+      - "5432:5432"
+    volumes:
+      - edu_platform_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U edu -d edu_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: edu-platform-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - edu_platform_redisdata:/data
+
+  minio:
+    image: minio/minio:latest
+    container_name: edu-platform-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio_minio_minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - edu_platform_minio:/data
+
+volumes:
+  edu_platform_pgdata:
+  edu_platform_redisdata:
+  edu_platform_minio:

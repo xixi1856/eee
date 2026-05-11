@@ -88,6 +88,27 @@ async def test_fifo_two_messages_sequential(runner_stack):
 
 
 @pytest.mark.asyncio
+async def test_platform_metadata_injects_course_and_lesson(runner_stack):
+    runner, _store, sid, _cm = runner_stack
+    async for _ob in runner.enqueue_and_stream(
+        InboundMessage.user_text(
+            channel=ChannelKind.HTTP,
+            session_id=sid,
+            user_id="u1",
+            content="hi",
+            metadata={
+                "platform_course_id": "course-uuid-1",
+                "platform_lesson_id": "lesson-uuid-2",
+            },
+        )
+    ):
+        pass
+    assert runner._agent.config.course_id == "course-uuid-1"
+    assert runner._agent.config.lesson_id == "lesson-uuid-2"
+    await runner.stop()
+
+
+@pytest.mark.asyncio
 async def test_no_concurrent_turns(runner_stack, monkeypatch: pytest.MonkeyPatch):
     """Two concurrent enqueue_and_stream calls on the *same* runner: FIFO orders completions."""
     runner, _store, sid, cm = runner_stack

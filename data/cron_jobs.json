@@ -5,8 +5,18 @@
     "schedule": "0 8 * * *",
     "created_at": "2026-05-10T01:18:58",
     "status": "active",
-    "last_run": "",
-    "next_run": "2026-05-10T08:00:00",
+    "last_run": "2026-05-10T11:57:36",
+    "next_run": "2026-05-11T08:00:00",
     "output_dir": "output\\cron\\b2abfd5f"
+  },
+  {
+    "id": "30c2ade3",
+    "prompt": "生成一道关于计算机网络的练习题（题型：单选或填空），难度适中，覆盖基础概念如TCP/IP、DNS、HTTP、子网掩码等。题目需附带解析，适合初学者巩固知识。",
+    "schedule": "48 11 * * *",
+    "created_at": "2026-05-10T11:46:37",
+    "status": "active",
+    "last_run": "2026-05-10T11:57:36",
+    "next_run": "2026-05-11T11:48:00",
+    "output_dir": "output\\cron\\30c2ade3"
   }
 ]

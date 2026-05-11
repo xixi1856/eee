@@ -94,3 +94,19 @@ def test_invalid_session_get_returns_404(http_client):
     client, _sid, _gw, _store = http_client
     r = client.get("/v1/sessions/does-not-exist-xyz", params={"user_id": "bob"})
     assert r.status_code == 404
+
+
+def test_platform_user_id_mismatch_returns_400(http_client):
+    client, sid, _gw, _store = http_client
+    body = {
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": False,
+    }
+    r = client.post(
+        "/v1/chat/completions",
+        params={"session_id": sid, "user_id": "bob"},
+        headers={"X-Platform-User-Id": "not-bob"},
+        json=body,
+    )
+    assert r.status_code == 400

@@ -339,7 +339,7 @@ class MemoryRetriever:
 
 1. 定义数据模型，创建存储目录与序列化。
 2. 实现 MemoryStore 的 CRUD。
-3. 实现 MemoryExtractor（可先 mock LLM）。
+3. 实现 MemoryExtractor。
 4. 实现 MemoryConsolidator 的聚合与冲突协整逻辑。
 5. 实现 MemoryRetriever 的检索。
 6. 集成到 CLI（会话结束、可选 token 阈值经 Agent 轻量触发）与 Agent（`memory_enabled`、工具、可选 prompt 记忆块）。

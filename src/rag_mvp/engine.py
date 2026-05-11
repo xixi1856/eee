@@ -2,14 +2,26 @@
 
 import asyncio
 import json
+import re
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any, Literal, cast
 
-from lightrag import LightRAG
+from lightrag import LightRAG, QueryParam
 from loguru import logger
+from lightrag.utils import compute_mdhash_id
 from raganything import RAGAnything, RAGAnythingConfig
 
 from .config import settings
-from .llm import embedding_func, llm_model_func, vision_model_func, _filtered_vision_model_func
+from .course_workspace import course_id_to_workspace
+from .llm import (
+    _filtered_vision_model_func,
+    build_data_uri_from_image_path,
+    embedding_func,
+    llm_model_func,
+    vision_model_func,
+)
+from .postgres_env import ensure_postgres_env_from_database_url
 
 # ---------------------------------------------------------------------------
 # Metadata helpers – persist embedding config so mismatches are caught early
@@ -56,6 +68,23 @@ _SUPPORTED_SUFFIXES = frozenset({
     ".txt", ".md",
     ".jpg", ".jpeg", ".png",
 })
+
+_IMAGE_QUERY_SUFFIXES = frozenset({".jpg", ".jpeg", ".png"})
+_QUERY_IMAGE_TOP_K = 60
+_QUERY_IMAGE_CHUNK_TOP_K = 40
+_QUERY_IMAGE_MAX_PARSED_CHARS = 100_000
+
+_VISION_QUERY_SYSTEM = (
+    "You are a careful assistant. Answer using ONLY: (1) the retrieved knowledge base excerpts, "
+    "(2) the user-provided image(s) when relevant, (3) the user's question. "
+    "If excerpts are empty, say so and answer from the image(s) and question. "
+    "Prefer the same language as the user's question."
+)
+_TEXT_IMAGE_FALLBACK_SYSTEM = (
+    "You are a careful assistant. The vision API was unavailable; image content below was "
+    "extracted via document parsing (OCR/layout). Answer using the retrieved passages, "
+    "that parsed text, and the user's question. Prefer the same language as the question."
+)
 
 
 def _build_rag() -> RAGAnything:
@@ -124,6 +153,11 @@ def _mineru_kwargs() -> dict:
     }
 
 
+def mineru_kwargs() -> dict:
+    """Single source for MinerU kwargs (parse_document / ingest paths)."""
+    return _mineru_kwargs()
+
+
 async def _aingest_file(rag: RAGAnything, file_path: Path) -> None:
     """Async: parse and index a single document file."""
     out_dir = str(settings.output_dir / file_path.stem)
@@ -170,7 +204,151 @@ def ingest_folder(folder_path: str | Path) -> None:
     logger.success(f"Folder ingested: {folder_path} ({len(files)} files)")
 
 
-def query(question: str, mode: str = "hybrid", with_refs: bool = False) -> str | dict:
+def _validate_image_paths_for_query(paths: Sequence[Path]) -> None:
+    for p in paths:
+        suf = p.suffix.lower()
+        if suf not in _IMAGE_QUERY_SUFFIXES:
+            raise ValueError(
+                f"Unsupported image type for --image: {p.name!r} ({suf!r}). "
+                f"Allowed: {', '.join(sorted(_IMAGE_QUERY_SUFFIXES))}"
+            )
+
+
+def _chunks_to_context_text(chunks: list[Any]) -> str:
+    parts: list[str] = []
+    for i, ch in enumerate(chunks):
+        if not isinstance(ch, dict):
+            continue
+        fp = ch.get("file_path", "") or ""
+        content = str(ch.get("content") or "").strip()
+        ref = ch.get("reference_id", i + 1)
+        parts.append(f"[{ref}] ({fp})\n{content}")
+    return "\n\n---\n\n".join(parts) if parts else "(No retrieved passages.)"
+
+
+def _collect_parsed_markdown_under(dirs: Sequence[Path]) -> str:
+    texts: list[str] = []
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for md in sorted(d.rglob("*.md")):
+            try:
+                texts.append(md.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+    blob = "\n\n".join(texts)
+    if len(blob) > _QUERY_IMAGE_MAX_PARSED_CHARS:
+        return blob[:_QUERY_IMAGE_MAX_PARSED_CHARS] + "\n\n[... truncated ...]"
+    return blob
+
+
+async def _aquery_data_for_image_query(
+    question: str,
+    mode: str,
+    *,
+    include_references: bool,
+) -> dict[str, Any]:
+    from lightrag import QueryParam
+
+    rag = get_rag()
+    lightrag = rag.lightrag
+    assert lightrag is not None, "LightRAG instance not initialised"
+    m = cast(
+        "Literal['local', 'global', 'hybrid', 'naive', 'mix', 'bypass']",
+        mode,
+    )
+    param = QueryParam(
+        mode=m,
+        top_k=_QUERY_IMAGE_TOP_K,
+        chunk_top_k=_QUERY_IMAGE_CHUNK_TOP_K,
+        include_references=include_references,
+    )
+    return await lightrag.aquery_data(question.strip(), param)
+
+
+async def _answer_with_images_async(
+    question: str,
+    mode: str,
+    image_paths: tuple[Path, ...],
+    *,
+    with_refs: bool,
+) -> str | dict:
+    raw = await _aquery_data_for_image_query(
+        question, mode, include_references=with_refs
+    )
+    data = raw.get("data") or {}
+    chunks: list[Any] = list(data.get("chunks") or [])
+    entities: list[Any] = list(data.get("entities") or [])
+    relationships: list[Any] = list(data.get("relationships") or [])
+    references: list[Any] = list(data.get("references") or [])
+
+    context_text = _chunks_to_context_text(chunks)
+    user_text = (
+        "## Retrieved passages\n"
+        + context_text
+        + "\n\n## User question\n"
+        + question.strip()
+    )
+
+    content_parts: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
+    for img_path in image_paths:
+        content_parts.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": build_data_uri_from_image_path(img_path)},
+            }
+        )
+    messages = [
+        {"role": "system", "content": _VISION_QUERY_SYSTEM},
+        {"role": "user", "content": content_parts},
+    ]
+
+    answer = ""
+    try:
+        answer = await vision_model_func("", messages=messages)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Vision multimodal query failed: {}", exc)
+
+    if not (answer or "").strip():
+        logger.warning("Vision unavailable or empty; falling back to MinerU parse + text LLM")
+        parsed_sections: list[str] = []
+        for img_path in image_paths:
+            parse_file(img_path)
+            stem_dir = settings.output_dir / img_path.stem
+            parse_dirs.append(stem_dir)
+            md_blob = _collect_parsed_markdown_under([stem_dir])
+            label = img_path.name
+            parsed_sections.append(f"### Parsed from {label}\n{md_blob or '(no markdown produced)'}")
+
+        parsed_blob = "\n\n".join(parsed_sections)
+        fallback_body = (
+            "## Retrieved passages\n"
+            + context_text
+            + "\n\n## Parsed image content (MinerU)\n"
+            + parsed_blob
+            + "\n\n## User question\n"
+            + question.strip()
+        )
+        answer = await llm_model_func(fallback_body, system_prompt=_TEXT_IMAGE_FALLBACK_SYSTEM)
+
+    if not with_refs:
+        return answer
+
+    return {
+        "answer": answer,
+        "chunks": chunks,
+        "entities": entities,
+        "relationships": relationships,
+        "references": references,
+    }
+
+
+def query(
+    question: str,
+    mode: str = "hybrid",
+    with_refs: bool = False,
+    image_paths: Sequence[Path] | None = None,
+) -> str | dict:
     """Run a RAG query and return the answer.
 
     Args:
@@ -179,6 +357,9 @@ def query(question: str, mode: str = "hybrid", with_refs: bool = False) -> str |
         with_refs: When True, returns a dict with keys ``answer``,
             ``chunks``, ``entities``, ``relationships`` and ``references``
             instead of a plain string.
+        image_paths: Optional image files (``.jpg`` / ``.jpeg`` / ``.png``).
+            When set, retrieval uses ``aquery_data`` then a vision LLM step
+            (with MinerU parse + text LLM fallback if vision fails).
     """
     from typing import Literal, cast
     from lightrag import QueryParam
@@ -188,6 +369,16 @@ def query(question: str, mode: str = "hybrid", with_refs: bool = False) -> str |
         mode,
     )
     rag = get_rag()
+
+    if image_paths:
+        paths = tuple(Path(p).resolve() for p in image_paths)
+        if not paths:
+            raise ValueError("image_paths must not be empty when provided")
+        _validate_image_paths_for_query(paths)
+        return asyncio.run(
+            _answer_with_images_async(question, mode, paths, with_refs=with_refs)
+        )
+
     if not with_refs:
         return asyncio.run(rag.aquery(question, mode=mode))
 
@@ -385,3 +576,251 @@ def parse_folder(folder_path: str | Path) -> None:
 
     asyncio.run(_process_all())
     logger.success(f"Folder parsed: {folder_path} ({len(files)} files)")
+
+
+# ---------------------------------------------------------------------------
+# Course RAG (Phase 7) — single factory for PG-backed LightRAG + RAGAnything
+# ---------------------------------------------------------------------------
+
+_course_cache: dict[str, RAGAnything] = {}
+_course_init_lock = asyncio.Lock()
+
+
+def material_stable_doc_id(material_id: str) -> str:
+    """Deterministic LightRAG document id for a platform material row."""
+    return compute_mdhash_id(f"edu:material:{material_id}", prefix="doc-")
+
+
+def _vision_for_course_rag() -> Any:
+    if settings.enable_image_filter:
+        return _filtered_vision_model_func
+    return vision_model_func
+
+
+async def get_course_rag_anything(course_id: str) -> RAGAnything:
+    """Return a cached RAGAnything bound to this course's workspace (PG storages)."""
+    workspace = course_id_to_workspace(course_id)
+    async with _course_init_lock:
+        if workspace in _course_cache:
+            return _course_cache[workspace]
+
+        ensure_postgres_env_from_database_url()
+
+        work = str(settings.working_dir / "course_pg_layout")
+        Path(work).mkdir(parents=True, exist_ok=True)
+        settings.output_dir.mkdir(parents=True, exist_ok=True)
+
+        lightrag = LightRAG(
+            working_dir=work,
+            workspace=workspace,
+            llm_model_func=llm_model_func,
+            embedding_func=embedding_func,
+            llm_model_max_async=settings.llm_max_async,
+            embedding_func_max_async=settings.embedding_max_async,
+            max_parallel_insert=settings.max_parallel_insert,
+            kv_storage="PGKVStorage",
+            vector_storage="PGVectorStorage",
+            graph_storage="PGGraphStorage",
+            doc_status_storage="PGDocStatusStorage",
+        )
+        await lightrag.initialize_storages()
+
+        cfg = RAGAnythingConfig(
+            working_dir=work,
+            parser_output_dir=str(settings.output_dir),
+            parser=settings.parser,
+            parse_method=settings.parse_method,
+            enable_image_processing=True,
+            enable_table_processing=True,
+            enable_equation_processing=True,
+        )
+
+        rag = RAGAnything(
+            lightrag=lightrag,
+            config=cfg,
+            llm_model_func=llm_model_func,
+            vision_model_func=_vision_for_course_rag(),
+            embedding_func=embedding_func,
+        )
+        init = await rag._ensure_lightrag_initialized()
+        if not init.get("success"):
+            raise RuntimeError(init.get("error") or "RAGAnything init failed for course")
+
+        _course_cache[workspace] = rag
+        logger.info("Course RAGAnything ready workspace={}", workspace)
+        return rag
+
+
+def _chunk_relevance_score(chunk: dict[str, Any], rank_index: int) -> float:
+    for key in ("rerank_score", "score", "similarity"):
+        v = chunk.get(key)
+        if v is not None:
+            try:
+                return max(0.0, min(1.0, float(v)))
+            except (TypeError, ValueError):
+                continue
+    dist = chunk.get("distance")
+    if dist is not None:
+        try:
+            d = float(dist)
+            return max(0.0, min(1.0, 1.0 / (1.0 + d)))
+        except (TypeError, ValueError):
+            pass
+    return max(0.0, 1.0 - (rank_index * 0.02))
+
+
+def _material_id_from_course_file_path(file_path: str | None) -> str | None:
+    if not file_path:
+        return None
+    m = re.search(r"materials/[0-9a-fA-F-]{36}/([0-9a-fA-F-]{36})/", str(file_path))
+    return m.group(1) if m else None
+
+
+def _hits_from_aquery_chunks(chunks: list[Any], *, origin: str) -> list[dict[str, Any]]:
+    hits: list[dict[str, Any]] = []
+    for i, ch in enumerate(chunks):
+        if not isinstance(ch, dict):
+            continue
+        cid = str(ch.get("chunk_id") or "")
+        text = str(ch.get("content") or "")
+        fp = ch.get("file_path")
+        mid = _material_id_from_course_file_path(str(fp) if fp is not None else "")
+        hits.append(
+            {
+                "chunk_id": cid,
+                "text": text,
+                "metadata": {"material_id": mid, "file_path": fp},
+                "relevance_score": _chunk_relevance_score(ch, i),
+                "origin": origin,
+            },
+        )
+    return hits
+
+
+async def course_aquery_data(
+    course_id: str,
+    question: str,
+    *,
+    mode: str,
+    top_k: int,
+) -> dict[str, Any]:
+    rag = await get_course_rag_anything(course_id)
+    m = cast(
+        "Literal['local', 'global', 'hybrid', 'naive', 'mix', 'bypass']",
+        mode if mode in ("local", "global", "hybrid", "naive", "mix", "bypass") else "hybrid",
+    )
+    param = QueryParam(mode=m, top_k=top_k, chunk_top_k=top_k)
+    assert rag.lightrag is not None
+    return await rag.lightrag.aquery_data(question.strip(), param)
+
+
+async def personal_aquery_data(
+    question: str,
+    *,
+    mode: str,
+    top_k: int,
+) -> dict[str, Any]:
+    rag = get_rag()
+    m = cast(
+        "Literal['local', 'global', 'hybrid', 'naive', 'mix', 'bypass']",
+        mode if mode in ("local", "global", "hybrid", "naive", "mix", "bypass") else "hybrid",
+    )
+    param = QueryParam(mode=m, top_k=top_k, chunk_top_k=top_k)
+    assert rag.lightrag is not None
+    return await rag.lightrag.aquery_data(question.strip(), param)
+
+
+def course_retrieval_hits_sync(
+    course_id: str,
+    question: str,
+    *,
+    mode: str,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    async def _run() -> list[dict[str, Any]]:
+        raw = await course_aquery_data(course_id, question, mode=mode, top_k=top_k)
+        data = raw.get("data") or {}
+        chunks = data.get("chunks") or []
+        return _hits_from_aquery_chunks(chunks, origin="course")
+
+    return asyncio.run(_run())
+
+
+def personal_retrieval_hits_sync(
+    question: str,
+    *,
+    mode: str,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    async def _run() -> list[dict[str, Any]]:
+        raw = await personal_aquery_data(question, mode=mode, top_k=top_k)
+        data = raw.get("data") or {}
+        chunks = data.get("chunks") or []
+        return _hits_from_aquery_chunks(chunks, origin="personal")
+
+    return asyncio.run(_run())
+
+
+async def ingest_parsed_material_into_course_async(
+    course_id: str,
+    material_id: str,
+    source_file: Path,
+) -> int:
+    """Insert already-parsed MinerU JSON (under output_dir / stem) into course LightRAG."""
+    stem = source_file.stem
+    scan_dir = settings.output_dir / stem
+    if not scan_dir.exists():
+        raise FileNotFoundError(f"No parse output dir: {scan_dir}")
+    json_files = [
+        p
+        for p in scan_dir.rglob("*_content_list.json")
+        if "_content_list_v2" not in p.name
+    ]
+    if not json_files:
+        raise FileNotFoundError(f"No *_content_list.json under {scan_dir}")
+
+    rag = await get_course_rag_anything(course_id)
+    doc_id = material_stable_doc_id(material_id)
+    total = 0
+    for json_path in json_files:
+        sub_stem = json_path.stem.replace("_content_list", "")
+        raw: list = json.loads(json_path.read_text(encoding="utf-8"))
+        content_list = _fix_image_paths(raw, json_path.parent)
+        await rag.insert_content_list(
+            content_list,
+            file_path=sub_stem,
+            doc_id=doc_id,
+        )
+        total += len(content_list)
+    st = await rag.get_document_processing_status(doc_id)
+    return int(st.get("chunks_count") or total)
+
+
+def ingest_parsed_material_into_course_sync(
+    course_id: str,
+    material_id: str,
+    source_file: Path,
+) -> int:
+    return asyncio.run(
+        ingest_parsed_material_into_course_async(course_id, material_id, source_file),
+    )
+
+
+async def delete_material_course_async(course_id: str, material_id: str) -> None:
+    rag = await get_course_rag_anything(course_id)
+    doc_id = material_stable_doc_id(material_id)
+    result = await rag.lightrag.adelete_by_doc_id(doc_id)
+    if result.status not in ("success", "not_found"):
+        raise RuntimeError(f"LightRAG delete failed: {result.status} {result.message}")
+
+
+def delete_material_course_sync(course_id: str, material_id: str) -> None:
+    asyncio.run(delete_material_course_async(course_id, material_id))
+
+
+async def get_lightrag_for_course(course_id: str) -> LightRAG:
+    """Return the LightRAG instance for a course (PG storages + stable workspace)."""
+    rag = await get_course_rag_anything(course_id)
+    if rag.lightrag is None:
+        raise RuntimeError("Course RAGAnything has no LightRAG instance")
+    return rag.lightrag

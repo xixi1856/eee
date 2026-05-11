@@ -5,10 +5,10 @@
 B1 完成后，教育平台已经具备用户身份管理与 Agent 绑定能力。B2 的核心目标是建立**课程资料管理与 RAG 知识库系统**，使教育平台能够：
 
 1. **课程与课时管理**：创建课程、编辑课程信息、学生加入、课时 CRUD。
-2. **资料上传与处理**：支持多格式（PDF、PPTX、Word、Markdown、TXT、图片）上传，异步处理转换与 RAG 索引。
-3. **课程 RAG 存储**：每个课程对应 PostgreSQL 中独立的 LightRAG namespace，课程间知识图谱完全隔离。
+2. **资料上传与处理**：API 侧可先仅开放 **PDF、Markdown、TXT**；**实现目标**为 Python Worker 的解析与索引 **与 `src/rag_mvp/engine.py` 中 CLI `rag parse` 对应的 `parse_file` / `parse_folder` 及后续 ingest 同源**——即统一走 **RAG-Anything（如 MinerU）** 的文档管线，**不**长期依赖与 `parse_file` 无关的独立轻量解析（如仅 `pypdf` 抽字）。其它格式（PPTX、Word、图片）在管线接入前不在 API 中开放上传。
+3. **课程 RAG 存储**：每门课对应 LightRAG 的一个 **`workspace` 字符串**（由 **`course_id` 稳定派生、1:1**），向量与文档状态落在 **共享的 `LIGHTRAG_*` PostgreSQL 表** 中并按 `workspace` 行级隔离；ingest 走 **RAG-Anything + `LightRAG` PG 存储**，检索走 **`LightRAG.query` / multimodal**（与 `rag_mvp` 个人库同引擎范式）。详见 **决策 3**。
 4. **个人 RAG 与课程 RAG 的路由**：Agent 侧的 `knowledge_query` 工具根据 session context 路由到正确来源。
-5. **资料处理流水线**：Java 后端创建任务 → Redis 队列 → Python Worker 处理 → 回写状态。
+5. **资料处理流水线**：**Next.js 服务端**（Route Handler 或服务模块）创建任务 → Redis 队列 → Python Worker 处理 → 回写状态。
 
 B2 完成后，教育平台应该具备以下特征：
 
@@ -81,114 +81,79 @@ CREATE INDEX ON materials(course_id, status);
 ### 决策 2：资料处理流水线
 
 ```
-1. 前端上传文件 → Java 后端接收
+1. 前端上传文件 → **Next.js Route Handler**（如 `POST .../materials`）接收
 2. 存储原始文件到 MinIO
 3. 创建 Material record（status=UPLOADED）
 4. 生成处理任务，推入 Redis 队列
 5. Python Worker（rag_mvp）消费任务：
    - 从 MinIO 下载文件
-   - 执行 parse（PDF → text、PPTX → text + images 等）
+   - **解析（parse）**：须与 **`engine.parse_file` / `parse_folder`（即 CLI `rag parse` 所用入口）同源**——同一套 **RAG-Anything / MinerU** 配置与输出约定，再进入 ingest；**目标**是课程资料与个人 CLI 场景 **共用一条解析实现**，避免 Worker 私有的「仅抽文本」分叉。
    - 更新 Material record（status=PARSED）
-   - 执行 RAG ingest（调用 LightRAG）
+   - **索引（ingest）**：在同一路径上接续 **绑定该课 `workspace` 的 `LightRAG` ingest**，写入 **`LIGHTRAG_*`（PGKV / PGVector / PGDocStatus / 可选 PGGraph）**（与 `engine.ingest_file` 等个人 ingest 同范式）
    - 更新 Material record（status=READY, indexed_chunk_count）
 6. 处理失败时更新 status=FAILED，记录错误信息
 7. Agent 可查询 READY 状态的资料
 ```
 
-### 决策 3：课程 RAG 的 PostgreSQL 存储方案
+### 决策 3：课程 RAG 存储、PostgreSQL 形态与 LightRAG 检索
 
-每个课程使用独立的 namespace（表前缀）：
+Phase 7 以 **LightRAG 官方 PostgreSQL 多租户模型** 为唯一落地方案：**共享元数据表名（`LIGHTRAG_*`）+ 行级 `workspace` 隔离**，**不按课拆表名**；业务上的「哪门课」一律通过 **`course_id` → `workspace` 字符串** 映射进入引擎。
 
-```sql
--- course_{course_id}_chunks
-CREATE TABLE course_<uuid>_chunks (
-    id UUID PRIMARY KEY,
-    material_id UUID NOT NULL,  -- 来自哪个资料
-    chunk_text TEXT NOT NULL,
-    chunk_index INT,
-    embedding vector(1536),  -- pgvector
-    metadata JSONB,  -- {page_number, section, ...}
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+#### 存储与表职责
 
--- course_{course_id}_entities
-CREATE TABLE course_<uuid>_entities (
-    id UUID PRIMARY KEY,
-    entity_name VARCHAR(255),
-    entity_type VARCHAR(50),  -- "PERSON", "CONCEPT", "LOCATION", ...
-    description TEXT,
-    embedding vector(1536),
-    metadata JSONB,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+- **平台业务表**（Prisma / Migrate）：`courses`、`materials`、`course_enrollments` 等，保存 **文件元数据、状态机、MinIO 路径**；**不**承担向量检索的专用 schema（避免与 LightRAG 内置 PG 布局并行维护一套「手写 chunk 表」）。
+- **LightRAG PG 存储**：启用 **`PGKVStorage`、`PGVectorStorage`、`PGDocStatusStorage`**，可选 **`PGGraphStorage`**。表由 LightRAG 侧 DDL 管理（如 `LIGHTRAG_DOC_CHUNKS`、`LIGHTRAG_VDB_CHUNKS`、`LIGHTRAG_VDB_ENTITY`、`LIGHTRAG_VDB_RELATION` 等，具体以所用版本为准），主键形态为 **`(workspace, id)`**，**所有课程共用同一套 DDL**。
 
--- course_{course_id}_relationships
-CREATE TABLE course_<uuid>_relationships (
-    id UUID PRIMARY KEY,
-    source_entity_id UUID REFERENCES course_<uuid>_entities(id),
-    target_entity_id UUID REFERENCES course_<uuid>_entities(id),
-    relationship_type VARCHAR(100),
-    metadata JSONB,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
+#### `course_id` 与 `workspace`（契约）
 
-**好处**：
+- 为每门课生成 **稳定、唯一** 的 **`workspace` 字符串**，与 **`courses.id`（`course_id`）1:1**（推荐例如 `course_<uuid>` 或规范化的 UUID 字符串）。应用层 **固定同一派生函数**，供 Worker ingest、`knowledge_query` 建实例复用。
+- **`workspace` 在对应 `LightRAG` 实例初始化后不可变**（与 LightRAG 文档一致）。
+- **`working_dir`**：在 Json 等文件型后端表示子目录；在 **本方案 PostgreSQL 后端** 下，**租户隔离以表内 `workspace` 列为准**；多门课可 **共享同一 `working_dir`、不同 `workspace`**。
 
-- 完全隔离，跨课程查询天生失效。
-- LightRAG 支持独立 namespace，无需修改库。
-- 后期删除课程时可直接删除对应表。
+#### 解析与 Ingest（写入格式）
 
-**成本**：
+- **解析**：Worker 必须改为调用与 **`engine.parse_file` / `parse_folder`**（CLI **`rag parse`**）**相同的 RAG-Anything 解析栈**（同一 `_build_parser` / `RAGAnything.parse_document` 或引擎封装的等价异步路径），保证 **输出目录与缓存格式** 与 `ingest_file` / `process_document_complete` 等 ingest 前置条件一致。
+- **Ingest**：在同一 `process_parse_and_index`（或拆分后的清晰步骤）中，在解析产物就绪后，使用 **已绑定该课 `workspace`** 的 **`LightRAG` 实例** 执行与 **`engine.ingest_*`** 同源的 ingest，写入 **`LIGHTRAG_*`**。
+- 嵌入模型与维度由 **LightRAG / 配置** 统一约束（默认与项目其余部分一致，如 Ollama `bge-m3`）；**不在应用层另写一套向量列 DDL**。
 
-- 表数量多（3 × N 课程数）。
-- 表管理复杂（自动建表、清理）。
+#### 检索（查询格式）
 
-**替代方案**（不采用）：
+- **课程内检索入口**：`LightRAG.query`、`query_with_multimodal` 或 `rag_mvp` 引擎封装方法；**禁止**以手写 SQL 替代课程腿主路径（避免与 hybrid / 图 / 多模态能力分叉）。
+- **Agent**：`knowledge_query` 在 **`sources` 含课程** 时，根据 runtime 中的 **`course_id`** 解析出 **`workspace`**，构造/获取对应 **`LightRAG` 实例** 并调用上述 API；平台 internal API **仅鉴权与审计**，不实现第二套向量检索 DSL。
 
-- 单表 + `course_id` 列：跨课程查询风险高，误删数据风险高。
-- 不同数据库：运维成本高，查询跨数据库复杂。
+#### 运维与删除
 
-### 决策 4：资料处理任务的格式与队列
+- 删除课程、删除资料：除 MinIO 与 **`materials` 行**外，须按 **`workspace`（及资料在 LightRAG 内的 doc/chunk 标识）** 调用引擎或存储层支持的删除策略，**不得**影响其他 `workspace` 行。
 
-Redis 队列中的任务格式：
+### 决策 4：资料处理任务的格式与队列（Redis Stream）
+
+**不信任队列载荷中的业务字段**：消息体仅含 `material_id` 与 `operation`；`course_id`、`minio_path`、`file_type` 一律由 Worker **`SELECT materials`** 得到。
+
+Stream 消息字段（示例）：
 
 ```json
 {
   "task_id": "task_uuid",
-  "course_id": "course_uuid",
   "material_id": "material_uuid",
   "operation": "parse_and_index",
-  "file_type": "pdf",
-  "minio_path": "materials/course_xxx/filename.pdf",
-  "created_at": "2026-05-08T09:00:00Z"
+  "created_at": "2026-05-10T09:00:00Z"
 }
 ```
 
-队列名：`edu:rag:tasks:pending`。
+- Stream 键名默认：`edu:rag:tasks:stream`（`RAG_TASK_STREAM_NAME` 可覆盖）。
+- Consumer group（默认 `edu-rag-workers`）+ **`XREADGROUP` / `XACK`**；超时未 ACK 的消息由 **`XAUTOCLAIM`** 回收（`RAG_STREAM_CLAIM_IDLE_MS`）。
+- 资料状态机支持 **stale reclaim**（`RAG_MATERIAL_STALE_SEC`）：`PARSING`/`INDEXING`/`PARSED` 过久可重新抢占，避免静默卡死。
 
-Python Worker 定期（如每 5 秒）从队列中取任务，处理后更新 Material record 的 status。
+**已废弃**：Redis List + `BRPOP` + `edu:rag:tasks:pending`。
 
 ### 决策 5：Agent 侧的多源 RAG 查询
 
-Agent 的 `knowledge_query` 工具改进（对标 A4）：
+`knowledge_query`：**`course_id` 仅来自 `TurnRuntimeContext`（session 绑定）**，工具参数中 **不再** 暴露 `course_id`，避免模型侧覆盖租户边界。`sources` 非法值 **直接报错**（不回退为 `all`）；`sources` 为 `course` 或 `all` 时会话 **必须** 已绑定课程，否则报错（禁止隐式退回仅个人库）。`top_k` 须为 1–20 的整数。
 
 ```python
-async def knowledge_query(
-    query: str,
-    sources: Literal["personal", "course", "all"] = "all",
-    course_id: str | None = None,
-    top_k: int = 5,
-) -> list[QueryResult]:
-    """
-    当 session context 包含 course_id 时：
-    - sources="all" (默认)：先查课程 RAG，后查个人 RAG，合并结果
-    - sources="course"：仅查课程 RAG
-    - sources="personal"：仅查个人 RAG
-    
-    当 session context 无 course_id 时：
-    - 仅查个人 RAG（无法查课程 RAG）
-    """
+# 语义摘要（实际以 JSON Schema 为准）
+# sources: personal | course | all
+# course 边界: runtime context only
 ```
 
 返回结果包含 `origin` 标注：
@@ -204,19 +169,21 @@ class QueryResult(BaseModel):
     relevance_score: float
 ```
 
-### 决策 6：前端课程管理与资料上传
+**双源对齐**：返回结构中的 **`origin`** 标注 **平台课程 LightRAG 索引** 与 **本地 `rag_mvp` 个人库**；课程命中均由 **`LightRAG` 系 API** 产出（见决策 3）。
 
-前端页面：
+### 决策 6：Next.js 课程管理与资料上传
+
+**`app/` 下页面**（Server / Client 组件组合）：
 
 - **课程列表**：教师查看自己的课程 / 学生查看加入的课程。
 - **课程详情**：显示课时列表、已上传资料。
-- **资料上传**：支持拖拽上传、进度条、多文件批量上传。
-- **资料列表**：显示状态流转（uploaded → parsing → ready）。
+- **资料上传**：支持拖拽上传、进度条、多文件批量上传（`multipart` 提交到 Route Handler）。
+- **资料列表**：显示状态流转（uploaded → parsing → ready）；可用 **polling** 或 **SSE** 推送状态（B2 可选）。
 - **资料预览**：对于支持的格式（PDF、图片），可在线预览。
 
 ### 决策 7：与 Python Worker 的通信协议
 
-Java 后端与 Python Worker 通过 Redis 队列通信，无需额外 RPC。
+**Next.js 服务端**与 Python Worker 通过 Redis 队列通信，无需额外 RPC。
 
 但为了监控与管理，建议预留 HTTP API（可选）：
 
@@ -235,94 +202,90 @@ POST /worker/force-process/{task_id} — 手工重新处理某个失败任务
 
 权限检查在 Agent 侧实现（`knowledge_query` 中检查 course_id 与 user 是否匹配）。
 
+## 实现边界与工程清单
+
+本小节归纳 **B2 / Phase 7 交付边界**（与 Phase 8 B3 UI/采集区分）；实现与验收以 **上文决策 + 本节清单** 为准。
+
+### 产品边界
+
+- **Agent（教育平台会话）**：`knowledge_query` **课程腿** 命中 **平台侧 LightRAG 索引**（`LIGHTRAG_*` + 该课 `workspace`）；**个人腿** 使用 **本地 `rag_mvp` 个人库**。二者工具层 **并列**，由 `sources` 与 **runtime**（会话绑定的 `course_id`、用户身份）路由，**不由模型自填课程边界**（决策 5、H5）。
+- **无 Agent**：直接使用 **`rag_mvp`** CLI 或 `engine.ingest_*` / `engine.query`；平台仅在「Agent + 绑定用户 + 课程上下文」路径下经 internal API 做 **鉴权与多租户数据面**。
+- **单引擎**：课程与个人 **同一套 `rag_mvp` / `engine` 范式**；课程租户键为 **`workspace`（与 `course_id` 1:1）**，见决策 3。
+
+### 技术要点（目标一览）
+
+| 维度 | Phase 7 要求 |
+|------|----------------|
+| 库表 | LightRAG **`LIGHTRAG_*`**，`(workspace, id)`；平台 **`materials` 等业务表** |
+| 写入 | Worker：**RAGAnything** + 绑定该课 **`workspace`** 的 **`LightRAG` ingest** |
+| 课程查询 | **`knowledge_query` 课程腿** → **`LightRAG.query` / multimodal**（与 `engine` 一致） |
+| 隔离 | **每课一 `workspace`**，共享 DDL，不按课拆表名 |
+
+### 代码任务清单（可拆 PR）
+
+1. **工厂**：`get_lightrag_for_course(course_id)`（或等价名），**固化 `course_id` → `workspace`**，复用 `engine._build_rag` 的初始化逻辑，避免复制粘贴。
+2. **Worker**：`process_parse_and_index` **解析阶段**改为复用 **`engine.parse_file` 同源 API**（与 CLI `rag parse` 一致），**ingest 阶段**与 **`engine.ingest_*` / 文档完整管线** 同源；去除与上述分叉的独立解析实现；`indexed_chunk_count` 等可由引擎统计或约定回填规则。
+3. **`knowledge_query`**：课程腿 **仅** 走引擎查询；internal API **鉴权**，不维护并行 SQL 检索 DSL。
+4. **测试**：课程与个人 **hybrid / multimodal**；**跨课 `workspace` 隔离**（不得串数据）。
+
 ## 文件清单
 
-### 新建文件（Java 后端）
+### 新建 / 扩展文件（Next.js + Prisma，`edu-platform/`）
 
-- [edu-platform/src/main/java/com/eduagent/entity/Course.java](file:///edu-platform/src/main/java/com/eduagent/entity/Course.java)
-  职责：JPA Course 实体。
+- [edu-platform/prisma/schema.prisma](file:///edu-platform/prisma/schema.prisma)（扩展）
+  职责：新增 `Course`、`Lesson`、`CourseEnrollment`、`Material` 等模型；迁移由 **Prisma Migrate** 管理（替代 Flyway）。**课程向量与 LightRAG 文档块不在 Prisma 内建模**，由 **`LIGHTRAG_*`** 承担。
 
-- [edu-platform/src/main/java/com/eduagent/entity/Lesson.java](file:///edu-platform/src/main/java/com/eduagent/entity/Lesson.java)
-  职责：JPA Lesson 实体。
+- [edu-platform/lib/services/courseService.ts](file:///edu-platform/lib/services/courseService.ts)
+  职责：课程与选课业务逻辑。
 
-- [edu-platform/src/main/java/com/eduagent/entity/CourseEnrollment.java](file:///edu-platform/src/main/java/com/eduagent/entity/CourseEnrollment.java)
-  职责：JPA CourseEnrollment 实体。
+- [edu-platform/lib/services/materialService.ts](file:///edu-platform/lib/services/materialService.ts)
+  职责：资料上传、元数据写入、**Redis 任务入队**。
 
-- [edu-platform/src/main/java/com/eduagent/entity/Material.java](file:///edu-platform/src/main/java/com/eduagent/entity/Material.java)
-  职责：JPA Material 实体。
+- [edu-platform/lib/minio.ts](file:///edu-platform/lib/minio.ts)
+  职责：MinIO 客户端封装（上传、预签名 URL、删除）。
 
-- [edu-platform/src/main/java/com/eduagent/repository/CourseRepository.java](file:///edu-platform/src/main/java/com/eduagent/repository/CourseRepository.java)
-  职责：Course 数据访问接口。
+- [edu-platform/lib/redis.ts](file:///edu-platform/lib/redis.ts)
+  职责：Redis 连接（Stream、bind 等复用）。
 
-- [edu-platform/src/main/java/com/eduagent/repository/LessonRepository.java](file:///edu-platform/src/main/java/com/eduagent/repository/LessonRepository.java)
-  职责：Lesson 数据访问接口。
+- [edu-platform/lib/queue/ragTask.ts](file:///edu-platform/lib/queue/ragTask.ts)
+  职责：向 **`RAG_TASK_STREAM_NAME`**（默认 `edu:rag:tasks:stream`）执行 **`XADD`**，载荷仅 `material_id` + `operation`。
 
-- [edu-platform/src/main/java/com/eduagent/repository/MaterialRepository.java](file:///edu-platform/src/main/java/com/eduagent/repository/MaterialRepository.java)
-  职责：Material 数据访问接口。
+- [edu-platform/app/api/v1/courses/route.ts](file:///edu-platform/app/api/v1/courses/route.ts)
+  职责：`POST /api/v1/courses` 等课程集合端点（可按需拆分为 `[courseId]/route.ts`）。
 
-- [edu-platform/src/main/java/com/eduagent/dto/CourseRequest.java](file:///edu-platform/src/main/java/com/eduagent/dto/CourseRequest.java)
-  职责：课程创建/更新请求 DTO。
+- [edu-platform/app/api/v1/courses/[courseId]/materials/route.ts](file:///edu-platform/app/api/v1/courses/[courseId]/materials/route.ts)
+  职责：资料 `POST`（multipart）、`GET` 列表。
 
-- [edu-platform/src/main/java/com/eduagent/dto/CourseResponse.java](file:///edu-platform/src/main/java/com/eduagent/dto/CourseResponse.java)
-  职责：课程响应 DTO。
+- [edu-platform/app/api/v1/materials/[materialId]/route.ts](file:///edu-platform/app/api/v1/materials/[materialId]/route.ts)
+  职责：`DELETE /api/v1/materials/{material_id}`。
 
-- [edu-platform/src/main/java/com/eduagent/service/CourseService.java](file:///edu-platform/src/main/java/com/eduagent/service/CourseService.java)
-  职责：课程业务逻辑。
+- [edu-platform/app/(app)/courses/page.tsx](file:///edu-platform/app/(app)/courses/page.tsx)
+  职责：课程列表页。
 
-- [edu-platform/src/main/java/com/eduagent/service/MaterialService.java](file:///edu-platform/src/main/java/com/eduagent/service/MaterialService.java)
-  职责：资料业务逻辑，包含上传、处理任务队列操作。
+- [edu-platform/app/(app)/courses/[courseId]/page.tsx](file:///edu-platform/app/(app)/courses/[courseId]/page.tsx)
+  职责：课程详情、资料列表与上传入口。
 
-- [edu-platform/src/main/java/com/eduagent/service/MinIOService.java](file:///edu-platform/src/main/java/com/eduagent/service/MinIOService.java)
-  职责：MinIO 操作（上传、下载、删除）。
-
-- [edu-platform/src/main/java/com/eduagent/service/RagTaskQueueService.java](file:///edu-platform/src/main/java/com/eduagent/service/RagTaskQueueService.java)
-  职责：Redis 队列操作（任务入队、监控）。
-
-- [edu-platform/src/main/java/com/eduagent/controller/CourseController.java](file:///edu-platform/src/main/java/com/eduagent/controller/CourseController.java)
-  职责：提供课程 CRUD 端点。
-
-- [edu-platform/src/main/java/com/eduagent/controller/MaterialController.java](file:///edu-platform/src/main/java/com/eduagent/controller/MaterialController.java)
-  职责：提供资料上传、查询、删除端点。
-
-- [edu-platform/src/main/resources/db/migration/V2__courses_materials.sql](file:///edu-platform/src/main/resources/db/migration/V2__courses_materials.sql)
-  职责：Flyway 迁移脚本，建课程和资料相关的表。
+- [edu-platform/components/MaterialUpload.tsx](file:///edu-platform/components/MaterialUpload.tsx)
+  职责：资料上传 Client 组件（拖拽、进度）。
 
 ### 新建文件（Python Worker）
 
 - [src/rag_mvp/worker.py](file:///src/rag_mvp/worker.py)
-  职责：Redis 队列 consumer，处理资料 parse & index 任务。
+  职责：Redis **Stream** consumer（`XREADGROUP` / `XACK` / `XAUTOCLAIM`）。
   功能：
-  - 连接 Redis，监听 `edu:rag:tasks:pending`
-  - 取任务，调用 parse_and_index()
-  - 更新 Material record 的 status
-  - 异常处理与重试
+  - `XGROUP CREATE`（幂等）+ 消费组处理
+  - 从 DB 加载 `materials` 行（不信任 Stream 业务字段）
+  - 调用 `process_parse_and_index` / `process_delete_material`
+  - 处理失败写 `FAILED` 后 **ACK**；崩溃未 ACK 的消息由 `XAUTOCLAIM` 回收
 
 - [src/rag_mvp/material_processor.py](file:///src/rag_mvp/material_processor.py)
-  职责：资料处理核心逻辑。
+  职责：资料处理核心逻辑（MinIO 下载、状态机、**调用与 `engine.parse_file` / ingest 同源的 RAGAnything**）。
   功能：
-  - `parse_material(file_type, file_path)` — 解析各种格式
-  - `ingest_to_course_rag(course_id, chunks)` — 索引到 PostgreSQL
-  - `update_material_status(material_id, status, metadata)` — 更新状态
+  - 解析：**委托或内联复用** `engine` 中与 **`rag parse` 相同的解析路径**（见决策 2、决策 3「解析与 Ingest」），**不**保留与 `parse_file` 并行的仅文本抽取主路径。
+  - `ingest_material_to_lightrag(course_id, material_id, …)` — **绑定 `workspace` 的 `LightRAG` ingest**，写入 **`LIGHTRAG_*`**
+  - `update_material_status(...)` — 更新 `materials` 状态与计数
 
-### 新建文件（React 前端）
-
-- [edu-platform-web/src/pages/Courses/index.tsx](file:///edu-platform-web/src/pages/Courses/index.tsx)
-  职责：课程列表页面。
-
-- [edu-platform-web/src/pages/CourseDetail/index.tsx](file:///edu-platform-web/src/pages/CourseDetail/index.tsx)
-  职责：课程详情页面，包含资料列表、上传功能。
-
-- [edu-platform-web/src/pages/Materials/index.tsx](file:///edu-platform-web/src/pages/Materials/index.tsx)
-  职责：资料管理页面。
-
-- [edu-platform-web/src/components/MaterialUpload.tsx](file:///edu-platform-web/src/components/MaterialUpload.tsx)
-  职责：资料上传组件，支持拖拽、进度条。
-
-- [edu-platform-web/src/services/courseService.ts](file:///edu-platform-web/src/services/courseService.ts)
-  职责：课程相关 API 调用。
-
-- [edu-platform-web/src/services/materialService.ts](file:///edu-platform-web/src/services/materialService.ts)
-  职责：资料相关 API 调用。
+> 页面与 **`lib/services/*`** 的分工：复杂查询可在 Server Component 内直接调 `lib/services`；浏览器侧仅 `fetch('/api/v1/...')`，避免重复实现。
 
 ## 接口契约
 
@@ -391,7 +354,7 @@ lesson_id: <optional>
 
 ### 4. DELETE /api/v1/materials/{material_id} (删除资料)
 
-从 MinIO 与 PostgreSQL 中删除该资料及其 chunks。
+从 MinIO、**`materials` 记录**及 **LightRAG 中该资料对应文档/块**（在正确 **`workspace`** 下）删除；具体 API 与引擎版本对齐。
 
 ### 5. GET /api/v1/courses/{course_id}/join (学生加入课程)
 
@@ -401,47 +364,44 @@ lesson_id: <optional>
 
 ### 6. Redis 队列消息格式
 
+与 **决策 4** 一致，载荷 **仅** `material_id` + `operation`（及 `task_id` / `created_at` 等元信息）；`course_id`、路径、类型由 Worker **`SELECT materials`** 加载。
+
 ```json
 {
   "task_id": "task_uuid",
-  "course_id": "course_uuid",
   "material_id": "material_uuid",
   "operation": "parse_and_index",
-  "file_type": "pdf",
-  "minio_path": "materials/course_xxx/filename.pdf",
   "created_at": "2026-05-08T09:00:00Z"
 }
 ```
 
 ## 实施顺序
 
-### 后端（Java）
+### Next.js（Prisma + API + 页面）
 
-1. 新增数据库迁移脚本，建课程、资料、选课表。
-2. 实现 JPA 实体与 Repository。
-3. 实现 CourseService、MaterialService、MinIOService、RagTaskQueueService。
-4. 实现 CourseController、MaterialController。
-5. 单元与集成测试。
+1. 扩展 `schema.prisma`，**`prisma migrate`** 建课程、资料、选课表。
+2. 实现 `lib/services/courseService.ts`、`materialService.ts` 与 MinIO、Redis 封装。
+3. 实现 **`app/api/v1/courses/**`、`materials/**`** Route Handlers（含权限：教师/学生/选课）。
+4. Vitest/Jest 覆盖服务层与 API；必要时 **Playwright** 做上传 E2E。
 
-### 前端（React）
+### Next.js 页面
 
-1. 课程列表页面。
-2. 课程详情页面。
-3. 资料上传组件与状态展示。
-4. 学生加入课程功能。
+1. 课程列表与课程详情（资料列表、上传）。
+2. 资料状态展示（轮询或 SSE）。
+3. 学生加入课程（`POST .../join`）UI。
 
 ### Python Worker
 
 1. 实现 `worker.py`，连接 Redis 与 PostgreSQL。
-2. 实现 `material_processor.py`，集成 PDF 解析、LightRAG ingest。
+2. 实现 `material_processor.py`，集成 PDF 解析、**RAG-Anything + LightRAG ingest**（`LIGHTRAG_*` + 该课 `workspace`）。
 3. 处理各种文件格式（PDF、PPTX、Docx 等）。
 4. 错误处理与重试机制。
 5. 监控与日志。
 
 ### 集成
 
-1. Java 后端与 MinIO 集成测试。
-2. Java 后端与 Redis 队列集成测试。
+1. Next.js 与 MinIO 集成测试（上传与预签名 URL）。
+2. Next.js 与 Redis 入队集成测试。
 3. Python Worker 与 PostgreSQL + LightRAG 集成测试。
 4. E2E：教师上传 PDF → Worker 处理 → Agent 查询 → 返回正确结果。
 
@@ -449,19 +409,17 @@ lesson_id: <optional>
 
 ### 1. PostgreSQL 表管理
 
-自动建表的问题：LightRAG 创建的表结构可能不完全符合需求。建议：
-
-- 让 Python Worker 在索引前检查表是否存在。
-- 若不存在，调用 Flyway/Liquibase 创建（Java 侧）。
-- 或者 Worker 侧自己执行 CREATE TABLE IF NOT EXISTS。
+- **业务表**：`courses`、`materials` 等由 **Prisma Migrate** 管理。
+- **向量与 RAG 元数据**：**`LIGHTRAG_*`** 由 **LightRAG**（PGKV / PGVector / PGDocStatus / 可选 PGGraph）初始化与演进；租户隔离靠 **`workspace`**，与 **`course_id` 的映射在应用层唯一实现**（见决策 3）。
+- **禁止**再为每门课动态 `CREATE TABLE course_*_chunks` 或并行维护一套手写 chunk 表作为主检索源。
 
 ### 2. 大文件上传
 
 若支持大文件（如 1 GB PPT），上传可能超时。建议：
 
 - 前端分块上传（多个小块并行）。
-- Java 后端支持分块合并。
-- 或使用 MinIO 的预签名 URL，直接上传到 MinIO。
+- **Route Handler** 侧合并分块或协调 MinIO multipart。
+- 或使用 MinIO 的预签名 URL，**浏览器直传** MinIO，完成后回调平台写入 `Material` 并入队。
 
 ### 3. RAG 处理耗时
 
@@ -472,16 +430,11 @@ PDF 解析 + embedding + ingest 可能需要几十秒到几分钟（取决于文
 
 ### 4. 课程 RAG 的删除与清理
 
-删除课程时需要删除对应的所有 PostgreSQL 表。建议：
-
-- 执行 DROP TABLE course_<uuid>_*；
-- 或标记为"已删除"而不物理删除（软删除）。
+删除课程或资料时：同步清理 **`materials` / MinIO** 与 **`LIGHTRAG_*`** 中该 **`workspace`**（及资料对应文档）的数据；调用 **LightRAG 或存储层提供的删除能力**，**不得**误删其他 `workspace`；与 `courses` / `materials` 软删策略对齐。
 
 ### 5. 个人 RAG 与课程 RAG 的混用
 
-当前 Agent 侧有个人 RAG（本地 JSON/JSONL）与课程 RAG（PostgreSQL）两套。数据来源与存储完全分离，增加复杂度。
-
-简化方案（不采用）：全部用 PostgreSQL。缺点是本地开发与测试不便（需要 PostgreSQL 与 pgvector）。
+个人库与课程库在 Agent 内 **双源并列**（决策 5）；二者在实现上均归 **`rag_mvp` / `LightRAG` 引擎范式**：个人用默认或独立 `workspace` / 存储配置，课程用 **`course_id` 派生的 `workspace`**（决策 3）。个人侧可保留 Json 等便于本机开发的配置，课程侧以 **PG `LIGHTRAG_*`** 为 Phase 7 交付要求。
 
 ## 验收标准
 
@@ -493,20 +446,21 @@ PDF 解析 + embedding + ingest 可能需要几十秒到几分钟（取决于文
 
 ### 资料上传
 
-- 支持上传 PDF、PPTX、Word、Markdown 等格式。
+- 支持上传 **PDF、Markdown、TXT**（与 Worker `parse_material` 一致）。
 - 上传后资料状态为 UPLOADED。
 - Worker 自动处理，状态流转至 READY。
 - 处理失败时状态为 FAILED，记录错误信息。
 
 ### RAG 索引
 
-- 资料准备好后 (status=READY)，indexed_chunk_count > 0。
-- PostgreSQL 中能查到对应 course_xxx_chunks 表的数据。
+- 资料准备好后 (status=READY)，`indexed_chunk_count > 0`（或由 LightRAG 统计回填的等价指标）。
+- 在 **`LIGHTRAG_*`** 中，该资料在对应课的 **`workspace`** 下可查（文档块 / 向量行由 LightRAG 管理）。
 
 ### Agent 查询
 
-- Agent 在有 course_id 的 session 中调用 `knowledge_query`，优先查课程 RAG。
-- 返回结果带 `origin="course"` 标注。
+- Agent 在 **session 已绑定课程** 时调用 `knowledge_query`（`sources=all` 或 `course`）；**`course_id` 仅来自 `TurnRuntimeContext`**，**不**作为工具参数传入（见决策 5）。
+- 课程腿仅通过 **绑定该课 `workspace` 的 `LightRAG.query` / multimodal**（与 `engine` 个人路径同范式）；**无**手写 SQL 向量主路径。
+- 返回结果带 `origin="course"` 标注（与个人腿并列）。
 - 不同课程的查询结果隔离。
 
 ### 权限
@@ -526,7 +480,7 @@ PDF 解析 + embedding + ingest 可能需要几十秒到几分钟（取决于文
 
 ### 1. RAG ingest 的模型选择
 
-当前方案使用 LightRAG 与 embedding 模型（如 OpenAI ada）生成 vectors 存入 pgvector。
+课程向量由 **LightRAG 配置的 embedding** 写入 **`LIGHTRAG_*`**（与 **RAG-Anything + `LightRAG` ingest** 一致）；**共享表 + 每课 `workspace`（由 `course_id` 稳定派生）**（决策 3）。
 
 是否使用本地 embedding 模型（如 BGE）以降低成本，还是保持用云 embedding？
 

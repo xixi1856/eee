@@ -154,6 +154,28 @@ def create_app(
                 return m.content
         return ""
 
+    def _platform_chat_metadata(request: Request, *, user_id: str, auth_api_key: str | None) -> dict[str, Any]:
+        """Headers from Next.js / platform (phase8).
+
+        ``X-Platform-User-Id`` when set must equal ``user_id`` (the Agent session user id
+        from the query string), not the platform UUID.
+        """
+        h = request.headers
+        platform_uid = (h.get("x-platform-user-id") or "").strip()
+        if platform_uid and platform_uid != user_id:
+            raise HTTPException(
+                status_code=400,
+                detail="X-Platform-User-Id must match user_id query parameter (agent user id)",
+            )
+        course = (h.get("x-platform-course-id") or "").strip()
+        lesson = (h.get("x-platform-lesson-id") or "").strip()
+        meta: dict[str, Any] = {"api_key": auth_api_key}
+        if course:
+            meta["platform_course_id"] = course
+        if lesson:
+            meta["platform_lesson_id"] = lesson
+        return meta
+
     def _sse_line(obj: Any) -> str:
         return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
@@ -176,7 +198,7 @@ def create_app(
             session_id=session_id,
             user_id=user_id,
             content=text.strip(),
-            metadata={"api_key": auth.api_key},
+            metadata=_platform_chat_metadata(request, user_id=user_id, auth_api_key=auth.api_key),
         )
 
         if payload.stream:
@@ -225,10 +247,13 @@ def create_app(
                             ch0["finish_reason"] = "stop"
                         elif ob.content_type == OutboundContentType.META:
                             ch0["delta"] = {"content": ""}
-                        frame["edu_meta"] = {
+                        edu_meta: dict[str, Any] = {
                             "content_type": ob.content_type.value,
                             "is_final": ob.is_final,
                         }
+                        if ob.metadata:
+                            edu_meta["b3"] = ob.metadata
+                        frame["edu_meta"] = edu_meta
                         yield _sse_line(frame).encode("utf-8")
                     yield b"data: [DONE]\n\n"
                 except Exception as exc:  # noqa: BLE001

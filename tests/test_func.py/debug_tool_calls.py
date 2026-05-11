@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 """Debug tool call preservation."""
 from edu_agent.context.compressor import compress_messages, _tail_start_index
-import json
 
 # Create messages with tool call at the beginning
 messages = [

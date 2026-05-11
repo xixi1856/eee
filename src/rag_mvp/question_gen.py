@@ -11,6 +11,7 @@ Pipeline:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import re
 import xml.etree.ElementTree as ET
@@ -524,6 +525,24 @@ def _assign_objective_format_pairs(
     return pairs[:total]
 
 
+def _run_async_from_sync(coro_factory):
+    """Run *coro_factory()* in a fresh event loop.
+
+    Uses ``asyncio.run`` when no loop is running; otherwise runs the coroutine
+    in a worker thread with its own loop (``asyncio.run`` cannot nest).
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro_factory())
+
+    def _in_thread() -> Any:
+        return asyncio.run(coro_factory())
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(_in_thread).result()
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -615,7 +634,7 @@ def generate(
         return list(await asyncio.gather(*tasks))
 
     logger.info(f"Generating questions with LLM (target: {count})…")
-    raw_results = asyncio.run(_run_all())
+    raw_results = _run_async_from_sync(_run_all)
 
     questions = [q for q in raw_results if q is not None][:count]
 

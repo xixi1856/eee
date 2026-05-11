@@ -162,6 +162,7 @@ class SubAgent:
             else:
                 checker = parent_checker or tool_rt.permission_checker
             sub_course = parent_ctx.course_id if parent_ctx is not None else None
+            sub_lesson = parent_ctx.lesson_id if parent_ctx is not None else None
             sub_tok = set_current_runtime(
                 TurnRuntimeContext(
                     settings=settings,
@@ -172,6 +173,7 @@ class SubAgent:
                     tool_runtime=tool_rt,
                     permission_checker=checker,
                     course_id=sub_course,
+                    lesson_id=sub_lesson,
                 )
             )
             try:

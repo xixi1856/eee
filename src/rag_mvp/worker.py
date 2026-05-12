@@ -7,6 +7,7 @@ import signal
 import sys
 from typing import Any
 
+import psycopg
 import redis
 from dotenv import load_dotenv
 from loguru import logger
@@ -46,6 +47,32 @@ def _ensure_group(r: redis.Redis, stream: str, group: str) -> None:
         if "BUSYGROUP" in str(exc):
             return
         raise
+
+
+def _ensure_conn_alive(conn: psycopg.Connection) -> psycopg.Connection:
+    """Return a live DB connection, reconnecting if the current one is broken.
+
+    Long-running tasks (e.g. LibreOffice PPT→PDF conversion) can outlast the
+    server's idle-connection timeout.  A dead connection would leave materials
+    stuck in PENDING/UPLOADED after a successful MinIO upload because the DB
+    status update silently fails and the task is ACKed with no retry.
+    """
+    try:
+        # Lightweight ping to verify the socket is alive.
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        # Roll back any implicit transaction started by the ping so the next
+        # task starts in a clean state (rollback is a no-op when nothing was
+        # modified, so this is always safe).
+        conn.rollback()
+        return conn
+    except Exception:
+        logger.warning("DB connection lost; reconnecting before next task")
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return connect_sync(autocommit=False)
 
 
 def _coerce_field_dict(raw: Any) -> dict[str, str]:
@@ -126,9 +153,14 @@ def _handle_entries(
     stream: str,
     group: str,
     entries: list[tuple[str, dict[str, str]]],
-) -> None:
+) -> psycopg.Connection:
+    """Process stream entries and return the (possibly-reconnected) DB connection."""
     for msg_id, raw_fields in entries:
         fields = {str(k): str(v) for k, v in raw_fields.items()}
+        # Ensure the DB connection is alive before each task.  A long previous
+        # task (e.g. soffice conversion) may have caused the server to close the
+        # idle socket, which would leave the material stuck in PENDING/UPLOADED.
+        conn = _ensure_conn_alive(conn)
         try:
             _process_one(conn, fields)
             r.xack(stream, group, msg_id)
@@ -143,6 +175,7 @@ def _handle_entries(
                 r.xack(stream, group, msg_id)
             except redis.ResponseError:
                 logger.exception("XACK failed stream_id={}", msg_id)
+    return conn
 
 
 def main() -> None:
@@ -195,7 +228,7 @@ def main() -> None:
                 )
                 claimed = _parse_autoclaim_messages(resp)
                 if claimed:
-                    _handle_entries(conn, r, stream, group, claimed)
+                    conn = _handle_entries(conn, r, stream, group, claimed)
                 msgs = r.xreadgroup(
                     groupname=group,
                     consumername=consumer,
@@ -206,7 +239,7 @@ def main() -> None:
                 if msgs:
                     for _sname, entries in msgs:
                         if entries:
-                            _handle_entries(conn, r, stream, group, entries)
+                            conn = _handle_entries(conn, r, stream, group, entries)
             except redis.ConnectionError:
                 logger.exception("Redis connection error")
             except Exception:

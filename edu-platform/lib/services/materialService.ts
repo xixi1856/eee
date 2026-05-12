@@ -18,6 +18,7 @@ import { assertTeacherOfCourse, getCourseIfMember, assertUuid } from "@/lib/cour
 import {
   deleteObject,
   getObjectStream,
+  objectExists,
   putObjectStream,
 } from "@/lib/minio";
 import {
@@ -367,19 +368,79 @@ export async function assertMaterialReadAccess(
   return m;
 }
 
+/**
+ * Self-heal a PENDING preview for an office material whose PDF was already uploaded to storage
+ * but whose DB status was never updated (e.g. due to a transient worker DB-connection failure).
+ *
+ * If the preview object is found in storage: updates previewPdfStatus → READY and enqueues a
+ * parse_and_index task so the material can progress beyond UPLOADED status.
+ *
+ * Returns the possibly-updated preview status.
+ */
+async function selfHealPendingPreview(m: Material): Promise<MaterialPreviewPdfStatus> {
+  if (
+    !isOfficeMaterialFileType(m.fileType) ||
+    m.previewPdfStatus !== MaterialPreviewPdfStatus.PENDING
+  ) {
+    return m.previewPdfStatus;
+  }
+  try {
+    const keys = [
+      previewPdfObjectKey(m.minioPath),
+      legacyConvertedPdfObjectKey(m.minioPath, m.id),
+    ];
+    const found = (
+      await Promise.allSettled(keys.map((k) => objectExists(k)))
+    ).some((r) => r.status === "fulfilled" && r.value === true);
+
+    if (!found) return m.previewPdfStatus;
+
+    await prisma.material.updateMany({
+      where: {
+        id: m.id,
+        isDeleted: false,
+        previewPdfStatus: MaterialPreviewPdfStatus.PENDING,
+      },
+      data: { previewPdfStatus: MaterialPreviewPdfStatus.READY, statusMessage: null },
+    });
+
+    // Re-queue indexing so the material can advance from UPLOADED → READY.
+    if (m.status === MaterialStatus.UPLOADED && getRedisUrl()) {
+      try {
+        await enqueueRagTaskWithRetry({
+          task_id: randomUUID(),
+          material_id: m.id,
+          operation: "parse_and_index",
+          created_at: new Date().toISOString(),
+          text_only: true,
+          skip_kg: true,
+        });
+      } catch {
+        // Non-fatal: preview is fixed; indexing can be retried later.
+      }
+    }
+
+    return MaterialPreviewPdfStatus.READY;
+  } catch {
+    // Non-fatal: return the original status if self-healing fails.
+    return m.previewPdfStatus;
+  }
+}
+
 export async function getMaterialDetailDto(
   userId: string,
   role: UserRole,
   materialId: string,
 ): Promise<MaterialDetailDto> {
   const m = await assertMaterialReadAccess(userId, role, materialId);
+  const previewPdfStatus = await selfHealPendingPreview(m);
   return {
     id: m.id,
     filename: m.originalFilename,
     file_type: m.fileType,
     lesson_id: m.lessonId ?? null,
     status: m.status,
-    preview_pdf_status: m.previewPdfStatus,
+    preview_pdf_status: previewPdfStatus,
     indexed_chunk_count: m.indexedChunkCount,
     created_at: m.createdAt.toISOString(),
     status_message: m.statusMessage,
@@ -554,6 +615,21 @@ export async function openMaterialContentStream(
             statusMessage: null,
           },
         });
+        // Re-queue indexing so the material can advance from UPLOADED → READY.
+        if (m.status === MaterialStatus.UPLOADED && getRedisUrl()) {
+          try {
+            await enqueueRagTaskWithRetry({
+              task_id: randomUUID(),
+              material_id: m.id,
+              operation: "parse_and_index",
+              created_at: new Date().toISOString(),
+              text_only: true,
+              skip_kg: true,
+            });
+          } catch {
+            // Non-fatal: preview is fixed; indexing can be retried later.
+          }
+        }
         return {
           body: preview.body,
           contentType: preview.contentType || "application/pdf",

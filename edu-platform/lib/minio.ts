@@ -1,6 +1,7 @@
 import {
   DeleteObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
@@ -57,6 +58,30 @@ export async function deleteObject(objectKey: string): Promise<void> {
   await client.send(
     new DeleteObjectCommand({ Bucket: c.bucket, Key: objectKey }),
   );
+}
+
+/**
+ * Check whether an object exists in the configured bucket without downloading it.
+ * Returns true if the object exists, false if it does not (404).
+ * Throws for other S3 errors.
+ */
+export async function objectExists(objectKey: string): Promise<boolean> {
+  const c = getMinioConfig();
+  const client = getS3Client();
+  try {
+    await client.send(new HeadObjectCommand({ Bucket: c.bucket, Key: objectKey }));
+    return true;
+  } catch (e: unknown) {
+    const err = e as { name?: string; $metadata?: { httpStatusCode?: number } };
+    if (
+      err.name === "NotFound" ||
+      err.name === "NoSuchKey" ||
+      err.$metadata?.httpStatusCode === 404
+    ) {
+      return false;
+    }
+    throw e;
+  }
 }
 
 export async function getObjectStream(params: {

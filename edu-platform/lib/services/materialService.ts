@@ -396,8 +396,9 @@ async function selfHealPendingPreview(m: Material): Promise<MaterialPreviewPdfSt
           found = true;
           break;
         }
-      } catch {
+      } catch (checkErr) {
         // Treat individual key check failures as "not found" and continue.
+        console.warn(`[selfHealPendingPreview] Failed to check object existence for key ${key}:`, checkErr);
       }
     }
 
@@ -433,8 +434,9 @@ async function selfHealPendingPreview(m: Material): Promise<MaterialPreviewPdfSt
     }
 
     return MaterialPreviewPdfStatus.READY;
-  } catch {
+  } catch (healErr) {
     // Non-fatal: return the original status if self-healing fails.
+    console.error(`[selfHealPendingPreview] Self-healing failed for material ${m.id}:`, healErr);
     return m.previewPdfStatus;
   }
 }

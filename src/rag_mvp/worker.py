@@ -154,7 +154,11 @@ def _handle_entries(
     group: str,
     entries: list[tuple[str, dict[str, str]]],
 ) -> psycopg.Connection:
-    """Process stream entries and return the (possibly-reconnected) DB connection."""
+    """Process stream entries and return the current (possibly-reconnected) DB connection.
+
+    The connection is checked for liveness before each task and reconnected if
+    necessary; callers must use the returned reference for subsequent operations.
+    """
     for msg_id, raw_fields in entries:
         fields = {str(k): str(v) for k, v in raw_fields.items()}
         # Ensure the DB connection is alive before each task.  A long previous

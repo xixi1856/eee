@@ -158,6 +158,23 @@ export default function CourseChatDockview({ courseId }: Props) {
   const apiRef = useRef<DockviewApi | null>(null);
   const layoutDisposableRef = useRef<DockviewIDisposable | null>(null);
   const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const resettingLayoutRef = useRef(false);
+
+  const resetDockviewToDefault = useCallback((api: DockviewApi) => {
+    const storageKey = dockviewLayoutKey(courseId);
+    try {
+      localStorage.removeItem(storageKey);
+    } catch {
+      /* ignore */
+    }
+    resettingLayoutRef.current = true;
+    try {
+      api.clear();
+      defaultThreeColumnLayout(api);
+    } finally {
+      resettingLayoutRef.current = false;
+    }
+  }, [courseId]);
 
   useEffect(() => {
     const h = (ev: Event) => {
@@ -174,6 +191,22 @@ export default function CourseChatDockview({ courseId }: Props) {
         h as EventListener,
       );
   }, []);
+
+  useEffect(() => {
+    const h = (ev: Event) => {
+      const ce = ev as CustomEvent<{ courseId?: string }>;
+      if (ce.detail?.courseId !== courseId) return;
+      const api = apiRef.current;
+      if (!api) return;
+      resetDockviewToDefault(api);
+    };
+    window.addEventListener("edu:reset-course-chat-dockview", h as EventListener);
+    return () =>
+      window.removeEventListener(
+        "edu:reset-course-chat-dockview",
+        h as EventListener,
+      );
+  }, [courseId, resetDockviewToDefault]);
 
   const activeMaterialId = citation?.materialId ?? selectedMaterialId;
 
@@ -256,12 +289,22 @@ export default function CourseChatDockview({ courseId }: Props) {
       if (!loaded) {
         api.clear();
         defaultThreeColumnLayout(api);
+      } else if (api.panels.length === 0) {
+        resetDockviewToDefault(api);
       }
 
       const schedulePersist = () => {
         if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
         persistTimerRef.current = setTimeout(() => {
           persistTimerRef.current = null;
+          if (api.totalPanels === 0) {
+            try {
+              localStorage.removeItem(storageKey);
+            } catch {
+              /* ignore */
+            }
+            return;
+          }
           try {
             localStorage.setItem(storageKey, JSON.stringify(api.toJSON()));
           } catch {
@@ -270,9 +313,21 @@ export default function CourseChatDockview({ courseId }: Props) {
         }, 400);
       };
 
-      layoutDisposableRef.current = api.onDidLayoutChange(schedulePersist);
+      const layoutChangeSub = api.onDidLayoutChange(schedulePersist);
+      const removePanelSub = api.onDidRemovePanel(() => {
+        if (resettingLayoutRef.current) return;
+        if (api.panels.length === 0) {
+          resetDockviewToDefault(api);
+        }
+      });
+      layoutDisposableRef.current = {
+        dispose() {
+          layoutChangeSub.dispose();
+          removePanelSub.dispose();
+        },
+      };
     },
-    [courseId],
+    [courseId, resetDockviewToDefault],
   );
 
   return (

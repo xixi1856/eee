@@ -7,14 +7,13 @@ import {
   BookOpen, ChevronLeft, FileText, GraduationCap, LayoutList,
   MessageSquare, BarChart3, Loader2, Trash2, AlertCircle,
   CheckCircle2, Clock, Cpu, BookMarked, Pencil, FileQuestion, Sparkles, Copy,
-  RotateCcw,
 } from "lucide-react";
 import type { AssignmentSummaryDto } from "@/lib/dto/assignment.dto";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import MaterialUpload from "@/components/MaterialUpload";
+import { RetryMaterialIndexPopover } from "@/components/RetryMaterialIndexPopover";
 import KnowledgeGraphPanel from "@/components/KnowledgeGraphPanel";
-import { formatApiErrorFromResponse } from "@/lib/http/format-api-error";
 import { cn } from "@/lib/utils";
 
 type Course = {
@@ -130,26 +129,6 @@ function MaterialRow({
   onNotify: (type: "success" | "error", msg: string) => void;
   indent?: boolean;
 }) {
-  const [retrying, setRetrying] = useState(false);
-
-  async function retryIndex() {
-    setRetrying(true);
-    try {
-      const res = await fetch(
-        `/api/v1/courses/${courseId}/materials/${m.id}/retry-index`,
-        { method: "POST", credentials: "include" },
-      );
-      if (!res.ok) {
-        const detail = formatApiErrorFromResponse(res.status, await res.text());
-        onNotify("error", detail);
-        return;
-      }
-      onMaterialsRefresh();
-    } finally {
-      setRetrying(false);
-    }
-  }
-
   return (
     <div
       className={cn(
@@ -172,18 +151,14 @@ function MaterialRow({
       <div className="flex items-center gap-2 shrink-0">
         <MaterialStatusBadge status={m.status} />
         {isTeacher && m.status === "FAILED" && (
-          <button
-            type="button"
-            title="重试索引（使用已解析的本地缓存）"
-            disabled={retrying}
-            onClick={() => void retryIndex()}
-            className={cn(
-              "flex h-7 w-7 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground transition-colors",
-              retrying && "opacity-60 pointer-events-none",
-            )}
-          >
-            <RotateCcw size={13} className={retrying ? "animate-spin" : ""} />
-          </button>
+          <RetryMaterialIndexPopover
+            courseId={courseId}
+            materialId={m.id}
+            iconSize={13}
+            triggerClassName="flex h-7 w-7 items-center justify-center rounded-lg"
+            onSuccess={() => onMaterialsRefresh()}
+            onError={(msg) => onNotify("error", msg)}
+          />
         )}
         {isTeacher && (
           <button

@@ -39,6 +39,17 @@ describe("RagQueueTask contract", () => {
     expect(JSON.parse(JSON.stringify(t)).text_only).toBe(false);
   });
 
+  it("supports skip_kg strategy flag", () => {
+    const t: RagQueueTask = {
+      task_id: "550e8400-e29b-41d4-a716-446655440005",
+      material_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+      operation: "parse_and_index",
+      created_at: "2026-05-10T00:00:00.000Z",
+      skip_kg: false,
+    };
+    expect(JSON.parse(JSON.stringify(t)).skip_kg).toBe(false);
+  });
+
   it("allows repair_preview operation for preview self-healing", () => {
     const t: RagQueueTask = {
       task_id: "550e8400-e29b-41d4-a716-446655440003",
@@ -47,5 +58,16 @@ describe("RagQueueTask contract", () => {
       created_at: "2026-05-10T00:00:00.000Z",
     };
     expect(JSON.parse(JSON.stringify(t)).operation).toBe("repair_preview");
+  });
+
+  it("allows convert_preview operation for office upload phase-1", () => {
+    const t: RagQueueTask = {
+      task_id: "550e8400-e29b-41d4-a716-446655440004",
+      material_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+      operation: "convert_preview",
+      created_at: "2026-05-10T00:00:00.000Z",
+      text_only: true,
+    };
+    expect(JSON.parse(JSON.stringify(t)).operation).toBe("convert_preview");
   });
 });

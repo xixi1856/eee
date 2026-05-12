@@ -10,7 +10,7 @@ export default function AppLayout({
     <SidebarProvider>
       <div className="flex w-full h-screen overflow-hidden bg-background text-foreground">
         <AppSidebar />
-        <main className="flex-1 flex flex-col min-w-0 relative">
+        <main className="flex-1 flex flex-col min-h-0 min-w-0 relative overflow-y-auto">
           <div className="absolute top-4 left-4 z-50 md:hidden">
              <SidebarTrigger />
           </div>

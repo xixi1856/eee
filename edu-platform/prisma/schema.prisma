@@ -174,9 +174,23 @@ model Material {
 
   course Course  @relation(fields: [courseId], references: [id], onDelete: Cascade)
   lesson Lesson? @relation(fields: [lessonId], references: [id], onDelete: SetNull)
+  images MaterialImage[]
 
   @@index([courseId, status])
   @@map("materials")
+}
+
+model MaterialImage {
+  id         String   @id @default(uuid()) @db.Uuid
+  materialId String   @map("material_id") @db.Uuid
+  pageIdx    Int      @map("page_idx")
+  minioUrl   String   @map("minio_url")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  material Material @relation(fields: [materialId], references: [id], onDelete: Cascade)
+
+  @@index([materialId])
+  @@map("material_images")
 }
 
 model Credential {

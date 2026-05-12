@@ -13,6 +13,7 @@ from loguru import logger
 
 from rag_mvp.db import connect_sync
 from rag_mvp.material_processor import (
+    process_convert_preview,
     process_delete_material,
     process_index_only,
     process_parse_and_index,
@@ -89,6 +90,7 @@ def _parse_bool_field(raw: str | None, default: bool = True) -> bool:
 def _process_one(conn: Any, fields: dict[str, str]) -> None:
     op = fields.get("operation")
     text_only = _parse_bool_field(fields.get("text_only"), default=True)
+    skip_kg = _parse_bool_field(fields.get("skip_kg"), default=True)
     if op == "assignment.generate":
         from rag_mvp.assignment_gen import generate_assignment
         import json as _json
@@ -105,13 +107,15 @@ def _process_one(conn: Any, fields: dict[str, str]) -> None:
     if not material_id:
         raise ValueError("missing material_id")
     if op == "parse_and_index":
-        process_parse_and_index(conn, material_id, text_only=text_only)
+        process_parse_and_index(conn, material_id, text_only=text_only, skip_kg=skip_kg)
     elif op == "index_only":
-        process_index_only(conn, material_id, text_only=text_only)
+        process_index_only(conn, material_id, text_only=text_only, skip_kg=skip_kg)
     elif op == "delete_material":
         process_delete_material(conn, material_id)
     elif op == "repair_preview":
         process_repair_preview(conn, material_id)
+    elif op == "convert_preview":
+        process_convert_preview(conn, material_id, text_only=text_only, skip_kg=skip_kg)
     else:
         raise ValueError(f"unknown operation: {op!r}")
 

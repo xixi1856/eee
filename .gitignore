@@ -36,3 +36,4 @@ scripts/truncate_except_prisma.sql
 AGENTS.md
 .gitignore
 test.py
+.env(1)

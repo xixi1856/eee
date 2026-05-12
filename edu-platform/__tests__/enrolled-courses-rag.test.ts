@@ -46,6 +46,16 @@ describe("GET /api/v1/internal/enrolled-courses-rag", () => {
     findManyCoursesMock.mockResolvedValue([]);
   });
 
+  it("returns empty course_ids when resolved id is not a platform UUID", async () => {
+    const u = new URL("http://localhost/api");
+    u.searchParams.set("user_id", "default");
+    const res = await GET(req(u.toString(), "k".repeat(20)));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { course_ids: string[] };
+    expect(body.course_ids).toEqual([]);
+    expect(findFirstUserMock).not.toHaveBeenCalled();
+  });
+
   it("returns 401 when key invalid", async () => {
     const u = new URL("http://localhost/api");
     u.searchParams.set("user_id", "u1");
@@ -55,7 +65,7 @@ describe("GET /api/v1/internal/enrolled-courses-rag", () => {
 
   it("returns course_ids for student enrollments", async () => {
     const u = new URL("http://localhost/api");
-    u.searchParams.set("user_id", "student-platform-uuid");
+    u.searchParams.set("user_id", "550e8400-e29b-41d4-a716-446655440001");
     const res = await GET(req(u.toString(), "k".repeat(20)));
     expect(res.status).toBe(200);
     const body = (await res.json()) as { course_ids: string[] };

@@ -113,6 +113,7 @@ export async function uploadMaterialStream(params: {
   body: ReadableStream<Uint8Array> | Readable;
   lessonId?: string | null;
   textOnly?: boolean;
+  skipKg?: boolean;
 }): Promise<MaterialCreatedDto> {
   try {
     getMinioConfig();
@@ -214,13 +215,25 @@ export async function uploadMaterialStream(params: {
     );
   }
 
-  const task: RagQueueTask = {
-    task_id: randomUUID(),
-    material_id: materialId,
-    operation: "parse_and_index",
-    created_at: new Date().toISOString(),
-    text_only: params.textOnly ?? true,
-  };
+  const textOnly = params.textOnly ?? true;
+  const skipKg = params.skipKg ?? true;
+  const task: RagQueueTask = isOfficeMaterialFileType(fileType)
+    ? {
+        task_id: randomUUID(),
+        material_id: materialId,
+        operation: "convert_preview",
+        created_at: new Date().toISOString(),
+        text_only: textOnly,
+        skip_kg: skipKg,
+      }
+    : {
+        task_id: randomUUID(),
+        material_id: materialId,
+        operation: "parse_and_index",
+        created_at: new Date().toISOString(),
+        text_only: textOnly,
+        skip_kg: skipKg,
+      };
   await enqueueRagTaskWithRetry(task);
 
   return {
@@ -293,6 +306,7 @@ export async function retryMaterialIndex(
   courseId: string,
   materialId: string,
   textOnly?: boolean,
+  skipKg?: boolean,
 ): Promise<void> {
   assertUuid(materialId, "material_id");
   assertUuid(courseId, "course_id");
@@ -324,6 +338,7 @@ export async function retryMaterialIndex(
     operation: "index_only",
     created_at: new Date().toISOString(),
     text_only: textOnly ?? true,
+    skip_kg: skipKg ?? true,
   };
   await enqueueRagTaskWithRetry(task);
 }
@@ -520,6 +535,36 @@ export async function openMaterialContentStream(
   if (isOfficeMaterialFileType(ft)) {
     const ps = m.previewPdfStatus;
     if (ps !== MaterialPreviewPdfStatus.READY) {
+      // Self-heal stale state: preview object may already exist while DB still says PENDING/FAILED.
+      try {
+        const preview = await readOfficePreviewStreamWithFallback(m);
+        await prisma.material.updateMany({
+          where: {
+            id: m.id,
+            isDeleted: false,
+            previewPdfStatus: {
+              in: [
+                MaterialPreviewPdfStatus.PENDING,
+                MaterialPreviewPdfStatus.FAILED,
+              ],
+            },
+          },
+          data: {
+            previewPdfStatus: MaterialPreviewPdfStatus.READY,
+            statusMessage: null,
+          },
+        });
+        return {
+          body: preview.body,
+          contentType: preview.contentType || "application/pdf",
+          contentDisposition: "inline",
+        };
+      } catch (e) {
+        if (!(e instanceof ApiError) || e.code !== "PREVIEW_NOT_READY") {
+          throw e;
+        }
+      }
+
       let repairQueued = false;
       let repairQueueError: string | undefined;
       if (ps === MaterialPreviewPdfStatus.FAILED) {

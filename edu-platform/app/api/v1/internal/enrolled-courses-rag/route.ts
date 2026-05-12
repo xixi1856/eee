@@ -2,6 +2,7 @@ import type { NextRequest } from "next/server";
 import { jsonOk, jsonError } from "@/lib/http/json-response";
 import { ApiError } from "@/lib/http/api-error";
 import { getInternalApiKeyOrNull } from "@/lib/config";
+import { isUuid } from "@/lib/course-access";
 import { resolvePlatformUserFromAgentQuery } from "@/lib/internal-agent-user";
 import { listCourseIdsForRag } from "@/lib/course-rag-courses";
 import { prisma } from "@/lib/db";
@@ -31,6 +32,9 @@ export async function GET(req: NextRequest) {
       throw new ApiError(400, "VALIDATION_ERROR", "user_id is required");
     }
     const platformUserId = await resolvePlatformUserFromAgentQuery(userId);
+    if (!isUuid(platformUserId)) {
+      return jsonOk({ course_ids: [] as string[] });
+    }
     const user = await prisma.user.findFirst({
       where: { id: platformUserId, isActive: true },
       select: { role: true },

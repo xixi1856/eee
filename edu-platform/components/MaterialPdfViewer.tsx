@@ -1,14 +1,34 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type MutableRefObject,
+  type Ref,
+} from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { Loader2, AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
+
+function assignRef<T>(ref: Ref<T> | undefined, value: T | null) {
+  if (!ref) return;
+  if (typeof ref === "function") {
+    ref(value);
+  } else {
+    (ref as MutableRefObject<T | null>).current = value;
+  }
+}
 
 type Props = {
   materialId: string;
   downloadHref: string;
   downloadName: string;
+  /** Scroll container used for viewport screenshots (same node as PDF page canvases). */
+  scrollCaptureRef?: Ref<HTMLDivElement | null>;
+  /** Fires when loading finishes (success or error); viewport may still be empty briefly on success. */
+  onViewportCaptureReady?: (ready: boolean) => void;
 };
 
 /**
@@ -18,11 +38,25 @@ export default function MaterialPdfViewer({
   materialId,
   downloadHref,
   downloadName,
+  scrollCaptureRef,
+  onViewportCaptureReady,
 }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const docRef = useRef<PDFDocumentProxy | null>(null);
+
+  const setScrollContainerNode = useCallback(
+    (node: HTMLDivElement | null) => {
+      containerRef.current = node;
+      assignRef(scrollCaptureRef, node);
+    },
+    [scrollCaptureRef],
+  );
+
+  useEffect(() => {
+    onViewportCaptureReady?.(!loading && !error);
+  }, [loading, error, onViewportCaptureReady]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -84,6 +118,8 @@ export default function MaterialPdfViewer({
           if (!cancelled) setError(msg);
           return;
         }
+
+        if (!cancelled) setError(null);
 
         const buf = await res.arrayBuffer();
         const task = pdfjs.getDocument({ data: buf });
@@ -154,7 +190,7 @@ export default function MaterialPdfViewer({
         </div>
       )}
       <div
-        ref={containerRef}
+        ref={setScrollContainerNode}
         className="flex-1 min-h-0 overflow-auto px-2 py-2 bg-muted/15"
       />
     </div>

@@ -19,15 +19,20 @@ to the same MinIO download → parse → ingest path as the initial job.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
 import subprocess
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import boto3
+import redis
 from botocore.config import Config as BotocoreConfig
 from botocore.exceptions import ClientError
 import psycopg
@@ -81,6 +86,7 @@ async def _ingest_parsed_material_worker_async(
     local_file: Path,
     original_filename: str | None,
     text_only: bool,
+    skip_kg: bool,
 ) -> int:
     """Ingest + same cache invalidation as ``ingest_parsed_material_into_course_sync``."""
     try:
@@ -90,6 +96,7 @@ async def _ingest_parsed_material_worker_async(
             local_file,
             original_filename=original_filename,
             text_only=text_only,
+            skip_entity_extraction=skip_kg,
         )
     finally:
         _invalidate_course_rag_cache_for(course_id)
@@ -116,6 +123,7 @@ def _ingest_parsed_dispatch(
     local_file: Path,
     original_filename: str | None,
     text_only: bool,
+    skip_kg: bool,
 ) -> int:
     if is_worker_async_loop_started():
         return run_worker_coroutine(
@@ -125,6 +133,7 @@ def _ingest_parsed_dispatch(
                 local_file,
                 original_filename,
                 text_only,
+                skip_kg,
             ),
             timeout=None,
         )
@@ -134,6 +143,7 @@ def _ingest_parsed_dispatch(
         local_file,
         original_filename=original_filename,
         text_only=text_only,
+        skip_entity_extraction=skip_kg,
     )
 
 
@@ -157,7 +167,79 @@ def _material_stale_seconds() -> int:
     return int(os.environ.get("RAG_MATERIAL_STALE_SEC", "1800"))
 
 
+def _rag_task_stream_name() -> str:
+    return os.environ.get("RAG_TASK_STREAM_NAME", "edu:rag:tasks:stream").strip()
+
+
+def _enqueue_parse_and_index_task(
+    material_id: str, *, text_only: bool, skip_kg: bool = True
+) -> None:
+    """Chain Phase 2 after Office preview PDF is ready (same Redis Stream as Next.js)."""
+    redis_url = os.environ.get("REDIS_URL", "").strip()
+    if not redis_url:
+        raise RuntimeError("REDIS_URL is not set; cannot enqueue parse_and_index")
+    r = redis.from_url(redis_url, decode_responses=True)
+    r.xadd(
+        _rag_task_stream_name(),
+        {
+            "task_id": str(uuid4()),
+            "material_id": material_id,
+            "operation": "parse_and_index",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "text_only": "true" if text_only else "false",
+            "skip_kg": "true" if skip_kg else "false",
+        },
+    )
+
+
+def _enqueue_convert_preview_task(
+    material_id: str, *, text_only: bool, skip_kg: bool = True
+) -> None:
+    """Re-queue Phase 1 (e.g. compat for in-flight ``parse_and_index`` before Phase D)."""
+    redis_url = os.environ.get("REDIS_URL", "").strip()
+    if not redis_url:
+        raise RuntimeError("REDIS_URL is not set; cannot enqueue convert_preview")
+    r = redis.from_url(redis_url, decode_responses=True)
+    r.xadd(
+        _rag_task_stream_name(),
+        {
+            "task_id": str(uuid4()),
+            "material_id": material_id,
+            "operation": "convert_preview",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "text_only": "true" if text_only else "false",
+            "skip_kg": "true" if skip_kg else "false",
+        },
+    )
+
+
+def _maybe_enqueue_convert_preview_for_stuck_office(
+    conn: psycopg.Connection, material_id: str, *, text_only: bool, skip_kg: bool = True
+) -> None:
+    """If ``parse_and_index`` cannot claim because Phase D blocks office+PENDING, re-queue Phase 1."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT LOWER(file_type::text), status::text, preview_pdf_status::text
+            FROM materials WHERE id = %s::uuid AND is_deleted = false
+            """,
+            (material_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return
+    ft, st, prev = row[0], row[1], row[2]
+    if ft not in _OFFICE_FT_LOWER or st != "UPLOADED" or prev != "PENDING":
+        return
+    logger.warning(
+        "parse_and_index: material {} is office+PENDING; enqueue convert_preview (compat)",
+        material_id,
+    )
+    _enqueue_convert_preview_task(material_id, text_only=text_only, skip_kg=skip_kg)
+
+
 _OFFICE_SUFFIXES = frozenset({".ppt", ".pptx", ".doc", ".docx"})
+_OFFICE_FT_LOWER = frozenset({"ppt", "pptx", "doc", "docx"})
 
 
 def _convert_to_pdf(local_file: Path, out_dir: Path) -> Path:
@@ -383,6 +465,35 @@ def _claim_material_for_preview_repair(
     return None
 
 
+def _try_claim_convert_preview_row(
+    conn: psycopg.Connection, material_id: str
+) -> tuple[str, str | None] | None:
+    """Lock UPLOADED + office + PENDING for Phase-1 conversion (SKIP LOCKED)."""
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE materials m
+                SET updated_at = NOW()
+                FROM (
+                    SELECT id FROM materials
+                    WHERE id = %s::uuid AND is_deleted = false
+                      AND status = 'UPLOADED'
+                      AND LOWER(file_type) IN ('ppt', 'pptx', 'doc', 'docx')
+                      AND preview_pdf_status = 'PENDING'
+                    FOR UPDATE SKIP LOCKED
+                ) s
+                WHERE m.id = s.id
+                RETURNING m.minio_path::text, m.original_filename
+                """,
+                (material_id,),
+            )
+            row = cur.fetchone()
+            if row:
+                return (str(row[0]), row[1])
+    return None
+
+
 def _claim_material_for_parse(
     conn: psycopg.Connection, material_id: str
 ) -> dict[str, Any] | None:
@@ -398,6 +509,10 @@ def _claim_material_for_parse(
                 FROM (
                     SELECT id FROM materials
                     WHERE id = %s::uuid AND is_deleted = false
+                      AND NOT (
+                        LOWER(file_type) IN ('ppt', 'pptx', 'doc', 'docx')
+                        AND preview_pdf_status = 'PENDING'
+                      )
                       AND (
                         status = 'UPLOADED'
                         OR (
@@ -446,6 +561,76 @@ def _claim_material_for_parse(
     return None
 
 
+def _upload_material_images_to_minio(
+    material_id: str,
+    local_file: Path,
+    conn: psycopg.Connection,
+) -> None:
+    """Upload all images extracted by MinerU to MinIO and record in material_images table.
+
+    This always runs regardless of text_only flag — images are stored for traceability
+    even when multimodal embedding is disabled.
+    """
+    stem = local_file.stem
+    scan_dir = settings.output_dir / stem
+    if not scan_dir.exists():
+        return
+
+    client = _s3_client()
+    bucket = _bucket()
+    endpoint = os.environ.get("MINIO_ENDPOINT", "").strip()
+    if not endpoint.startswith("http"):
+        use_ssl = os.environ.get("MINIO_USE_SSL", "true").lower() == "true"
+        endpoint = ("https://" if use_ssl else "http://") + endpoint
+
+    uploaded: list[tuple[int, str]] = []  # (page_idx, minio_url)
+
+    for json_path in scan_dir.rglob("*_content_list.json"):
+        if "_content_list_v2" in json_path.name:
+            continue
+        try:
+            raw: list = json.loads(json_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for item in raw:
+            if item.get("type") != "image":
+                continue
+            rel = item.get("img_path", "")
+            if not rel:
+                continue
+            img_abs = (json_path.parent / rel).resolve()
+            if not img_abs.exists():
+                continue
+            page_idx = int(item.get("page_idx", 0))
+            # Use SHA1 of file content as part of key for deduplication
+            sha = hashlib.sha1(img_abs.read_bytes()).hexdigest()[:12]
+            suffix = img_abs.suffix.lower() or ".jpg"
+            minio_key = f"edu-images/{material_id}/p{page_idx:04d}_{sha}{suffix}"
+            try:
+                client.upload_file(str(img_abs), bucket, minio_key)
+            except Exception as exc:
+                logger.warning("Failed to upload image {} for material {}: {}", img_abs.name, material_id, exc)
+                continue
+            url = f"{endpoint}/{bucket}/{minio_key}"
+            uploaded.append((page_idx, url))
+
+    if not uploaded:
+        logger.debug("No images found to upload for material {}", material_id)
+        return
+
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO material_images (id, material_id, page_idx, minio_url, created_at)
+                VALUES (gen_random_uuid(), %s::uuid, %s, %s, NOW())
+                ON CONFLICT DO NOTHING
+                """,
+                [(material_id, pg, url) for pg, url in uploaded],
+            )
+    logger.info("Uploaded {} images to MinIO for material {}", len(uploaded), material_id)
+
+
 def _run_material_download_parse_and_ingest(
     conn: psycopg.Connection,
     material_id: str,
@@ -454,6 +639,7 @@ def _run_material_download_parse_and_ingest(
     file_type: str,
     original_filename: str | None,
     text_only: bool,
+    skip_kg: bool,
 ) -> None:
     """MinIO → parse → LightRAG. Row must already be ``PARSING``."""
     work_parent = Path(tempfile.mkdtemp(prefix="edu_mat_"))
@@ -467,29 +653,49 @@ def _run_material_download_parse_and_ingest(
         if ft == "image":
             raise ValueError("Image indexing is not supported for course materials in this phase")
 
-        # Convert Office → PDF for MinerU and upload ``preview.pdf`` (original ``minio_path`` unchanged).
+        preview_key = _preview_pdf_minio_key(minio_path)
+        # Convert Office → PDF for MinerU and upload ``preview.pdf`` (or reuse existing preview).
         if local_file.suffix.lower() in _OFFICE_SUFFIXES:
-            logger.info(
-                "Converting {} to PDF via LibreOffice (material {})",
-                local_file.suffix,
-                material_id,
-            )
-            try:
-                pdf_file = _convert_to_pdf(local_file, work_parent / "pdf_out")
-                preview_key = _preview_pdf_minio_key(minio_path)
-                _upload_preview_pdf_with_verify(pdf_file, preview_key)
+            if _object_exists(preview_key):
+                logger.info(
+                    "Reusing existing preview PDF for material {} ({})",
+                    material_id,
+                    preview_key,
+                )
+                pdf_file = work_parent / f"{material_id}.pdf"
+                download_object_to_path(preview_key, pdf_file)
+                # Reconcile stale DB state: preview object exists, so preview is READY.
                 with conn.transaction():
                     update_material_preview_pdf_status(conn, material_id, "READY")
-            except Exception:
-                with conn.transaction():
-                    update_material_preview_pdf_status(conn, material_id, "FAILED")
-                raise
-            local_file = pdf_file
-            ft = "pdf"
-            logger.info("Conversion done → {} (preview at {})", pdf_file.name, preview_key)
+                local_file = pdf_file
+                ft = "pdf"
+            else:
+                logger.info(
+                    "Converting {} to PDF via LibreOffice (material {})",
+                    local_file.suffix,
+                    material_id,
+                )
+                try:
+                    pdf_file = _convert_to_pdf(local_file, work_parent / "pdf_out")
+                    _upload_preview_pdf_with_verify(pdf_file, preview_key)
+                    with conn.transaction():
+                        update_material_preview_pdf_status(conn, material_id, "READY")
+                except Exception:
+                    with conn.transaction():
+                        update_material_preview_pdf_status(conn, material_id, "FAILED")
+                    raise
+                local_file = pdf_file
+                ft = "pdf"
+                logger.info("Conversion done → {} (preview at {})", pdf_file.name, preview_key)
 
         # Same parse stack as CLI `rag parse` (engine.parse_file), or worker persistent loop.
         _parse_file_dispatch(local_file)
+
+        # Upload extracted images to MinIO (always — regardless of text_only flag)
+        try:
+            _upload_material_images_to_minio(material_id, local_file, conn)
+        except Exception as img_exc:
+            logger.warning("Image upload failed for material {} (non-fatal): {}", material_id, img_exc)
 
         with conn.transaction():
             update_material_status(
@@ -508,6 +714,7 @@ def _run_material_download_parse_and_ingest(
             local_file,
             str(original_filename) if original_filename else None,
             text_only,
+            skip_kg,
         )
 
         with conn.transaction():
@@ -544,15 +751,144 @@ def _run_material_download_parse_and_ingest(
         shutil.rmtree(work_parent, ignore_errors=True)
 
 
+def process_convert_preview(
+    conn: psycopg.Connection,
+    material_id: str,
+    *,
+    text_only: bool = True,
+    skip_kg: bool = True,
+) -> None:
+    """Phase 1 for Office uploads: LibreOffice → ``preview.pdf`` → READY; then ``parse_and_index``."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT LOWER(file_type::text), status::text, preview_pdf_status::text, minio_path::text
+            FROM materials WHERE id = %s::uuid AND is_deleted = false
+            """,
+            (material_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        logger.error("convert_preview: material {} not found", material_id)
+        return
+    ft_lower, status, preview_st, minio_path = row[0], row[1], row[2], row[3]
+
+    if ft_lower not in _OFFICE_FT_LOWER:
+        logger.info(
+            "convert_preview: material {} is not office ({}); enqueue parse_and_index only",
+            material_id,
+            ft_lower,
+        )
+        try:
+            _enqueue_parse_and_index_task(material_id, text_only=text_only, skip_kg=skip_kg)
+        except Exception:
+            logger.exception(
+                "convert_preview: parse_and_index enqueue failed for non-office material {}",
+                material_id,
+            )
+            raise
+        return
+
+    preview_key = _preview_pdf_minio_key(minio_path)
+
+    if status == "UPLOADED" and preview_st == "READY":
+        if _object_exists(preview_key):
+            logger.info(
+                "convert_preview: material {} already READY; chain parse_and_index",
+                material_id,
+            )
+            try:
+                _enqueue_parse_and_index_task(material_id, text_only=text_only, skip_kg=skip_kg)
+            except Exception:
+                logger.exception(
+                    "convert_preview: chain parse_and_index enqueue failed for material {}",
+                    material_id,
+                )
+                raise
+            return
+        with conn.transaction():
+            update_material_preview_pdf_status(
+                conn,
+                material_id,
+                "PENDING",
+                "PREVIEW_OBJECT_MISSING_REBUILD",
+            )
+        preview_st = "PENDING"
+
+    if status != "UPLOADED":
+        logger.info(
+            "convert_preview: skip material {} (status={}, preview={})",
+            material_id,
+            status,
+            preview_st,
+        )
+        return
+
+    if preview_st != "PENDING":
+        logger.info(
+            "convert_preview: skip material {} (preview_pdf_status={})",
+            material_id,
+            preview_st,
+        )
+        return
+
+    claimed = _try_claim_convert_preview_row(conn, material_id)
+    if not claimed:
+        logger.info(
+            "convert_preview: material {} not claimed (locked or other worker)",
+            material_id,
+        )
+        return
+    minio_path_claimed, original_filename = claimed
+    work_parent = Path(tempfile.mkdtemp(prefix="edu_cvprev_"))
+    suffix = Path(minio_path_claimed).suffix or ".bin"
+    local_file = work_parent / f"{material_id}{suffix}"
+    try:
+        download_object_to_path(minio_path_claimed, local_file)
+        pdf_file = _convert_to_pdf(local_file, work_parent / "pdf_out")
+        _upload_preview_pdf_with_verify(pdf_file, preview_key)
+        with conn.transaction():
+            update_material_preview_pdf_status(conn, material_id, "READY")
+        try:
+            _enqueue_parse_and_index_task(material_id, text_only=text_only, skip_kg=skip_kg)
+        except Exception:
+            logger.exception(
+                "convert_preview: chain parse_and_index enqueue failed for material {}",
+                material_id,
+            )
+            raise
+        logger.success(
+            "convert_preview: material {} preview ready; parse_and_index queued",
+            material_id,
+        )
+    except Exception as exc:
+        logger.exception("convert_preview failed for material {}", material_id)
+        msg = str(exc)[:2000]
+        with conn.transaction():
+            update_material_preview_pdf_status(
+                conn,
+                material_id,
+                "FAILED",
+                f"CONVERT_PREVIEW: {msg[:1800]}",
+            )
+            update_material_status(conn, material_id, "FAILED", msg)
+    finally:
+        shutil.rmtree(work_parent, ignore_errors=True)
+
+
 def process_parse_and_index(
     conn: psycopg.Connection,
     material_id: str,
     *,
     text_only: bool = True,
+    skip_kg: bool = True,
 ) -> None:
     """DB is source of truth; parse via engine.parse_file; ingest via LightRAG insert only."""
     claimed = _claim_material_for_parse(conn, material_id)
     if not claimed:
+        _maybe_enqueue_convert_preview_for_stuck_office(
+            conn, material_id, text_only=text_only, skip_kg=skip_kg
+        )
         return
 
     _run_material_download_parse_and_ingest(
@@ -563,6 +899,7 @@ def process_parse_and_index(
         claimed["file_type"],
         claimed.get("original_filename"),
         text_only,
+        skip_kg,
     )
 
 
@@ -571,6 +908,7 @@ def process_index_only(
     material_id: str,
     *,
     text_only: bool = True,
+    skip_kg: bool = True,
 ) -> None:
     """Re-ingest from local parse cache, or full MinIO→parse→ingest if cache is missing."""
     claimed = _claim_material_for_index_retry(conn, material_id)
@@ -618,6 +956,7 @@ def process_index_only(
             file_type,
             str(original_filename) if original_filename else None,
             text_only,
+            skip_kg,
         )
         return
 
@@ -630,6 +969,7 @@ def process_index_only(
             source_placeholder,
             str(original_filename) if original_filename else None,
             text_only,
+            skip_kg,
         )
         with conn.transaction():
             ok = update_material_status(

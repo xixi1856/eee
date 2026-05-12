@@ -6,8 +6,12 @@ import { ApiError } from "@/lib/http/api-error";
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+export function isUuid(id: string): boolean {
+  return UUID_RE.test(id);
+}
+
 export function assertUuid(id: string, label = "id"): void {
-  if (!UUID_RE.test(id)) {
+  if (!isUuid(id)) {
     throw new ApiError(400, "VALIDATION_ERROR", `Invalid ${label}`);
   }
 }

@@ -65,8 +65,9 @@ export function AppSidebar() {
   const pathname = usePathname();
   const router = useRouter();
   const { resolvedTheme, setTheme } = useTheme();
-  const { state } = useSidebar();
-  const isCollapsed = state === "collapsed";
+  const { state, isMobile } = useSidebar();
+  /** Desktop icon rail only; mobile sheet always uses expanded header chrome */
+  const isCollapsed = state === "collapsed" && !isMobile;
   const [user, setUser] = useState<UserInfo | null>(null);
   const [loggingOut, setLoggingOut] = useState(false);
 
@@ -97,22 +98,43 @@ export function AppSidebar() {
     <Sidebar collapsible="icon" className="border-r border-sidebar-border">
       {/* Header */}
       <SidebarHeader className="py-4 px-3">
-        <div className="flex items-center gap-2.5">
-          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-sm">
-            <GraduationCap size={16} />
+        {isCollapsed ? (
+          <div className="flex justify-center">
+            <div className="group/brand relative flex size-8 shrink-0 items-center justify-center">
+              <SidebarTrigger
+                title="展开侧边栏"
+                className={cn(
+                  "absolute inset-0 z-0 size-8 shrink-0 rounded-md text-muted-foreground hover:bg-sidebar-accent hover:text-foreground",
+                  "opacity-0 transition-opacity",
+                  "group-hover/brand:opacity-100 group-focus-within/brand:opacity-100"
+                )}
+              />
+              <div
+                className={cn(
+                  "pointer-events-none relative z-10 flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-sm transition-opacity",
+                  "group-hover/brand:opacity-0 group-focus-within/brand:opacity-0"
+                )}
+              >
+                <GraduationCap size={16} />
+              </div>
+            </div>
           </div>
-          {!isCollapsed && (
+        ) : (
+          <div className="flex items-center gap-2.5">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-sm">
+              <GraduationCap size={16} />
+            </div>
             <div className="flex flex-col leading-none">
               <span className="font-display text-sm font-semibold tracking-tight text-sidebar-foreground">
                 EduAgent
               </span>
               <span className="text-[10px] text-muted-foreground">Campus</span>
             </div>
-          )}
-          <div className="ml-auto">
-            <SidebarTrigger className="h-6 w-6 text-muted-foreground hover:text-foreground" />
+            <div className="ml-auto">
+              <SidebarTrigger className="h-6 w-6 text-muted-foreground hover:text-foreground" />
+            </div>
           </div>
-        </div>
+        )}
       </SidebarHeader>
 
       {/* Navigation */}

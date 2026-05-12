@@ -65,6 +65,10 @@ class SkillEntry(NamedTuple):
     platforms: list[str]        # allowed platforms (windows/linux/darwin)
     scripts: list[Path]         # executable scripts under skill_dir/scripts/
     raw_meta: dict              # full parsed frontmatter (for future extensions)
+    # --- Agent-mode / orchestration fields ---
+    allowed_tools: list[str]    # tools this skill is permitted to invoke ([] = all)
+    handoffs: list[dict]        # [{target_skill, condition}] routing hints
+    agent_mode: str             # "planner" | "executor" | "reviewer" | "fixer" | ""
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +208,12 @@ def load_skill_entries(skills_dir: str | Path = "skills") -> list[SkillEntry]:
             platforms = [platforms] if platforms else []
         if not _is_eligible(requires_env, platforms):
             continue
+        _allowed_tools = meta.get("allowed_tools", [])
+        if isinstance(_allowed_tools, str):
+            _allowed_tools = [_allowed_tools] if _allowed_tools else []
+        _handoffs = meta.get("handoffs", [])
+        if not isinstance(_handoffs, list):
+            _handoffs = []
         entries[name] = SkillEntry(
             name=name,
             description=str(meta.get("description", "")),
@@ -218,6 +228,9 @@ def load_skill_entries(skills_dir: str | Path = "skills") -> list[SkillEntry]:
             platforms=platforms,
             scripts=[],
             raw_meta=meta,
+            allowed_tools=_allowed_tools,
+            handoffs=_handoffs,
+            agent_mode=str(meta.get("agent_mode", "")),
         )
 
     # --- Tier 2: directory-based skills ({name}/SKILL.md) ---
@@ -245,6 +258,12 @@ def load_skill_entries(skills_dir: str | Path = "skills") -> list[SkillEntry]:
         # Discover scripts/*.py under the skill directory
         scripts_dir = skill_md.parent / "scripts"
         scripts = sorted(scripts_dir.glob("*.py")) if scripts_dir.is_dir() else []
+        _allowed_tools2 = meta.get("allowed_tools", [])
+        if isinstance(_allowed_tools2, str):
+            _allowed_tools2 = [_allowed_tools2] if _allowed_tools2 else []
+        _handoffs2 = meta.get("handoffs", [])
+        if not isinstance(_handoffs2, list):
+            _handoffs2 = []
         entries[name] = SkillEntry(
             name=name,
             description=str(meta.get("description", "")),
@@ -259,6 +278,9 @@ def load_skill_entries(skills_dir: str | Path = "skills") -> list[SkillEntry]:
             platforms=platforms,
             scripts=scripts,
             raw_meta=meta,
+            allowed_tools=_allowed_tools2,
+            handoffs=_handoffs2,
+            agent_mode=str(meta.get("agent_mode", "")),
         )
 
     # Sort: always_inject first (EDUCATOR at top), then alpha

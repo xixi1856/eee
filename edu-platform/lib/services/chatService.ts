@@ -14,6 +14,17 @@ export type B3SseEvent =
       source_label?: string;
     }
   | {
+      type: "tool_call";
+      name: string;
+      tool_call_id?: string;
+    }
+  | {
+      type: "tool_result";
+      name: string;
+      success?: boolean;
+      duration_ms?: number;
+    }
+  | {
       type: "done";
       tokens?: number | null;
       exec_time_ms?: number | null;
@@ -48,6 +59,39 @@ function citationsFromB3(b3: Record<string, unknown>): B3SseEvent[] {
     });
   }
   return out;
+}
+
+function toolCallEventFromAgentFrame(
+  frame: Record<string, unknown>,
+): Extract<B3SseEvent, { type: "tool_call" }> | null {
+  const eduMeta = frame.edu_meta as Record<string, unknown> | undefined;
+  if (eduMeta?.content_type !== "tool_call") return null;
+  const choices = frame.choices as Record<string, unknown>[] | undefined;
+  const ch0 = choices?.[0] as Record<string, unknown> | undefined;
+  const delta = ch0?.delta as Record<string, unknown> | undefined;
+  const toolCalls = delta?.tool_calls as unknown[] | undefined;
+  const first = toolCalls?.[0] as Record<string, unknown> | undefined;
+  const fn = first?.function as Record<string, unknown> | undefined;
+  const name = typeof fn?.name === "string" ? fn.name.trim() : "";
+  if (!name) return null;
+  const tool_call_id = typeof first?.id === "string" ? first.id : undefined;
+  return { type: "tool_call", name, tool_call_id };
+}
+
+function toolResultEventFromAgentFrame(
+  frame: Record<string, unknown>,
+): Extract<B3SseEvent, { type: "tool_result" }> | null {
+  const eduMeta = frame.edu_meta as Record<string, unknown> | undefined;
+  if (eduMeta?.content_type !== "tool_result") return null;
+  const b3 = eduMeta.b3 as Record<string, unknown> | undefined;
+  if (!b3 || typeof b3 !== "object") return null;
+  const name = typeof b3.tool_name === "string" ? b3.tool_name.trim() : "";
+  if (!name) return null;
+  const success = typeof b3.success === "boolean" ? b3.success : undefined;
+  const ds = b3.duration_s;
+  const duration_ms =
+    typeof ds === "number" && Number.isFinite(ds) ? Math.round(ds * 1000) : undefined;
+  return { type: "tool_result", name, success, duration_ms };
 }
 
 export async function getOrCreateCourseChatSession(
@@ -196,6 +240,10 @@ export function createB3SseTransformFromAgent(
           fullAnswer += content;
           controller.enqueue(sseDataLine({ type: "text", content }));
         }
+        const tcEv = toolCallEventFromAgentFrame(frame);
+        if (tcEv) controller.enqueue(sseDataLine(tcEv));
+        const trEv = toolResultEventFromAgentFrame(frame);
+        if (trEv) controller.enqueue(sseDataLine(trEv));
         const eduMeta = frame.edu_meta as Record<string, unknown> | undefined;
         const b3 = eduMeta?.b3 as Record<string, unknown> | undefined;
         if (b3 && typeof b3 === "object") {

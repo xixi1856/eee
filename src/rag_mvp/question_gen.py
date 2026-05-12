@@ -293,6 +293,17 @@ _SYSTEM_PROMPT = """\
 5. 填空题答案应简短（1-5 个词或短语）
 6. 简答题答案应完整但简洁（3-8 句话）
 7. explanation 字段需引用原文中的相关句子作为佐证
+8. 严禁在题目中引用文档结构信息：不得提及 ★ 符号、大纲、目录、章节列表、学习目标列表等
+9. 严禁出现依赖不可见资源的表述：不得使用"如图所示"、"见下表"、"原文末尾提供的"、"附图"等措辞
+10. 题目必须考查实质知识点，而非文档的组织形式或编写结构
+11. 题干须自洽：考生只读题干与选项即可理解题意并完成作答，不得依赖「原文」「上文」「该材料」「本课讲义」等指向材料本身的笼统指代
+12. 若题干需要背景事实，请用一至三句简短陈述直接写入题干（条件、数据、场景），禁止使用「如下图」「见上文」「材料所述」等未把信息说清楚的指代
+"""
+
+_DEIXIS_RETRY_USER_APPEND = """
+【重要：上一版题干不合规，请重新输出整份 JSON】
+上一版可能含有：指代原文/材料/图/表而未给出具体信息，或依赖不可见排版。
+请重写：题干必须自洽，把所需关键事实直接写进题干；仍遵守系统规则中的题型与 JSON 格式要求。
 """
 
 _OBJECTIVE_INSTRUCTIONS: dict[str, str] = {
@@ -324,9 +335,62 @@ _SCENARIO_SYSTEM_PROMPT = """\
 你是一位经验丰富的教学设计专家。
 根据提供的原文内容和核心知识点，请生成一段用于出题的背景情境或多知识点关联分析。要求：
 1. 内容必须来源于原文，不得引入原文未提及的知识
-2. 情境描述应贴近真实场景，语言简洁，150-250字
-3. 直接输出情境描述文本，不要添加任何格式标记或 JSON
+2. 情境必须是真实世界的工程、应用或生活场景（如系统故障排查、网络调试、软件开发决策等）
+3. 严禁生成教学管理场景（如"教师编制大纲"、"学生填写学习目标"、"课程设计"等）
+4. 若核心知识点属于教学管理术语（如"学习目标"、"课程大纲"、"教学目标"、"课时安排"），则拒绝生成，直接返回空字符串
+5. 情境描述应语言简洁，150-250字
+6. 直接输出情境描述文本，不要添加任何格式标记或 JSON
 """
+
+# ---------------------------------------------------------------------------
+# Meta-question filter
+# ---------------------------------------------------------------------------
+
+_META_QUESTION_PATTERN = re.compile(
+    r"如图[所示]?|图\s*\d+|下图|上图|附图|\[图\]"
+    r"|原文[末尾]*提供|文中提供|见[下上]?表|表\s*\d+"
+    r"|★|大纲.*列表|学习目标.*列表|课程大纲中|教学大纲"
+    r"|列表中.*作用|章节.*大纲",
+    re.IGNORECASE,
+)
+
+
+def _is_meta_question(text: str) -> bool:
+    """Return True if the question text references invisible resources or document structure."""
+    return bool(_META_QUESTION_PATTERN.search(text))
+
+
+async def _call_question_llm(
+    entity_name: str,
+    q_type: str,
+    user_prompt: str,
+    system_prompt: str,
+) -> dict[str, Any] | None:
+    """Single LLM round: return parsed question dict or None."""
+    try:
+        logger.debug("LLM prompt for '{}' ({}): {}...", entity_name, q_type, user_prompt[:2000])
+        raw = await llm_model_func(user_prompt, system_prompt=system_prompt)
+        logger.debug("LLM response for '{}': {}...", entity_name, raw[:1000])
+    except Exception as exc:
+        logger.warning(f"LLM call failed for '{entity_name}': {exc}")
+        return None
+
+    raw = re.sub(r"```(?:json)?", "", raw).strip()
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        logger.warning(f"No JSON found in response for '{entity_name}'")
+        return None
+
+    try:
+        parsed = json.loads(match.group())
+    except json.JSONDecodeError as exc:
+        logger.warning(f"JSON parse error for '{entity_name}': {exc}")
+        return None
+
+    if not parsed.get("question") or not parsed.get("answer"):
+        logger.warning(f"Incomplete question data for '{entity_name}', skipping")
+        return None
+    return parsed
 
 
 def _build_prompt(entity: str, context: str, q_type: str, objective: str = "knowledge") -> str:
@@ -341,6 +405,8 @@ def _build_prompt(entity: str, context: str, q_type: str, objective: str = "know
         f"- 核心知识点：{entity}\n"
         f"- 题目类型：{label}\n"
         f"- 考查方向：{OBJECTIVE_TYPES.get(objective, '')}\n"
+        f"- 题干必须自洽：禁止用「原文/上文/下图/见表/该材料」等指代而未给出具体信息；"
+        f"需要的事实请用简短陈述直接写在题干中\n"
     )
 
     if q_type == "single_choice":
@@ -428,41 +494,41 @@ async def _generate_one(
         enriched_context = context
 
     prompt = _build_prompt(entity_name, enriched_context, q_type, objective)
-    try:
-        raw = await llm_model_func(prompt, system_prompt=_SYSTEM_PROMPT)
-    except Exception as exc:
-        logger.warning(f"LLM call failed for '{entity_name}': {exc}")
+    parsed = await _call_question_llm(entity_name, q_type, prompt, _SYSTEM_PROMPT)
+    if parsed is None:
         return None
 
-    # Strip markdown code fences if present, then extract JSON object
-    raw = re.sub(r"```(?:json)?", "", raw).strip()
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not match:
-        logger.warning(f"No JSON found in response for '{entity_name}'")
-        return None
-
-    try:
-        parsed = json.loads(match.group())
-    except json.JSONDecodeError as exc:
-        logger.warning(f"JSON parse error for '{entity_name}': {exc}")
-        return None
-
-    # Validate required fields
-    if not parsed.get("question") or not parsed.get("answer"):
-        logger.warning(f"Incomplete question data for '{entity_name}', skipping")
-        return None
+    question_text = str(parsed.get("question", ""))
+    if _is_meta_question(question_text):
+        logger.warning(
+            "Meta-question pattern on first pass for '{}' ({}), retrying once: {}...",
+            entity_name, q_type, question_text[:120],
+        )
+        retry_prompt = prompt + _DEIXIS_RETRY_USER_APPEND
+        parsed = await _call_question_llm(entity_name, q_type, retry_prompt, _SYSTEM_PROMPT)
+        if parsed is None:
+            return None
+        question_text = str(parsed.get("question", ""))
+        if _is_meta_question(question_text):
+            logger.warning(
+                "Meta-question persists after retry for '{}': {}...",
+                entity_name, question_text[:100],
+            )
+            return None
 
     return {
         "id":               q_id,
         "type":             q_type,
         "objective":        objective,
         "entity":           entity_name,
+        "tags":             [entity_name],
         "importance_score": round(score, 2),
-        "question":         parsed.get("question", ""),
+        "question":         question_text,
         "options":          parsed.get("options", []),
         "answer":           parsed.get("answer", ""),
         "explanation":      parsed.get("explanation", ""),
         "source_chunk_ids": chunk_ids[:2],
+        "source_images":    [],
     }
 
 

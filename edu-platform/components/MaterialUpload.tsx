@@ -26,6 +26,7 @@ export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props
   const inputRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
   const [textOnly, setTextOnly] = useState(true);
+  const [skipKg, setSkipKg] = useState(true);
   const [pct, setPct] = useState(0);
   const [status, setStatus] = useState<"idle" | "success" | "error">("idle");
   const [msg, setMsg] = useState<string | null>(null);
@@ -51,6 +52,7 @@ export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props
         fd.set("file", file);
         if (lessonId) fd.set("lesson_id", lessonId);
         fd.set("text_only", textOnly ? "true" : "false");
+        fd.set("skip_kg", skipKg ? "true" : "false");
         const xhr = new XMLHttpRequest();
         await new Promise<void>((resolve, reject) => {
           xhr.open("POST", `/api/v1/courses/${courseId}/materials`);
@@ -100,6 +102,20 @@ export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props
       </label>
       <p className="text-[11px] text-muted-foreground px-1">
         开启后跳过 list、image、table、equation、chart、code 等多模态块。
+      </p>
+
+      <label className="flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-xs text-foreground">
+        <input
+          type="checkbox"
+          checked={skipKg}
+          disabled={busy}
+          onChange={(e) => setSkipKg(e.target.checked)}
+          className="h-3.5 w-3.5 accent-primary"
+        />
+        <span className="font-medium">关闭实体与关系提取（省 LLM，默认推荐）</span>
+      </label>
+      <p className="text-[11px] text-muted-foreground px-1">
+        开启后不做知识图谱抽取，只写入向量。多模态块（图、表、公式等）会先转成可检索文本再嵌入；关闭「仅文本」时仍不会走 RAG-Anything 的图谱入库。若需要完整多模态图谱与实体关系，请取消勾选。
       </p>
 
       {/* Drop zone */}

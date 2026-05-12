@@ -122,6 +122,39 @@ class Settings(BaseSettings):
     embedding_max_async: int = 2    # parallel embedding calls (lower for Ollama CPU / Windows + PG pool)
     max_parallel_insert: int = 1    # parallel document inserts (was 2; safer with asyncio.run)
 
+    # Surrogate multimodal ingest (skip_kg + non-text-only): optional VLM caption for images
+    ingest_surrogate_image_vlm: bool = Field(
+        default=False,
+        validation_alias="INGEST_SURROGATE_IMAGE_VLM",
+        description="If true, course surrogate-ingest calls vision on each image file to append a short summary before text embedding (extra latency/cost).",
+    )
+    ingest_surrogate_image_vlm_max_tokens: int = Field(
+        default=400,
+        validation_alias="INGEST_SURROGATE_IMAGE_VLM_MAX_TOKENS",
+        ge=32,
+        le=4096,
+    )
+    ingest_surrogate_image_vlm_max_concurrency: int = Field(
+        default=2,
+        validation_alias="INGEST_SURROGATE_IMAGE_VLM_MAX_CONCURRENCY",
+        ge=1,
+        le=16,
+    )
+    ingest_surrogate_image_vlm_max_bytes: int = Field(
+        default=4_000_000,
+        validation_alias="INGEST_SURROGATE_IMAGE_VLM_MAX_BYTES",
+        ge=50_000,
+        description="Skip VLM if image file is larger than this (bytes); avoids huge reads.",
+    )
+    ingest_surrogate_image_vlm_system_prompt: str = Field(
+        default="你是文档检索助手。用户会上传一页中的插图。请用中文写2到4句客观描述，便于后续文本向量检索。不要标题、不要markdown、不要编造图中没有的内容。",
+        validation_alias="INGEST_SURROGATE_IMAGE_VLM_SYSTEM_PROMPT",
+    )
+    ingest_surrogate_image_vlm_user_prompt: str = Field(
+        default="请描述这张图片的关键信息（主体、图表类型、文字要点），用于知识库检索。",
+        validation_alias="INGEST_SURROGATE_IMAGE_VLM_USER_PROMPT",
+    )
+
     # Image filtering (skip decorative / useless images before full vision analysis)
     enable_image_filter: bool = False
     # Prompt sent to vision model for the quick filter check (binary USEFUL/USELESS)
@@ -135,6 +168,14 @@ class Settings(BaseSettings):
     # Graph storage backend: "NetworkXStorage" (no extra deps) or
     # "PGGraphStorage" (requires Apache AGE PostgreSQL extension)
     graph_storage: str = "NetworkXStorage"
+
+    # Optional LightRAG rerank (see HKUDS/LightRAG docs / examples/rerank_example.py).
+    # rerank_binding: cohere | jina | ali (DashScope text rerank)
+    rerank_binding: str = ""
+    rerank_model: str = ""
+    rerank_base_url: str = ""
+    rerank_api_key: str = ""
+    query_enable_rerank: bool = True
 
     ollama_api_key: str = ""
     tavily_api_key: str = ""

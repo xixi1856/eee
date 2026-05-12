@@ -2,8 +2,9 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { ChevronLeft } from "lucide-react";
+import { ChevronLeft, LayoutGrid } from "lucide-react";
 import CourseChatDockview from "@/components/CourseChatDockview";
+import { Button } from "@/components/ui/button";
 
 export default function CourseChatPage() {
   const params = useParams();
@@ -28,7 +29,23 @@ export default function CourseChatPage() {
           返回课程
         </Link>
         <h2 className="font-display text-sm font-semibold text-foreground">课程问答</h2>
-        <div className="w-20" />
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="h-8 gap-1.5 text-xs shrink-0"
+          title="若三栏都被关闭或布局异常，点此恢复资料列表、预览与问答"
+          onClick={() =>
+            window.dispatchEvent(
+              new CustomEvent("edu:reset-course-chat-dockview", {
+                detail: { courseId },
+              }),
+            )
+          }
+        >
+          <LayoutGrid size={14} />
+          恢复三栏
+        </Button>
       </div>
 
       <CourseChatDockview courseId={courseId} />

@@ -7,7 +7,6 @@ import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import {
   Sheet,
   SheetContent,
@@ -16,7 +15,6 @@ import {
 } from "@/components/ui/sheet";
 import {
   Send,
-  User,
   Bot,
   AlertCircle,
   Paperclip,
@@ -34,6 +32,8 @@ import {
   type ChatMessage,
   type UseChatStreamConfig,
 } from "@/lib/hooks/useChatStream";
+import { toolEmoji } from "@/lib/chatToolEmoji";
+import { EDU_CHAT_ADD_ATTACHMENT_EVENT } from "@/lib/captureElementToPngFile";
 
 type UserMe = {
   qa_collection_enabled?: boolean;
@@ -91,6 +91,7 @@ export default function ChatComponent(props: ChatComponentProps) {
   const {
     msgs,
     streaming,
+    toolActivity,
     busy,
     citations,
     lastMeta,
@@ -148,6 +149,18 @@ export default function ChatComponent(props: ChatComponentProps) {
   }, [loadUser]);
 
   useEffect(() => {
+    if (props.variant === "qa_center") return;
+    const onAddAttachment = (ev: Event) => {
+      const ce = ev as CustomEvent<{ file?: File }>;
+      const f = ce.detail?.file;
+      if (f instanceof File) void addAttachment(f);
+    };
+    window.addEventListener(EDU_CHAT_ADD_ATTACHMENT_EVENT, onAddAttachment);
+    return () =>
+      window.removeEventListener(EDU_CHAT_ADD_ATTACHMENT_EVENT, onAddAttachment);
+  }, [addAttachment, props.variant]);
+
+  useEffect(() => {
     if (scrollRef.current) {
       const scrollElement = scrollRef.current.querySelector(
         "[data-radix-scroll-area-viewport]",
@@ -156,7 +169,7 @@ export default function ChatComponent(props: ChatComponentProps) {
         scrollElement.scrollTop = scrollElement.scrollHeight;
       }
     }
-  }, [msgs, streaming]);
+  }, [msgs, streaming, toolActivity]);
 
   const handleSend = () => {
     if ((!input.trim() && pendingAttachments.length === 0) || busy) return;
@@ -211,7 +224,7 @@ export default function ChatComponent(props: ChatComponentProps) {
 
       {agentIdentityBound === false && (
         <div className="shrink-0 border-b border-amber-500/25 bg-amber-500/10 px-4 py-2.5 text-sm text-amber-950 dark:text-amber-100">
-          <div className="max-w-3xl mx-auto flex flex-wrap items-center gap-2">
+          <div className="w-full max-w-none flex flex-wrap items-center gap-2">
             <AlertCircle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" aria-hidden />
             <span>
               当前账号尚未绑定 Edu Agent。请先在 Agent 侧执行绑定（edu bind），再到本平台的
@@ -227,8 +240,8 @@ export default function ChatComponent(props: ChatComponentProps) {
         </div>
       )}
       <ScrollArea ref={scrollRef} className="flex-1 w-full px-4 md:px-8 pt-6 pb-32">
-        <div className="max-w-3xl mx-auto space-y-8 flex flex-col">
-          {msgs.length === 0 && !streaming && (
+        <div className="w-full max-w-none space-y-8 flex flex-col">
+          {msgs.length === 0 && !streaming && !busy && (
             <div className="h-[50vh] flex flex-col items-center justify-center text-muted-foreground opacity-50">
               <Bot className="h-16 w-16 mb-4" />
               <p>{emptyHint}</p>
@@ -238,29 +251,21 @@ export default function ChatComponent(props: ChatComponentProps) {
           {msgs.map((msg, i) => {
             const isEditing = editingClientId === msg.clientId;
             return (
-              <div
-                key={msg.clientId}
-                className={cn(
-                  "group flex w-full gap-4",
-                  msg.role === "user" ? "flex-row-reverse" : "flex-row",
-                )}
-              >
-                <Avatar
-                  className={cn(
-                    "w-8 h-8 shrink-0",
-                    msg.role === "user" ? "bg-muted" : "bg-primary text-primary-foreground",
-                  )}
-                >
-                  <AvatarFallback>
-                    {msg.role === "user" ? <User size={18} /> : <Bot size={18} />}
-                  </AvatarFallback>
-                </Avatar>
+              <div key={msg.clientId} className="group flex w-full flex-col">
                 <div
                   className={cn(
-                    "flex min-w-0 flex-1 flex-col max-w-[80%]",
-                    msg.role === "user" ? "items-end" : "items-start",
+                    "flex w-full",
+                    msg.role === "user" ? "justify-end" : "justify-start",
                   )}
                 >
+                  <div
+                    className={cn(
+                      "flex min-w-0 flex-col",
+                      msg.role === "user"
+                        ? "max-w-[min(100%,80%)] items-end"
+                        : "w-full min-w-0 items-start",
+                    )}
+                  >
                   {msg.attachments && msg.attachments.length > 0 && (
                     <div
                       className={cn(
@@ -276,10 +281,10 @@ export default function ChatComponent(props: ChatComponentProps) {
 
                   <div
                     className={cn(
-                      "relative rounded-2xl",
+                      "relative",
                       msg.role === "user"
-                        ? "bg-muted text-foreground rounded-tr-sm"
-                        : "bg-transparent text-foreground",
+                        ? "rounded-2xl bg-muted text-foreground rounded-tr-sm"
+                        : "rounded-none bg-transparent text-foreground",
                     )}
                   >
                     {msg.role === "user" && isEditing ? (
@@ -312,7 +317,8 @@ export default function ChatComponent(props: ChatComponentProps) {
                       <div
                         className={cn(
                           "px-4 py-3",
-                          msg.role === "assistant" && "prose prose-sm dark:prose-invert",
+                          msg.role === "assistant" &&
+                            "prose prose-sm dark:prose-invert max-w-none [&_pre]:border-0",
                         )}
                       >
                         {msg.role === "user" ? (
@@ -384,40 +390,92 @@ export default function ChatComponent(props: ChatComponentProps) {
                   </div>
                 </div>
               </div>
+              </div>
             );
           })}
 
-          {streaming && (
-            <div className="group flex w-full gap-4 flex-row">
-              <Avatar className="w-8 h-8 shrink-0 bg-primary text-primary-foreground">
-                <AvatarFallback>
-                  <Bot size={18} />
-                </AvatarFallback>
-              </Avatar>
-              <div className="flex min-w-0 flex-1 flex-col max-w-[80%] items-start">
-                <div className="px-4 py-3 bg-transparent text-foreground prose prose-sm dark:prose-invert">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{streaming}</ReactMarkdown>
-                  <span className="inline-block w-2 h-4 bg-primary animate-pulse ml-1 align-middle" />
+          {busy && (!streaming || toolActivity.length > 0) && (
+            <div className="flex w-full flex-col gap-2 pl-4">
+              {!streaming && (
+                <div
+                  className="flex items-center gap-2 text-sm text-muted-foreground"
+                  aria-live="polite"
+                  aria-busy="true"
+                >
+                  <Loader2 className="h-4 w-4 shrink-0 animate-spin" aria-hidden />
+                  <span>思考中…</span>
                 </div>
-                <div className="mt-1 flex opacity-100 sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    className="h-7 w-7 text-muted-foreground hover:text-foreground"
-                    disabled={streaming.length === 0}
-                    aria-label="复制正在生成的内容"
-                    onClick={() => void copyToClipboard(streaming).catch(() => {})}
-                  >
-                    <Copy size={14} strokeWidth={2} />
-                  </Button>
+              )}
+              {toolActivity.length > 0 && (
+                <ul className="m-0 flex list-none flex-col gap-1.5 p-0 text-sm text-muted-foreground">
+                  {toolActivity.map((row) => (
+                    <li
+                      key={row.clientKey}
+                      className="flex flex-wrap items-center gap-2 rounded-md border border-border/60 bg-muted/40 px-2.5 py-1.5"
+                    >
+                      <span className="tabular-nums" aria-hidden>
+                        {toolEmoji(row.name)}
+                      </span>
+                      <span className="font-mono text-xs text-foreground/90">{row.name}</span>
+                      {row.status === "running" && (
+                        <Loader2
+                          className="h-3.5 w-3.5 shrink-0 animate-spin opacity-70"
+                          aria-label="执行中"
+                        />
+                      )}
+                      {row.status === "done" && (
+                        <span className="text-xs">
+                          <span
+                            className={
+                              row.success === false
+                                ? "text-destructive"
+                                : "text-emerald-600 dark:text-emerald-400"
+                            }
+                          >
+                            {row.success === false ? "✗" : "✓"}
+                          </span>
+                          {typeof row.durationMs === "number" && (
+                            <span className="ml-1.5 opacity-80">
+                              {(row.durationMs / 1000).toFixed(1)}s
+                            </span>
+                          )}
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+
+          {streaming && (
+            <div className="group flex w-full flex-col">
+              <div className="flex w-full justify-start">
+                <div className="flex min-w-0 w-full flex-col items-start">
+                  <div className="rounded-none px-4 py-3 bg-transparent text-foreground prose prose-sm dark:prose-invert max-w-none [&_pre]:border-0">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{streaming}</ReactMarkdown>
+                    <span className="inline-block w-2 h-4 bg-primary animate-pulse ml-1 align-middle" />
+                  </div>
+                  <div className="mt-1 flex opacity-100 sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                      disabled={streaming.length === 0}
+                      aria-label="复制正在生成的内容"
+                      onClick={() => void copyToClipboard(streaming).catch(() => {})}
+                    >
+                      <Copy size={14} strokeWidth={2} />
+                    </Button>
+                  </div>
                 </div>
               </div>
             </div>
           )}
 
           {(citations.length > 0 || lastMeta) && (
-            <div className="flex w-full justify-start pl-12">
+            <div className="flex w-full justify-start pl-0">
               <div className="space-y-1.5">
                 {citations.length > 0 && (
                   <div className="flex flex-wrap gap-1.5">
@@ -465,7 +523,7 @@ export default function ChatComponent(props: ChatComponentProps) {
       </ScrollArea>
 
       <div className="absolute bottom-4 left-0 right-0 w-full px-4 md:px-8 bg-gradient-to-t from-background via-background to-transparent pt-6">
-        <div className="max-w-3xl mx-auto relative rounded-2xl bg-muted/40 border border-border shadow-sm focus-within:ring-1 focus-within:ring-ring focus-within:bg-background transition-colors overflow-hidden">
+        <div className="w-full max-w-none relative rounded-2xl bg-muted/40 border border-border shadow-sm focus-within:ring-1 focus-within:ring-ring focus-within:bg-background transition-colors overflow-hidden">
           {pendingAttachments.length > 0 && (
             <div className="flex flex-wrap gap-2 px-4 pt-3 pb-1">
               {pendingAttachments.map((att) => (

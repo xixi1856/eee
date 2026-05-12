@@ -85,4 +85,42 @@ describe("createB3SseTransformFromAgent", () => {
     await new Response(input.pipeThrough(tr)).text();
     expect(createMock).not.toHaveBeenCalled();
   });
+
+  it("emits tool_call and tool_result B3 events and still persists answer", async () => {
+    const input = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encodeAgentSse([
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"knowledge_query","arguments":"{}"}}]}}],"edu_meta":{"content_type":"tool_call","is_final":false,"b3":{"tool_name":"knowledge_query"}}}\n\n',
+            'data: {"choices":[{"delta":{"content":"Hi"}}],"edu_meta":{"content_type":"text","is_final":false}}\n\n',
+            'data: {"choices":[{"delta":{"role":"tool","content":""}}],"edu_meta":{"content_type":"tool_result","is_final":false,"b3":{"tool_name":"knowledge_query","success":true,"duration_s":0.42}}}\n\n',
+            'data: {"choices":[{"delta":{}}],"edu_meta":{"content_type":"text","is_final":true,"b3":{"execution_time_ms":20,"model_used":"gpt-test","total_tokens":5,"hit_chunks":[],"hit_materials":[],"hit_sources":[]}}}\n\n',
+            "data: [DONE]\n\n",
+          ]),
+        );
+        controller.close();
+      },
+    });
+
+    const tr = createB3SseTransformFromAgent({
+      courseId: "00000000-0000-4000-8000-0000000000aa",
+      platformStudentId: "00000000-0000-4000-8000-0000000000bb",
+      lessonId: null,
+      sessionId: "sess-tool",
+      question: "Q?",
+      answer: "",
+      persist: true,
+    });
+
+    const text = await new Response(input.pipeThrough(tr)).text();
+    expect(text).toContain('"type":"tool_call"');
+    expect(text).toContain('"name":"knowledge_query"');
+    expect(text).toContain('"tool_call_id":"call_1"');
+    expect(text).toContain('"type":"tool_result"');
+    expect(text).toContain('"duration_ms":420');
+    expect(text).toContain('"content":"Hi"');
+    expect(createMock).toHaveBeenCalledTimes(1);
+    const arg = createMock.mock.calls[0]![0] as { data: { answer: string } };
+    expect(arg.data.answer).toBe("Hi");
+  });
 });

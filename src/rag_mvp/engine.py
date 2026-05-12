@@ -12,6 +12,12 @@ from lightrag import LightRAG, QueryParam
 from loguru import logger
 from lightrag.utils import compute_mdhash_id
 from raganything import RAGAnything, RAGAnythingConfig
+from raganything.utils import separate_content
+
+from rag_mvp.multimodal_surrogate_chunks import (
+    merge_file_chunks_with_global_indices,
+    multimodal_items_to_custom_chunks_async,
+)
 
 from .config import settings
 from .course_workspace import course_id_to_workspace
@@ -78,6 +84,53 @@ def _lightrag_insertion_tuning_kwargs() -> dict[str, int]:
         "chunk_overlap_token_size": settings.chunk_overlap_token_size,
         "default_embedding_timeout": settings.embedding_timeout_seconds,
     }
+
+
+def build_optional_rerank_model_func() -> Any | None:
+    """Return a partial rerank callable for LightRAG, or None if reranking is disabled."""
+    binding = (settings.rerank_binding or "").strip().lower()
+    if not binding:
+        return None
+    from functools import partial
+
+    from lightrag.rerank import ali_rerank, cohere_rerank, jina_rerank
+
+    model = (settings.rerank_model or "").strip()
+    api_key = (settings.rerank_api_key or settings.llm_api_key or "").strip() or None
+    base_url = (settings.rerank_base_url or "").strip()
+
+    if binding == "cohere":
+        return partial(
+            cohere_rerank,
+            model=model or "rerank-v3.5",
+            api_key=api_key,
+            base_url=base_url or "https://api.cohere.com/v2/rerank",
+        )
+    if binding == "jina":
+        return partial(
+            jina_rerank,
+            model=model or "jina-reranker-v2-base-multilingual",
+            api_key=api_key,
+            base_url=base_url or "https://api.jina.ai/v1/rerank",
+        )
+    if binding in ("ali", "aliyun", "dashscope"):
+        return partial(
+            ali_rerank,
+            model=model or "gte-rerank-v2",
+            api_key=api_key,
+            base_url=base_url
+            or "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
+        )
+    logger.warning("Unknown RERANK_BINDING={!r}; ignoring rerank_model_func", binding)
+    return None
+
+
+def _lightrag_constructor_extras() -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    rf = build_optional_rerank_model_func()
+    if rf is not None:
+        out["rerank_model_func"] = rf
+    return out
 
 
 # Supported document extensions
@@ -152,6 +205,7 @@ def _build_rag() -> RAGAnything:
         embedding_func_max_async=settings.embedding_max_async,
         max_parallel_insert=settings.max_parallel_insert,
         **_lightrag_insertion_tuning_kwargs(),
+        **_lightrag_constructor_extras(),
     )
     _write_metadata()
 
@@ -550,6 +604,34 @@ def _filter_text_only_content(content_list: list) -> tuple[list, dict[str, int]]
     return kept, skipped
 
 
+def _custom_kg_chunks_from_text(lightrag: LightRAG, text: str, file_path: str) -> list[dict[str, Any]]:
+    """Split *text* with LightRAG token chunking for ``ainsert_custom_kg`` (no entity extraction)."""
+    from lightrag.operate import chunking_by_token_size
+
+    pieces = chunking_by_token_size(
+        lightrag.tokenizer,
+        text,
+        None,
+        False,
+        lightrag.chunk_overlap_token_size,
+        lightrag.chunk_token_size,
+    )
+    chunks: list[dict[str, Any]] = []
+    for p in pieces:
+        content = (p.get("content") or "").strip()
+        if not content:
+            continue
+        chunks.append(
+            {
+                "content": content,
+                "source_id": f"c{len(chunks)}",
+                "file_path": file_path,
+                "chunk_order_index": len(chunks),
+            }
+        )
+    return chunks
+
+
 def reindex_from_cache(
     output_dir: str | Path | None = None,
     file_path: str | Path | None = None,
@@ -773,6 +855,7 @@ async def get_course_rag_anything(course_id: str) -> RAGAnything:
             graph_storage=settings.graph_storage,
             doc_status_storage="PGDocStatusStorage",
             **_lightrag_insertion_tuning_kwargs(),
+            **_lightrag_constructor_extras(),
         )
         await lightrag.initialize_storages()
 
@@ -885,9 +968,16 @@ async def course_aquery_data(
         "Literal['local', 'global', 'hybrid', 'naive', 'mix', 'bypass']",
         mode if mode in ("local", "global", "hybrid", "naive", "mix", "bypass") else "hybrid",
     )
-    param = QueryParam(mode=m, top_k=top_k, chunk_top_k=top_k)
-    assert rag.lightrag is not None
-    return await rag.lightrag.aquery_data(question.strip(), param)
+    lr = rag.lightrag
+    assert lr is not None
+    rerank_installed = getattr(lr, "rerank_model_func", None) is not None
+    param = QueryParam(
+        mode=m,
+        top_k=top_k,
+        chunk_top_k=top_k,
+        enable_rerank=settings.query_enable_rerank and rerank_installed,
+    )
+    return await lr.aquery_data(question.strip(), param)
 
 
 async def personal_aquery_data(
@@ -902,9 +992,16 @@ async def personal_aquery_data(
         "Literal['local', 'global', 'hybrid', 'naive', 'mix', 'bypass']",
         mode if mode in ("local", "global", "hybrid", "naive", "mix", "bypass") else "hybrid",
     )
-    param = QueryParam(mode=m, top_k=top_k, chunk_top_k=top_k)
-    assert rag.lightrag is not None
-    return await rag.lightrag.aquery_data(question.strip(), param)
+    lr = rag.lightrag
+    assert lr is not None
+    rerank_installed = getattr(lr, "rerank_model_func", None) is not None
+    param = QueryParam(
+        mode=m,
+        top_k=top_k,
+        chunk_top_k=top_k,
+        enable_rerank=settings.query_enable_rerank and rerank_installed,
+    )
+    return await lr.aquery_data(question.strip(), param)
 
 
 def course_retrieval_hits_sync(
@@ -950,6 +1047,7 @@ async def ingest_parsed_material_into_course_async(
     source_file: Path,
     original_filename: str | None = None,
     text_only: bool = True,
+    skip_entity_extraction: bool = True,
 ) -> int:
     """Insert already-parsed MinerU JSON (under output_dir / stem) into course LightRAG."""
     ensure_embedding_backend_reachable()
@@ -969,7 +1067,10 @@ async def ingest_parsed_material_into_course_async(
     try:
         rag = await get_course_rag_anything(course_id)
         doc_id = material_stable_doc_id(material_id)
-        total = 0
+        lr = rag.lightrag
+        assert lr is not None
+
+        prepared: list[tuple[list, str]] = []
         for json_path in json_files:
             sub_stem = json_path.stem.replace("_content_list", "")
             display_stem = Path(original_filename).stem if original_filename else sub_stem
@@ -986,6 +1087,79 @@ async def ingest_parsed_material_into_course_async(
                     skipped,
                 )
                 content_list = filtered_list
+            prepared.append((content_list, rag_file_path))
+
+        use_fast_kg_skip = skip_entity_extraction and all(
+            len(separate_content(cl)[1]) == 0 for cl, _ in prepared
+        )
+        use_multimodal_surrogate = (
+            skip_entity_extraction
+            and not text_only
+            and any(len(separate_content(cl)[1]) > 0 for cl, _ in prepared)
+        )
+
+        if use_fast_kg_skip:
+            all_chunks: list[dict[str, Any]] = []
+            for content_list, rag_file_path in prepared:
+                text_content, _mm = separate_content(content_list)
+                if not text_content.strip():
+                    continue
+                all_chunks.extend(_custom_kg_chunks_from_text(lr, text_content, rag_file_path))
+            if not all_chunks:
+                raise RuntimeError(
+                    f"No text chunks to index for material {material_id} (doc_id={doc_id}); "
+                    "check MinerU output or disable text-only / enable multimodal blocks."
+                )
+            await lr.ainsert_custom_kg({"chunks": all_chunks}, full_doc_id=doc_id)
+            logger.success(
+                "Indexed material {} ({} chunks via LightRAG ainsert_custom_kg, no entity extraction)",
+                material_id,
+                len(all_chunks),
+            )
+            return len(all_chunks)
+
+        if use_multimodal_surrogate:
+            logger.info(
+                "ingest material={} using custom multimodal surrogate chunks + ainsert_custom_kg",
+                material_id,
+            )
+            per_file_chunks: list[list[dict[str, Any]]] = []
+            for content_list, rag_file_path in prepared:
+                text_content, mm = separate_content(content_list)
+                file_chunks: list[dict[str, Any]] = []
+                if text_content.strip():
+                    file_chunks.extend(
+                        _custom_kg_chunks_from_text(lr, text_content, rag_file_path),
+                    )
+                if mm:
+                    file_chunks.extend(
+                        await multimodal_items_to_custom_chunks_async(
+                            lr,
+                            mm,
+                            rag_file_path,
+                            order_base=len(file_chunks),
+                            use_vlm_for_images=settings.ingest_surrogate_image_vlm,
+                        ),
+                    )
+                per_file_chunks.append(file_chunks)
+
+            all_mm_chunks = merge_file_chunks_with_global_indices(per_file_chunks)
+            if not all_mm_chunks:
+                raise RuntimeError(
+                    f"No chunks to index for material {material_id} (doc_id={doc_id}); "
+                    "check MinerU output or multimodal surrogate coverage.",
+                )
+            await lr.ainsert_custom_kg({"chunks": all_mm_chunks}, full_doc_id=doc_id)
+            logger.success(
+                "Indexed material {} ({} chunks via surrogate multimodal + ainsert_custom_kg, "
+                "no entity extraction)",
+                material_id,
+                len(all_mm_chunks),
+            )
+            return len(all_mm_chunks)
+
+        total = 0
+        for content_list, rag_file_path in prepared:
             await rag.insert_content_list(
                 content_list,
                 file_path=rag_file_path,
@@ -1074,6 +1248,7 @@ def ingest_parsed_material_into_course_sync(
     source_file: Path,
     original_filename: str | None = None,
     text_only: bool = True,
+    skip_entity_extraction: bool = True,
 ) -> int:
     try:
         return asyncio.run(
@@ -1083,6 +1258,7 @@ def ingest_parsed_material_into_course_sync(
                 source_file,
                 original_filename=original_filename,
                 text_only=text_only,
+                skip_entity_extraction=skip_entity_extraction,
             ),
         )
     finally:

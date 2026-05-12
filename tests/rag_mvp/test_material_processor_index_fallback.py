@@ -32,9 +32,10 @@ def test_index_only_fallback_moves_to_parsing_and_runs_full_pipeline(monkeypatch
         file_type,
         original_filename,
         text_only,
+        skip_kg,
     ) -> None:
         full_calls.append(
-            (material_id, course_id, minio_path, file_type, original_filename, text_only),
+            (material_id, course_id, minio_path, file_type, original_filename, text_only, skip_kg),
         )
 
     monkeypatch.setattr(mp, "_run_material_download_parse_and_ingest", fake_run)
@@ -59,6 +60,7 @@ def test_index_only_fallback_moves_to_parsing_and_runs_full_pipeline(monkeypatch
             claimed["minio_path"],
             claimed["file_type"],
             claimed["original_filename"],
+            True,
             True,
         ),
     ]

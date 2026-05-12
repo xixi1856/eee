@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { FileText, Hash, Loader2, AlertCircle, Download } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -8,6 +8,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
 import MaterialPdfViewer from "@/components/MaterialPdfViewer";
 import { isOfficeMaterialFileType } from "@/lib/material-office";
+import { captureScrollViewportToPngFile, EDU_CHAT_ADD_ATTACHMENT_EVENT } from "@/lib/captureElementToPngFile";
 
 type MaterialDetail = {
   id: string;
@@ -37,6 +38,10 @@ export default function CourseMaterialViewer({
   const [chunkError, setChunkError] = useState<string | null>(null);
   const [textBody, setTextBody] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [captureBusy, setCaptureBusy] = useState(false);
+  const [pdfViewportReady, setPdfViewportReady] = useState(false);
+  const textScrollRef = useRef<HTMLDivElement>(null);
+  const pdfScrollRef = useRef<HTMLDivElement>(null);
 
   const loadMaterial = useCallback(async () => {
     if (!materialId) {
@@ -101,6 +106,10 @@ export default function CourseMaterialViewer({
   }, [materialId, material?.file_type, material?.id]);
 
   useEffect(() => {
+    setPdfViewportReady(false);
+  }, [materialId]);
+
+  useEffect(() => {
     if (!materialId || !chunkId) {
       setChunkError(null);
       return;
@@ -160,6 +169,52 @@ export default function CourseMaterialViewer({
     office && material.preview_pdf_status === "FAILED";
   const previewPending =
     office && material.preview_pdf_status === "PENDING";
+  const previewPendingText =
+    previewPending && material.status === "READY"
+      ? "索引已完成，正在同步 PDF 预览状态…"
+      : "正在生成 PDF 预览…";
+
+  const textPreviewReady =
+    (ft === "md" || ft === "txt") && textBody !== null;
+
+  const screenshotTargetReady =
+    (showPdfIframe && pdfViewportReady) ||
+    textPreviewReady ||
+    previewFailed;
+
+  const screenshotDisabled =
+    captureBusy ||
+    loading ||
+    previewPending ||
+    !screenshotTargetReady;
+
+  const safeScreenshotBase = material.filename
+    .replace(/[/\\:*?"<>|]/g, "_")
+    .slice(0, 80);
+
+  const handleScreenshotToChat = async () => {
+    const el = showPdfIframe
+      ? pdfScrollRef.current
+      : textScrollRef.current;
+    if (!el || screenshotDisabled) return;
+    setCaptureBusy(true);
+    try {
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const file = await captureScrollViewportToPngFile(
+        el,
+        `资料截图-${safeScreenshotBase}-${stamp}.png`,
+      );
+      window.dispatchEvent(
+        new CustomEvent(EDU_CHAT_ADD_ATTACHMENT_EVENT, {
+          detail: { file },
+        }),
+      );
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "截屏失败");
+    } finally {
+      setCaptureBusy(false);
+    }
+  };
 
   return (
     <div className="flex flex-col h-full min-h-0 overflow-hidden">
@@ -181,18 +236,56 @@ export default function CourseMaterialViewer({
             {sourceLabel}
           </p>
         )}
-        <Button variant="outline" size="sm" className="h-7 text-[11px] w-full" asChild>
-          <a
-            href={`/api/v1/materials/${materialId}/content?variant=original`}
-            download={material.filename}
+        <div className="flex gap-2 items-stretch">
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            className="h-7 w-7 shrink-0"
+            disabled={screenshotDisabled}
+            title="截屏当前预览并添加到问答附件"
+            onClick={() => void handleScreenshotToChat()}
+            aria-label="截屏当前预览并添加到问答附件"
           >
-            <Download size={12} className="mr-1" />
-            下载原文件
-          </a>
-        </Button>
+            {captureBusy ? (
+              <Loader2 size={14} className="animate-spin" />
+            ) : (
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden
+              >
+                <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z" />
+                <circle cx="12" cy="13" r="3" />
+              </svg>
+            )}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 text-[11px] flex-1 min-w-0"
+            asChild
+          >
+            <a
+              href={`/api/v1/materials/${materialId}/content?variant=original`}
+              download={material.filename}
+            >
+              <Download size={12} className="mr-1 shrink-0" />
+              下载原文件
+            </a>
+          </Button>
+        </div>
       </div>
 
       <div
+        ref={showPdfIframe ? undefined : textScrollRef}
         className={
           showPdfIframe
             ? "flex-1 min-h-0 flex flex-col overflow-hidden"
@@ -208,7 +301,7 @@ export default function CourseMaterialViewer({
         {previewPending && (
           <div className="flex items-center gap-2 m-3 text-xs text-muted-foreground">
             <Loader2 size={14} className="animate-spin" />
-            正在生成 PDF 预览…
+            {previewPendingText}
           </div>
         )}
 
@@ -224,6 +317,8 @@ export default function CourseMaterialViewer({
             materialId={materialId}
             downloadHref={`/api/v1/materials/${materialId}/content?variant=original`}
             downloadName={material.filename}
+            scrollCaptureRef={pdfScrollRef}
+            onViewportCaptureReady={setPdfViewportReady}
           />
         )}
 

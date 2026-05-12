@@ -25,6 +25,15 @@ export type DoneMeta = {
   error?: string;
 };
 
+/** In-flight tool row for the current assistant turn (not persisted). */
+export type ToolActivityItem = {
+  clientKey: string;
+  name: string;
+  status: "running" | "done";
+  success?: boolean;
+  durationMs?: number;
+};
+
 export type AttachmentRef = {
   id: string;
   key: string;
@@ -137,6 +146,8 @@ export function useChatStream(config: UseChatStreamConfig) {
   msgsRef.current = msgs;
 
   const [streaming, setStreaming] = useState<string>("");
+  const [toolActivity, setToolActivity] = useState<ToolActivityItem[]>([]);
+  const toolSeqRef = useRef(0);
   const [busy, setBusy] = useState(false);
   const [citations, setCitations] = useState<Citation[]>([]);
   const [lastMeta, setLastMeta] = useState<DoneMeta | null>(null);
@@ -257,6 +268,8 @@ export function useChatStream(config: UseChatStreamConfig) {
       const config = cfgRef.current;
       setBusy(true);
       setStreaming("");
+      setToolActivity([]);
+      toolSeqRef.current = 0;
       setCitations([]);
       setLastMeta(null);
       setErrorMsg(null);
@@ -331,11 +344,44 @@ export function useChatStream(config: UseChatStreamConfig) {
                 tokens?: number;
                 exec_time_ms?: number;
                 error?: string;
+                name?: string;
+                tool_call_id?: string;
+                success?: boolean;
+                duration_ms?: number;
               };
 
               if (event.type === "text" && event.content) {
                 streamText += event.content;
                 setStreaming(streamText);
+              } else if (event.type === "tool_call" && event.name) {
+                const id =
+                  typeof event.tool_call_id === "string" && event.tool_call_id
+                    ? event.tool_call_id
+                    : `tc-${++toolSeqRef.current}`;
+                setToolActivity((prev) => [
+                  ...prev,
+                  { clientKey: id, name: event.name!, status: "running" },
+                ]);
+              } else if (event.type === "tool_result" && event.name) {
+                const toolName = event.name;
+                setToolActivity((prev) => {
+                  let runIdx = -1;
+                  for (let i = prev.length - 1; i >= 0; i--) {
+                    if (prev[i].status === "running" && prev[i].name === toolName) {
+                      runIdx = i;
+                      break;
+                    }
+                  }
+                  if (runIdx === -1) return prev;
+                  const next = [...prev];
+                  next[runIdx] = {
+                    ...next[runIdx],
+                    status: "done",
+                    success: event.success,
+                    durationMs: event.duration_ms,
+                  };
+                  return next;
+                });
               } else if (event.type === "citation") {
                 newCitations.push({
                   chunk_id: event.chunk_id,
@@ -372,6 +418,7 @@ export function useChatStream(config: UseChatStreamConfig) {
           });
         }
         setStreaming("");
+        setToolActivity([]);
       } catch (e) {
         if ((e as { name?: string }).name !== "AbortError") {
           const msg = e instanceof Error ? e.message : "请求失败";
@@ -388,6 +435,7 @@ export function useChatStream(config: UseChatStreamConfig) {
           });
         }
         setStreaming("");
+        setToolActivity([]);
       } finally {
         setBusy(false);
       }
@@ -493,6 +541,7 @@ export function useChatStream(config: UseChatStreamConfig) {
   return {
     msgs,
     streaming,
+    toolActivity,
     busy,
     citations,
     lastMeta,

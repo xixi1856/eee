@@ -1,9 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { FileText, Loader2, RotateCcw, Search } from "lucide-react";
+import { FileText, Loader2, Search } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { RetryMaterialIndexPopover } from "@/components/RetryMaterialIndexPopover";
 import { isOfficeMaterialFileType } from "@/lib/material-office";
 import { cn } from "@/lib/utils";
 
@@ -48,8 +49,6 @@ export default function CourseMaterialList({
   const [materials, setMaterials] = useState<MaterialRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [q, setQ] = useState("");
-  const [textOnlyRetry, setTextOnlyRetry] = useState(true);
-  const [retryingId, setRetryingId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -71,30 +70,6 @@ export default function CourseMaterialList({
   useEffect(() => {
     void load();
   }, [load]);
-
-  const retryIndex = useCallback(
-    async (materialId: string) => {
-      setRetryingId(materialId);
-      try {
-        const res = await fetch(
-          `/api/v1/courses/${courseId}/materials/${materialId}/retry-index`,
-          {
-            method: "POST",
-            credentials: "include",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ text_only: textOnlyRetry }),
-          },
-        );
-        if (!res.ok) {
-          return;
-        }
-        await load();
-      } finally {
-        setRetryingId(null);
-      }
-    },
-    [courseId, load],
-  );
 
   const filtered = useMemo(() => {
     const s = q.trim().toLowerCase();
@@ -124,15 +99,6 @@ export default function CourseMaterialList({
             className="h-8 pl-8 text-xs"
           />
         </div>
-        <label className="flex items-center gap-2 rounded-md border border-border px-2 py-1 text-[11px] text-muted-foreground">
-          <input
-            type="checkbox"
-            checked={textOnlyRetry}
-            onChange={(e) => setTextOnlyRetry(e.target.checked)}
-            className="h-3 w-3 accent-primary"
-          />
-          <span>重试索引默认仅文本</span>
-        </label>
       </div>
 
       <ScrollArea className="flex-1 min-h-0">
@@ -175,25 +141,13 @@ export default function CourseMaterialList({
                 </div>
               </button>
               {m.status === "FAILED" && (
-                <button
-                  type="button"
-                  title="重试索引（使用已解析的本地缓存）"
-                  disabled={retryingId === m.id}
-                  onClick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    void retryIndex(m.id);
-                  }}
-                  className={cn(
-                    "shrink-0 mt-1.5 p-1.5 rounded-md text-muted-foreground hover:bg-muted hover:text-foreground",
-                    retryingId === m.id && "opacity-60 pointer-events-none",
-                  )}
-                >
-                  <RotateCcw
-                    size={12}
-                    className={retryingId === m.id ? "animate-spin" : ""}
-                  />
-                </button>
+                <RetryMaterialIndexPopover
+                  courseId={courseId}
+                  materialId={m.id}
+                  iconSize={12}
+                  triggerClassName="shrink-0 mt-1.5 p-1.5 rounded-md"
+                  onSuccess={() => void load()}
+                />
               )}
             </div>
           ))}

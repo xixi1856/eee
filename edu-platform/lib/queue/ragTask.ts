@@ -5,9 +5,16 @@ import { getRedis } from "@/lib/redis";
 export type RagQueueTask = {
   task_id: string;
   material_id: string;
-  operation: "parse_and_index" | "index_only" | "delete_material" | "repair_preview";
+  operation:
+    | "parse_and_index"
+    | "index_only"
+    | "delete_material"
+    | "repair_preview"
+    | "convert_preview";
   created_at: string;
   text_only?: boolean;
+  /** When true (default), skip LLM entity/relation extraction at ingest (chunks + embeddings only). */
+  skip_kg?: boolean;
 };
 
 export async function enqueueRagTask(task: RagQueueTask): Promise<void> {
@@ -21,6 +28,9 @@ export async function enqueueRagTask(task: RagQueueTask): Promise<void> {
   };
   if (typeof task.text_only === "boolean") {
     fields.text_only = task.text_only ? "true" : "false";
+  }
+  if (typeof task.skip_kg === "boolean") {
+    fields.skip_kg = task.skip_kg ? "true" : "false";
   }
   await redis.xAdd(stream, "*", {
     ...fields,

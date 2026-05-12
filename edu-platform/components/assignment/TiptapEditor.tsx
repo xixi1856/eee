@@ -22,6 +22,7 @@ export function TiptapEditor({
   minHeight = "80px",
 }: TiptapEditorProps) {
   const editor = useEditor({
+    immediatelyRender: false,
     extensions: [
       StarterKit,
       Placeholder.configure({ placeholder }),

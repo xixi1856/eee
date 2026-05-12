@@ -111,7 +111,7 @@ export default function AssignmentsPage() {
   }
 
   return (
-    <div className="max-w-3xl mx-auto px-4 py-6 space-y-6">
+    <div className="mx-auto w-full max-w-6xl px-4 py-6 space-y-6">
 
       {/* Header */}
       <div className="flex items-center gap-3">

@@ -51,6 +51,10 @@ class AgentDefaults(BaseModel):
     max_iterations: int = 20
     skills_dir: str = "skills"
     tool_timeout_sec: float = 120.0
+    # OpenAI SDK: forwarded as ``extra_body`` on each ``chat.completions.create``.
+    # DeepSeek V4 defaults to thinking mode; without echoing ``reasoning_content`` on tool
+    # rounds, use e.g. ``{"thinking": {"type": "disabled"}}`` — see api-docs.deepseek.com/guides/thinking_mode
+    llm_extra_body: dict[str, Any] = Field(default_factory=dict)
 
 
 class ProviderCredentials(BaseModel):

@@ -10,13 +10,33 @@
     "output_dir": "output\\cron\\b2abfd5f"
   },
   {
-    "id": "30c2ade3",
-    "prompt": "生成一道关于计算机网络的练习题（题型：单选或填空），难度适中，覆盖基础概念如TCP/IP、DNS、HTTP、子网掩码等。题目需附带解析，适合初学者巩固知识。",
-    "schedule": "48 11 * * *",
-    "created_at": "2026-05-10T11:46:37",
+    "id": "4780f28d",
+    "prompt": "为学习者生成一道计算机网络相关的启发性题目，采用苏格拉底式提问风格，引导思考而非直接给出答案。题目应基于基础概念，如TCP/IP模型、数据包传输、路由选择或拥塞控制，适合初学者。",
+    "schedule": "0 7 * * *",
+    "created_at": "2026-05-12T04:29:44",
     "status": "active",
-    "last_run": "2026-05-10T11:57:36",
-    "next_run": "2026-05-11T11:48:00",
-    "output_dir": "output\\cron\\30c2ade3"
+    "last_run": "",
+    "next_run": "2026-05-12T07:00:00",
+    "output_dir": "output\\cron\\4780f28d"
+  },
+  {
+    "id": "d868f054",
+    "prompt": "生成一道关于计算机网络的练习题（题型：单选或填空），难度适中，覆盖基础概念如TCP/IP、DNS、HTTP、子网掩码等。题目需附带解析，适合初学者巩固知识。",
+    "schedule": "6 11 * * *",
+    "created_at": "2026-05-12T11:04:58",
+    "status": "active",
+    "last_run": "",
+    "next_run": "2026-05-12T11:06:00",
+    "output_dir": "output\\cron\\d868f054"
+  },
+  {
+    "id": "b1b24a60",
+    "prompt": "生成一道关于计算机网络的练习题（题型：单选或填空），难度适中，覆盖基础概念如TCP/IP、DNS、HTTP、子网掩码等。题目需附带解析，适合初学者巩固知识。",
+    "schedule": "12 11 * * *",
+    "created_at": "2026-05-12T11:10:33",
+    "status": "active",
+    "last_run": "",
+    "next_run": "2026-05-12T11:12:00",
+    "output_dir": "output\\cron\\b1b24a60"
   }
 ]

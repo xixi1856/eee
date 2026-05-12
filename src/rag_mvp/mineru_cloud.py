@@ -16,12 +16,16 @@ and passes the result to insert_content_list — exactly the same as reindex_fro
 from __future__ import annotations
 
 import asyncio
+import shutil
 import io
+import tempfile
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import httpx
+from pypdf import PdfReader, PdfWriter
 from loguru import logger
 
 from .config import settings
@@ -29,10 +33,22 @@ from .config import settings
 _BASE_URL = "https://mineru.net/api/v4"
 _BATCH_URL = f"{_BASE_URL}/file-urls/batch"
 _RESULTS_URL = f"{_BASE_URL}/extract-results/batch"
+_MAX_FILE_BYTES = 200 * 1024 * 1024
+_MAX_FILE_PAGES = 200
+_MAX_BATCH_FILES = 200
 
 
 class MineruCloudError(RuntimeError):
     """Raised when the MinerU Cloud API returns an error or times out."""
+
+
+@dataclass(frozen=True)
+class _UploadPart:
+    source_path: Path
+    upload_name: str
+    output_subdir: str
+    page_from: int | None = None
+    page_to: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -46,13 +62,105 @@ def _auth_headers() -> dict[str, str]:
     }
 
 
-async def _request_upload_url(
+def _pdf_page_count(file_path: Path) -> int:
+    reader = PdfReader(str(file_path))
+    return len(reader.pages)
+
+
+def _write_pdf_slice(reader: PdfReader, out_path: Path, start: int, end: int) -> None:
+    writer = PdfWriter()
+    for i in range(start, end):
+        writer.add_page(reader.pages[i])
+    with out_path.open("wb") as f:
+        writer.write(f)
+
+
+def _prepare_upload_parts(file_path: Path, temp_dir: Path) -> list[_UploadPart]:
+    """Create upload parts respecting MinerU cloud limits.
+
+    Strategy:
+    - For files within limits, upload as-is.
+    - For oversized PDFs, split into chunks where each part satisfies
+      page-count <= 200 and file-size <= 200MB.
+    - For non-PDF files over 200MB, raise and let caller decide fallback.
+    """
+    size_ok = file_path.stat().st_size <= _MAX_FILE_BYTES
+    suffix = file_path.suffix.lower()
+
+    # Fast path: non-PDF or already within limits.
+    if suffix != ".pdf":
+        if not size_ok:
+            raise MineruCloudError(
+                "非 PDF 文件超过 MinerU 云端 200MB 限制，无法自动切分；请改用本地解析或手工拆分"
+            )
+        return [
+            _UploadPart(
+                source_path=file_path,
+                upload_name=file_path.name,
+                output_subdir="part_0001",
+            ),
+        ]
+
+    total_pages = _pdf_page_count(file_path)
+    if size_ok and total_pages <= _MAX_FILE_PAGES:
+        return [
+            _UploadPart(
+                source_path=file_path,
+                upload_name=file_path.name,
+                output_subdir="part_0001",
+                page_from=1,
+                page_to=total_pages,
+            ),
+        ]
+
+    reader = PdfReader(str(file_path))
+    parts: list[_UploadPart] = []
+    start = 0
+    part_idx = 1
+
+    while start < total_pages:
+        # Start with page-window limit first.
+        candidate_end = min(start + _MAX_FILE_PAGES, total_pages)
+
+        # Shrink by size if needed.
+        while True:
+            part_name = f"{file_path.stem}__part_{part_idx:04d}.pdf"
+            part_path = temp_dir / part_name
+            _write_pdf_slice(reader, part_path, start, candidate_end)
+            if part_path.stat().st_size <= _MAX_FILE_BYTES:
+                break
+
+            if candidate_end - start <= 1:
+                raise MineruCloudError(
+                    f"PDF 第 {start + 1} 页单页已超过 200MB，无法自动切分上传: {file_path.name}"
+                )
+
+            # Reduce chunk aggressively to converge faster.
+            span = candidate_end - start
+            candidate_end = start + max(1, span // 2)
+
+        parts.append(
+            _UploadPart(
+                source_path=part_path,
+                upload_name=part_name,
+                output_subdir=f"part_{part_idx:04d}",
+                page_from=start + 1,
+                page_to=candidate_end,
+            ),
+        )
+        start = candidate_end
+        part_idx += 1
+
+    return parts
+
+
+async def _request_upload_urls(
     client: httpx.AsyncClient,
-    file_name: str,
-) -> tuple[str, str]:
-    """Step 1: obtain batch_id and pre-signed upload URL."""
+    parts: list[_UploadPart],
+) -> tuple[str, list[str]]:
+    """Step 1: obtain batch_id and pre-signed upload URLs."""
     payload: dict[str, Any] = {
-        "files": [{"name": file_name}],
+        "files": [{"name": p.upload_name} for p in parts],
         "model_version": settings.mineru_cloud_model_version,
         "enable_formula": True,
         "enable_table": True,
@@ -66,8 +174,12 @@ async def _request_upload_url(
             f"申请上传链接失败: code={body.get('code')} msg={body.get('msg')}"
         )
     batch_id: str = body["data"]["batch_id"]
-    file_url: str = body["data"]["file_urls"][0]
-    return batch_id, file_url
+    file_urls: list[str] = body["data"].get("file_urls") or []
+    if len(file_urls) != len(parts):
+        raise MineruCloudError(
+            f"上传链接数量不匹配: expected={len(parts)} actual={len(file_urls)}"
+        )
+    return batch_id, file_urls
 
 
 async def _upload_file(
@@ -85,14 +197,27 @@ async def _upload_file(
         )
 
 
+async def _upload_files(
+    client: httpx.AsyncClient,
+    parts: list[_UploadPart],
+    upload_urls: list[str],
+) -> None:
+    for part, url in zip(parts, upload_urls):
+        logger.info(
+            "MinerU Cloud: 上传分片 {} ({} MB)...",
+            part.upload_name,
+            f"{part.source_path.stat().st_size / 1024 / 1024:.2f}",
+        )
+        await _upload_file(client, url, part.source_path)
+
+
 async def _poll_until_done(
     client: httpx.AsyncClient,
     batch_id: str,
-    file_name: str,
-) -> str:
-    """Step 3: poll batch results until done/failed, return full_zip_url."""
+) -> dict[str, dict[str, Any]]:
+    """Step 3: poll batch results until all done/failed, return result map by file_name."""
     url = f"{_RESULTS_URL}/{batch_id}"
-    deadline = asyncio.get_event_loop().time() + settings.mineru_cloud_timeout
+    deadline = asyncio.get_running_loop().time() + settings.mineru_cloud_timeout
     _STATE_LABELS = {
         "waiting-file": "等待文件确认",
         "pending": "排队中",
@@ -100,7 +225,7 @@ async def _poll_until_done(
         "converting": "格式转换中",
     }
     while True:
-        remaining = deadline - asyncio.get_event_loop().time()
+        remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             raise MineruCloudError(
                 f"云端解析超时 ({settings.mineru_cloud_timeout}s), batch_id={batch_id}"
@@ -114,30 +239,32 @@ async def _poll_until_done(
                 f"查询任务结果失败: code={body.get('code')} msg={body.get('msg')}"
             )
 
-        results: list[dict] = body["data"].get("extract_result") or []
-        # Match by file_name (batch may contain only one file in our usage)
-        entry = next((r for r in results if r.get("file_name") == file_name), None)
-        if entry is None and results:
-            entry = results[0]  # fallback: single-file batch
-
-        if entry is None:
+        results: list[dict[str, Any]] = body["data"].get("extract_result") or []
+        if not results:
             await asyncio.sleep(settings.mineru_cloud_poll_interval)
             continue
 
-        state: str = entry.get("state", "")
-        if state == "done":
-            zip_url: str = entry.get("full_zip_url", "")
-            if not zip_url:
-                raise MineruCloudError("任务完成但 full_zip_url 为空")
-            return zip_url
-
-        if state == "failed":
+        states = [str(r.get("state", "")) for r in results]
+        if any(s == "failed" for s in states):
+            failed_entry = next(r for r in results if r.get("state") == "failed")
             raise MineruCloudError(
-                f"云端解析失败: {entry.get('err_msg') or '未知错误'}"
+                f"云端解析失败: {failed_entry.get('file_name')} - {failed_entry.get('err_msg') or '未知错误'}"
             )
 
-        label = _STATE_LABELS.get(state, state)
-        logger.debug("MinerU Cloud [{}] {}", batch_id[:8], label)
+        if all(s == "done" for s in states):
+            by_name: dict[str, dict[str, Any]] = {}
+            for entry in results:
+                name = str(entry.get("file_name") or "")
+                if not name:
+                    continue
+                by_name[name] = entry
+            return by_name
+
+        summary: dict[str, int] = {}
+        for s in states:
+            key = _STATE_LABELS.get(s, s)
+            summary[key] = summary.get(key, 0) + 1
+        logger.debug("MinerU Cloud [{}] 状态: {}", batch_id[:8], summary)
         await asyncio.sleep(settings.mineru_cloud_poll_interval)
 
 
@@ -168,21 +295,47 @@ async def parse_file_via_cloud(file_path: Path, out_dir: Path) -> None:
     if not settings.mineru_cloud_api_key:
         raise MineruCloudError("MINERU_CLOUD_API_KEY 未配置")
 
-    file_name = file_path.name
-    logger.info("MinerU Cloud: 上传 {} ...", file_name)
+    # Avoid stale parse artifacts mixing with fresh cloud outputs.
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("MinerU Cloud: 准备解析 {}", file_path.name)
 
     # httpx timeout: connect 30s, read/write 120s (file upload may be slow)
     timeout = httpx.Timeout(connect=30.0, read=120.0, write=120.0, pool=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        batch_id, upload_url = await _request_upload_url(client, file_name)
-        logger.info("MinerU Cloud: batch_id={} 开始上传...", batch_id[:8])
+        with tempfile.TemporaryDirectory(prefix="mineru_cloud_parts_") as tmp:
+            parts = _prepare_upload_parts(file_path, Path(tmp))
+            logger.info("MinerU Cloud: 共 {} 个分片待上传", len(parts))
 
-        await _upload_file(client, upload_url, file_path)
-        logger.info("MinerU Cloud: 上传完成，等待解析...")
+            for i in range(0, len(parts), _MAX_BATCH_FILES):
+                batch_parts = parts[i:i + _MAX_BATCH_FILES]
+                batch_no = (i // _MAX_BATCH_FILES) + 1
+                logger.info(
+                    "MinerU Cloud: 提交批次 {}/{} ({} 个文件)",
+                    batch_no,
+                    (len(parts) - 1) // _MAX_BATCH_FILES + 1,
+                    len(batch_parts),
+                )
+                batch_id, upload_urls = await _request_upload_urls(client, batch_parts)
+                await _upload_files(client, batch_parts, upload_urls)
 
-        zip_url = await _poll_until_done(client, batch_id, file_name)
-        logger.info("MinerU Cloud: 解析完成，下载 ZIP...")
+                results_by_name = await _poll_until_done(client, batch_id)
 
-        await _download_and_extract(client, zip_url, out_dir)
+                for part in batch_parts:
+                    entry = results_by_name.get(part.upload_name)
+                    if entry is None:
+                        raise MineruCloudError(
+                            f"批次结果缺少分片记录: {part.upload_name}"
+                        )
+                    zip_url = str(entry.get("full_zip_url") or "")
+                    if not zip_url:
+                        raise MineruCloudError(
+                            f"分片解析完成但 full_zip_url 为空: {part.upload_name}"
+                        )
 
-    logger.success("MinerU Cloud: {} → {}", file_name, out_dir)
+                    target_dir = out_dir / "cloud_parts" / part.output_subdir
+                    await _download_and_extract(client, zip_url, target_dir)
+
+    logger.success("MinerU Cloud: {} → {}", file_path.name, out_dir)

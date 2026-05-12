@@ -51,6 +51,10 @@ export default function CredentialsPage() {
   const [filterUserId, setFilterUserId] = useState("");
   const [filterStatus, setFilterStatus] = useState("");
   const [generatedCode, setGeneratedCode] = useState<string | null>(null);
+  const [regenCode, setRegenCode] = useState<string | null>(null);
+  const [regenExpiry, setRegenExpiry] = useState<string | null>(null);
+  const [showRegenConfirm, setShowRegenConfirm] = useState(false);
+  const [regenLoading, setRegenLoading] = useState(false);
   const { notification, notify } = useNotify();
 
   const loadMe = useCallback(async () => {
@@ -123,6 +127,28 @@ export default function CredentialsPage() {
     else notify("error", "撤销失败");
   }
 
+  async function handleRegen() {
+    setRegenLoading(true);
+    try {
+      const res = await fetch("/api/v1/credentials/regenerate", {
+        method: "POST",
+        credentials: "include",
+      });
+      if (!res.ok) {
+        const d = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
+        notify("error", d.error?.message ?? "重新生成失败");
+        return;
+      }
+      const d = (await res.json()) as { code?: string; expires_at?: string };
+      setRegenCode(d.code ?? null);
+      setRegenExpiry(d.expires_at ?? null);
+      setShowRegenConfirm(false);
+      void loadMine();
+    } finally {
+      setRegenLoading(false);
+    }
+  }
+
   if (loading) return (
     <div className="max-w-3xl mx-auto px-6 py-8 space-y-4">
       {Array.from({length:3}).map((_,i) => <Skeleton key={i} className="h-12 w-full rounded-xl" />)}
@@ -159,9 +185,32 @@ export default function CredentialsPage() {
         {(role === "STUDENT" || role === "TEACHER") && (
           <div className="space-y-3">
             <p className="text-xs text-muted-foreground">
-              凭证码在注册时由平台一次性发放。如需补发，请联系管理员。
+              凭证码在注册时由平台一次性发放，用于将 EduAgent 与你的账号绑定。
             </p>
-            {mine.length === 0 ? (
+
+            {/* Newly regenerated code — shown once */}
+            {regenCode && (
+              <div className="flex items-center gap-3 rounded-xl border border-primary/30 bg-primary/8 px-4 py-4">
+                <Key size={16} className="text-primary shrink-0" />
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs font-medium text-muted-foreground mb-1">新凭证码（仅显示一次，请立即复制）</p>
+                  <p className="font-mono text-lg font-bold text-primary tracking-widest">{regenCode}</p>
+                  {regenExpiry && (
+                    <p className="text-xs text-muted-foreground mt-1">
+                      有效至 {new Date(regenExpiry).toLocaleString("zh-CN")}
+                    </p>
+                  )}
+                </div>
+                <button
+                  onClick={() => { void navigator.clipboard.writeText(regenCode); notify("success", "已复制"); }}
+                  className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+                >
+                  <Copy size={14} />
+                </button>
+              </div>
+            )}
+
+            {mine.length === 0 && !regenCode ? (
               <div className="flex flex-col items-center justify-center py-16 rounded-xl border border-dashed border-border">
                 <Key size={24} className="text-muted-foreground mb-2" />
                 <p className="text-sm text-muted-foreground">暂无凭证记录</p>
@@ -182,6 +231,48 @@ export default function CredentialsPage() {
                 ))}
               </div>
             )}
+
+            {/* Regenerate button */}
+            {!regenCode && (
+              <div className="pt-1">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setShowRegenConfirm(true)}
+                  disabled={regenLoading}
+                >
+                  <RefreshCw size={13} className="mr-1.5" />重新生成凭证
+                </Button>
+                <p className="mt-1.5 text-xs text-muted-foreground">
+                  如果错过了凭证码，可以重新生成（旧凭证将立即失效）。
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Regenerate confirmation modal */}
+        {showRegenConfirm && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+            <div className="mx-4 w-full max-w-sm rounded-2xl bg-card border border-border p-6 shadow-2xl space-y-4">
+              <div className="flex items-start gap-3">
+                <AlertCircle size={20} className="text-amber-500 shrink-0 mt-0.5" />
+                <div>
+                  <h3 className="font-semibold text-foreground text-sm">确认重新生成凭证？</h3>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    当前所有有效凭证将立即失效。新凭证码仅显示一次，请立即复制保存。
+                  </p>
+                </div>
+              </div>
+              <div className="flex justify-end gap-2">
+                <Button variant="outline" size="sm" onClick={() => setShowRegenConfirm(false)} disabled={regenLoading}>
+                  取消
+                </Button>
+                <Button size="sm" onClick={() => void handleRegen()} disabled={regenLoading}>
+                  {regenLoading ? "生成中…" : "确认生成"}
+                </Button>
+              </div>
+            </div>
           </div>
         )}
 

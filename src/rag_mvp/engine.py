@@ -69,6 +69,17 @@ def _check_metadata() -> None:
             "Vectors may be incompatible; run 'rag clear-storage' and re-ingest."
         )
 
+
+def _lightrag_insertion_tuning_kwargs() -> dict[str, int]:
+    """Chunk / embedding batch / timeout knobs passed into LightRAG (from Settings, not import-time os.getenv)."""
+    return {
+        "embedding_batch_num": settings.embedding_batch_num,
+        "chunk_token_size": settings.chunk_token_size,
+        "chunk_overlap_token_size": settings.chunk_overlap_token_size,
+        "default_embedding_timeout": settings.embedding_timeout_seconds,
+    }
+
+
 # Supported document extensions
 _SUPPORTED_SUFFIXES = frozenset({
     ".pdf",
@@ -140,6 +151,7 @@ def _build_rag() -> RAGAnything:
         llm_model_max_async=settings.llm_max_async,
         embedding_func_max_async=settings.embedding_max_async,
         max_parallel_insert=settings.max_parallel_insert,
+        **_lightrag_insertion_tuning_kwargs(),
     )
     _write_metadata()
 
@@ -525,6 +537,19 @@ def _fix_image_paths(content_list: list, json_dir: Path) -> list:
     return fixed
 
 
+def _filter_text_only_content(content_list: list) -> tuple[list, dict[str, int]]:
+    """Keep only ``type == 'text'`` items and return skipped type counts."""
+    kept: list = []
+    skipped: dict[str, int] = {}
+    for item in content_list:
+        ctype = str(item.get("type") or "unknown")
+        if ctype == "text":
+            kept.append(item)
+            continue
+        skipped[ctype] = skipped.get(ctype, 0) + 1
+    return kept, skipped
+
+
 def reindex_from_cache(
     output_dir: str | Path | None = None,
     file_path: str | Path | None = None,
@@ -747,6 +772,7 @@ async def get_course_rag_anything(course_id: str) -> RAGAnything:
             vector_storage="PGVectorStorage",
             graph_storage=settings.graph_storage,
             doc_status_storage="PGDocStatusStorage",
+            **_lightrag_insertion_tuning_kwargs(),
         )
         await lightrag.initialize_storages()
 
@@ -802,9 +828,26 @@ def _chunk_relevance_score(chunk: dict[str, Any], rank_index: int) -> float:
     return max(0.0, 1.0 - (rank_index * 0.02))
 
 
+def _sanitize_material_display_stem(raw: str) -> str:
+    s = re.sub(r"\s+", "_", raw.strip())
+    s = re.sub(r"[^\w\u4e00-\u9fff\-]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    if not s:
+        return "document"
+    return s[:60]
+
+
+def _make_material_file_path(material_id: str, display_stem: str) -> str:
+    safe_stem = _sanitize_material_display_stem(display_stem)
+    return f"mat_{material_id}_{safe_stem}"
+
+
 def _material_id_from_course_file_path(file_path: str | None) -> str | None:
     if not file_path:
         return None
+    m_prefixed = re.search(r"^mat_([0-9a-fA-F-]{36})_", str(file_path))
+    if m_prefixed:
+        return m_prefixed.group(1)
     m = re.search(r"materials/[0-9a-fA-F-]{36}/([0-9a-fA-F-]{36})/", str(file_path))
     return m.group(1) if m else None
 
@@ -905,6 +948,8 @@ async def ingest_parsed_material_into_course_async(
     course_id: str,
     material_id: str,
     source_file: Path,
+    original_filename: str | None = None,
+    text_only: bool = True,
 ) -> int:
     """Insert already-parsed MinerU JSON (under output_dir / stem) into course LightRAG."""
     ensure_embedding_backend_reachable()
@@ -927,11 +972,23 @@ async def ingest_parsed_material_into_course_async(
         total = 0
         for json_path in json_files:
             sub_stem = json_path.stem.replace("_content_list", "")
+            display_stem = Path(original_filename).stem if original_filename else sub_stem
+            rag_file_path = _make_material_file_path(material_id, display_stem)
             raw: list = json.loads(json_path.read_text(encoding="utf-8"))
             content_list = _fix_image_paths(raw, json_path.parent)
+            if text_only:
+                filtered_list, skipped = _filter_text_only_content(content_list)
+                logger.info(
+                    "text_only ingest material={} file={} kept_text={} skipped_types={}",
+                    material_id,
+                    json_path.name,
+                    len(filtered_list),
+                    skipped,
+                )
+                content_list = filtered_list
             await rag.insert_content_list(
                 content_list,
-                file_path=sub_stem,
+                file_path=rag_file_path,
                 doc_id=doc_id,
             )
             total += len(content_list)
@@ -1015,10 +1072,18 @@ def ingest_parsed_material_into_course_sync(
     course_id: str,
     material_id: str,
     source_file: Path,
+    original_filename: str | None = None,
+    text_only: bool = True,
 ) -> int:
     try:
         return asyncio.run(
-            ingest_parsed_material_into_course_async(course_id, material_id, source_file),
+            ingest_parsed_material_into_course_async(
+                course_id,
+                material_id,
+                source_file,
+                original_filename=original_filename,
+                text_only=text_only,
+            ),
         )
     finally:
         _invalidate_course_rag_cache_for(course_id)

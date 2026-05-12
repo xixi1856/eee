@@ -3,10 +3,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 export type ChatMessage = {
+  clientId: string;
   role: "user" | "assistant";
   text: string;
   attachments?: AttachmentRef[];
+  /** Same QaLog row id for hydrated user/assistant pair */
+  qaLogId?: string;
+  /** After editing this user turn, the assistant reply that was replaced (client-only). */
+  supersededAssistantReply?: string;
 };
+
 export type Citation = {
   chunk_id?: string;
   material_id?: string;
@@ -77,23 +83,59 @@ function formatChatHttpError(status: number, body: ApiErrJson): string {
   return raw || `请求失败 (${status})`;
 }
 
-function logToMsgs(
-  rows: { question: string; answer: string | null }[],
-): ChatMessage[] {
+function newClientId(): string {
+  return crypto.randomUUID();
+}
+
+function isAssistantErrorBubble(text: string): boolean {
+  return text.startsWith("[错误:");
+}
+
+type HydratedRow = {
+  id?: string;
+  question: string;
+  answer: string | null;
+};
+
+function logToMsgs(rows: HydratedRow[]): ChatMessage[] {
   const out: ChatMessage[] = [];
   for (const r of rows) {
-    out.push({ role: "user", text: r.question });
+    const qaLogId = typeof r.id === "string" && r.id ? r.id : undefined;
+    out.push({
+      clientId: newClientId(),
+      role: "user",
+      text: r.question,
+      ...(qaLogId ? { qaLogId } : {}),
+    });
     if (r.answer) {
-      out.push({ role: "assistant", text: r.answer });
+      out.push({
+        clientId: newClientId(),
+        role: "assistant",
+        text: r.answer,
+        ...(qaLogId ? { qaLogId } : {}),
+      });
     }
   }
   return out;
+}
+
+function mapAttachmentsForPayload(refs: AttachmentRef[]) {
+  return refs.map(({ id, key, presigned_url, mime_type, name }) => ({
+    id,
+    key,
+    presigned_url,
+    mime_type,
+    name,
+  }));
 }
 
 export function useChatStream(config: UseChatStreamConfig) {
   const cfgRef = useRef(config);
   cfgRef.current = config;
   const [msgs, setMsgs] = useState<ChatMessage[]>([]);
+  const msgsRef = useRef<ChatMessage[]>([]);
+  msgsRef.current = msgs;
+
   const [streaming, setStreaming] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [citations, setCitations] = useState<Citation[]>([]);
@@ -125,7 +167,7 @@ export function useChatStream(config: UseChatStreamConfig) {
           );
           if (!res.ok || cancelled) return;
           const body = (await res.json()) as {
-            messages?: { question: string; answer: string | null }[];
+            messages?: HydratedRow[];
           };
           const rows = Array.isArray(body.messages) ? body.messages : [];
           if (!cancelled) setMsgs(logToMsgs(rows));
@@ -149,7 +191,7 @@ export function useChatStream(config: UseChatStreamConfig) {
           );
           if (!res.ok || cancelled) return;
           const body = (await res.json()) as {
-            messages?: { question: string; answer: string | null }[];
+            messages?: HydratedRow[];
           };
           const rows = Array.isArray(body.messages) ? body.messages : [];
           if (!cancelled) setMsgs(logToMsgs(rows));
@@ -210,42 +252,21 @@ export function useChatStream(config: UseChatStreamConfig) {
     });
   }, []);
 
-  const sendMessage = useCallback(
-    async (text: string, lessonId?: string) => {
+  const runChatRequest = useCallback(
+    async (message: string, lessonId: string | undefined, attachmentRefs: AttachmentRef[]) => {
       const config = cfgRef.current;
-      if (busy) return;
       setBusy(true);
       setStreaming("");
       setCitations([]);
       setLastMeta(null);
       setErrorMsg(null);
 
-      const snapshotAttachments = pendingAttachments.slice();
-      setPendingAttachments([]);
-
-      setMsgs((prev) => [
-        ...prev,
-        {
-          role: "user",
-          text,
-          attachments: snapshotAttachments.length ? snapshotAttachments : undefined,
-        },
-      ]);
-
       abortRef.current?.abort();
       abortRef.current = new AbortController();
 
-      try {
-        const attachmentsPayload = snapshotAttachments.map(
-          ({ id, key, presigned_url, mime_type, name }) => ({
-            id,
-            key,
-            presigned_url,
-            mime_type,
-            name,
-          }),
-        );
+      const attachmentsPayload = mapAttachmentsForPayload(attachmentRefs);
 
+      try {
         const isQaGlobal = config.kind === "qa_center_global";
         const courseId = config.kind === "course" ? config.courseId : "";
         const url = isQaGlobal
@@ -253,7 +274,7 @@ export function useChatStream(config: UseChatStreamConfig) {
           : `/api/v1/courses/${courseId}/chat`;
 
         const body: Record<string, unknown> = {
-          message: text,
+          message,
           ...(lessonId ? { lesson_id: lessonId } : {}),
           ...(attachmentsPayload.length ? { attachments: attachmentsPayload } : {}),
         };
@@ -339,22 +360,134 @@ export function useChatStream(config: UseChatStreamConfig) {
         }
 
         if (streamText) {
-          setMsgs((prev) => [...prev, { role: "assistant", text: streamText }]);
+          const assistantMsg: ChatMessage = {
+            clientId: newClientId(),
+            role: "assistant",
+            text: streamText,
+          };
+          setMsgs((prev) => {
+            const next = [...prev, assistantMsg];
+            msgsRef.current = next;
+            return next;
+          });
         }
         setStreaming("");
       } catch (e) {
         if ((e as { name?: string }).name !== "AbortError") {
           const msg = e instanceof Error ? e.message : "请求失败";
           setErrorMsg(msg);
-          setMsgs((prev) => [...prev, { role: "assistant", text: `[错误: ${msg}]` }]);
+          const errBubble: ChatMessage = {
+            clientId: newClientId(),
+            role: "assistant",
+            text: `[错误: ${msg}]`,
+          };
+          setMsgs((prev) => {
+            const next = [...prev, errBubble];
+            msgsRef.current = next;
+            return next;
+          });
         }
         setStreaming("");
       } finally {
         setBusy(false);
       }
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [busy, pendingAttachments],
+    [],
+  );
+
+  const sendMessage = useCallback(
+    async (text: string, lessonId?: string) => {
+      if (busy) return;
+      const trimmed = text.trim();
+      if (!trimmed && pendingAttachments.length === 0) return;
+
+      const snapshotAttachments = pendingAttachments.slice();
+      setPendingAttachments([]);
+
+      const userMsg: ChatMessage = {
+        clientId: newClientId(),
+        role: "user",
+        text: trimmed,
+        ...(snapshotAttachments.length ? { attachments: snapshotAttachments } : {}),
+      };
+
+      setMsgs((prev) => {
+        const next = [...prev, userMsg];
+        msgsRef.current = next;
+        return next;
+      });
+
+      await runChatRequest(trimmed, lessonId, snapshotAttachments);
+    },
+    [busy, pendingAttachments, runChatRequest],
+  );
+
+  const commitUserEditReplace = useCallback(
+    async (replaceFromIndex: number, text: string, lessonId?: string): Promise<boolean> => {
+      if (busy) return false;
+      const trimmed = text.trim();
+      const prev = msgsRef.current;
+      const row = prev[replaceFromIndex];
+      if (!row || row.role !== "user") return false;
+      const hasAtt = (row.attachments?.length ?? 0) > 0;
+      if (!trimmed && !hasAtt) return false;
+
+      const nextAssistant = prev[replaceFromIndex + 1];
+      let superseded: string | undefined;
+      if (
+        nextAssistant?.role === "assistant" &&
+        !isAssistantErrorBubble(nextAssistant.text)
+      ) {
+        superseded = nextAssistant.text;
+      }
+
+      const attachments = row.attachments ?? [];
+      const newUser: ChatMessage = {
+        clientId: newClientId(),
+        role: "user",
+        text: trimmed,
+        ...(attachments.length ? { attachments } : {}),
+        ...(superseded !== undefined ? { supersededAssistantReply: superseded } : {}),
+      };
+
+      const messageForApi = trimmed;
+
+      const newMsgs = [...prev.slice(0, replaceFromIndex), newUser];
+      msgsRef.current = newMsgs;
+      setMsgs(newMsgs);
+
+      await runChatRequest(messageForApi, lessonId, attachments);
+      return true;
+    },
+    [busy, runChatRequest],
+  );
+
+  const regenerateAssistantAt = useCallback(
+    async (assistantIndex: number, lessonId?: string) => {
+      if (busy) return;
+      const prev = msgsRef.current;
+      const userRow = prev[assistantIndex - 1];
+      const assistantRow = prev[assistantIndex];
+      if (
+        !userRow ||
+        userRow.role !== "user" ||
+        !assistantRow ||
+        assistantRow.role !== "assistant"
+      ) {
+        return;
+      }
+
+      const newMsgs = prev.slice(0, assistantIndex);
+      msgsRef.current = newMsgs;
+      setMsgs(newMsgs);
+
+      await runChatRequest(
+        userRow.text,
+        lessonId,
+        userRow.attachments ?? [],
+      );
+    },
+    [busy, runChatRequest],
   );
 
   return {
@@ -365,6 +498,8 @@ export function useChatStream(config: UseChatStreamConfig) {
     lastMeta,
     errorMsg,
     sendMessage,
+    commitUserEditReplace,
+    regenerateAssistantAt,
     pendingAttachments,
     attachmentUploading,
     addAttachment,

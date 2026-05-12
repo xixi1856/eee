@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _EMBEDDING_MODES = frozenset({"ollama", "openai_compatible"})
@@ -24,16 +24,28 @@ class Settings(BaseSettings):
     refine_model: str = "qwen-long"   # long-context model for structure-refine phase
     vision_model: str = "qwen-vl-max"
     # Embedding backend: ollama (local) | openai_compatible (OpenAI /v1/embeddings API, incl. DashScope compatible-mode)
-    embedding_mode: str = "ollama"
+    embedding_mode: str = "openai_compatible"
     # Optional overrides for openai_compatible; empty → use LLM_BASE_URL / LLM_API_KEY
     embedding_base_url: str = ""
     embedding_api_key: str = ""
     ollama_base_url: str = "http://127.0.0.1:11434"
     # Model id depends on embedding_mode: Ollama tag (e.g. bge-m3) or API model (e.g. text-embedding-v1).
-    embedding_model: str = "bge-m3"
+    embedding_model: str = "text-embedding-v1"
     # Must match embedding vectors and PostgreSQL ``vector(N)`` on LightRAG tables.
     embedding_dim: int = 1024
     embedding_max_tokens: int = 8192
+    # LightRAG insert tuning (passed explicitly in engine.LightRAG so values respect Settings, not import-time os.getenv).
+    embedding_batch_num: int = Field(
+        default=3,
+        validation_alias="EMBEDDING_BATCH_NUM",
+        description="Texts per embedding batch inside LightRAG; lower reduces peak embed memory/latency.",
+    )
+    chunk_token_size: int = Field(default=1000, validation_alias="CHUNK_SIZE")
+    """LightRAG text chunk size in tokens (env CHUNK_SIZE)."""
+    chunk_overlap_token_size: int = Field(default=100, validation_alias="CHUNK_OVERLAP_SIZE")
+    """Overlap between consecutive chunks (env CHUNK_OVERLAP_SIZE)."""
+    embedding_timeout_seconds: int = Field(default=120, validation_alias="EMBEDDING_TIMEOUT")
+    """LightRAG default_embedding_timeout (seconds). Worker execution cap scales with this inside lightrag.utils."""
 
     @field_validator("embedding_mode", mode="before")
     @classmethod
@@ -107,7 +119,7 @@ class Settings(BaseSettings):
 
     # Concurrency limits (lower to reduce 429 rate-limit errors and asyncpg pool races)
     llm_max_async: int = 4          # parallel LLM (chat) requests
-    embedding_max_async: int = 8    # parallel embedding requests (was 16; PG pool + Windows)
+    embedding_max_async: int = 2    # parallel embedding calls (lower for Ollama CPU / Windows + PG pool)
     max_parallel_insert: int = 1    # parallel document inserts (was 2; safer with asyncio.run)
 
     # Image filtering (skip decorative / useless images before full vision analysis)

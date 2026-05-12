@@ -112,6 +112,7 @@ export async function uploadMaterialStream(params: {
   contentLength: number;
   body: ReadableStream<Uint8Array> | Readable;
   lessonId?: string | null;
+  textOnly?: boolean;
 }): Promise<MaterialCreatedDto> {
   try {
     getMinioConfig();
@@ -218,6 +219,7 @@ export async function uploadMaterialStream(params: {
     material_id: materialId,
     operation: "parse_and_index",
     created_at: new Date().toISOString(),
+    text_only: params.textOnly ?? true,
   };
   await enqueueRagTaskWithRetry(task);
 
@@ -284,6 +286,48 @@ export async function deleteMaterial(
   }
 }
 
+/** Queue index-only retry (worker must have local MinerU output under ``output_dir``). */
+export async function retryMaterialIndex(
+  userId: string,
+  role: UserRole,
+  courseId: string,
+  materialId: string,
+  textOnly?: boolean,
+): Promise<void> {
+  assertUuid(materialId, "material_id");
+  assertUuid(courseId, "course_id");
+  await assertTeacherOfCourse(userId, role, courseId);
+  if (!getRedisUrl()) {
+    throw new ApiError(
+      503,
+      "SERVICE_UNAVAILABLE",
+      "REDIS_URL is required to queue RAG index retry",
+    );
+  }
+  const m = await prisma.material.findFirst({
+    where: { id: materialId, courseId, isDeleted: false },
+  });
+  if (!m) {
+    throw new ApiError(404, "NOT_FOUND", "Material not found");
+  }
+  if (m.status !== MaterialStatus.FAILED) {
+    throw new ApiError(
+      409,
+      "CONFLICT",
+      "Only materials in FAILED status can retry indexing from cached parse output",
+      { status: m.status },
+    );
+  }
+  const task: RagQueueTask = {
+    task_id: randomUUID(),
+    material_id: materialId,
+    operation: "index_only",
+    created_at: new Date().toISOString(),
+    text_only: textOnly ?? true,
+  };
+  await enqueueRagTaskWithRetry(task);
+}
+
 function guessContentTypeByFileType(fileType: string): string {
   const ft = fileType.toLowerCase();
   if (ft === "pdf") return "application/pdf";
@@ -337,6 +381,106 @@ async function readObjectStreamForMaterial(
   }
 }
 
+async function enqueuePreviewRepairIfFailed(materialId: string): Promise<boolean> {
+  if (!getRedisUrl()) {
+    return false;
+  }
+  const moved = await prisma.material.updateMany({
+    where: {
+      id: materialId,
+      isDeleted: false,
+      previewPdfStatus: MaterialPreviewPdfStatus.FAILED,
+    },
+    data: {
+      previewPdfStatus: MaterialPreviewPdfStatus.PENDING,
+      statusMessage: null,
+    },
+  });
+  if (moved.count < 1) {
+    return false;
+  }
+  try {
+    await enqueueRagTaskWithRetry({
+      task_id: randomUUID(),
+      material_id: materialId,
+      operation: "repair_preview",
+      created_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    await prisma.material.updateMany({
+      where: {
+        id: materialId,
+        isDeleted: false,
+        previewPdfStatus: MaterialPreviewPdfStatus.PENDING,
+      },
+      data: {
+        previewPdfStatus: MaterialPreviewPdfStatus.FAILED,
+        statusMessage: `PREVIEW_REPAIR_QUEUE_FAILED: ${detail.slice(0, 500)}`,
+      },
+    });
+    throw e;
+  }
+  return true;
+}
+
+/** Office inline preview: try `preview.pdf`, then legacy `{materialId}.pdf`. */
+async function readOfficePreviewStreamWithFallback(
+  m: Material,
+): Promise<Awaited<ReturnType<typeof getObjectStream>>> {
+  const keys = [
+    previewPdfObjectKey(m.minioPath),
+    legacyConvertedPdfObjectKey(m.minioPath, m.id),
+  ];
+  for (const objectKey of keys) {
+    try {
+      return await readObjectStreamForMaterial(objectKey);
+    } catch (e) {
+      const err = e instanceof ApiError ? e : mapStorageReadError(e);
+      if (err.status === 404 && err.code === "NOT_FOUND") {
+        continue;
+      }
+      throw err;
+    }
+  }
+  let reconcileFailed = false;
+  let reconcileDetail: string | undefined;
+  let repairQueued = false;
+  let repairQueueDetail: string | undefined;
+  if (m.previewPdfStatus === MaterialPreviewPdfStatus.READY) {
+    try {
+      await prisma.material.update({
+        where: { id: m.id },
+        data: {
+          previewPdfStatus: MaterialPreviewPdfStatus.FAILED,
+          statusMessage: "预览 PDF 在存储中不存在，请重新上传或等待转换完成。",
+        },
+      });
+    } catch (e) {
+      reconcileFailed = true;
+      reconcileDetail = e instanceof Error ? e.message : String(e);
+    }
+    try {
+      repairQueued = await enqueuePreviewRepairIfFailed(m.id);
+    } catch (e) {
+      repairQueueDetail = e instanceof Error ? e.message : String(e);
+    }
+  }
+  throw new ApiError(
+    425,
+    "PREVIEW_NOT_READY",
+    "Preview PDF is repairing",
+    {
+      tried_keys: keys,
+      reconciled_to_failed: m.previewPdfStatus === MaterialPreviewPdfStatus.READY && !reconcileFailed,
+      reconcile_failed: reconcileFailed,
+      reconcile_error: reconcileFailed ? reconcileDetail?.slice(0, 500) : undefined,
+      repair_queued: repairQueued,
+      repair_queue_error: repairQueueDetail ? repairQueueDetail.slice(0, 500) : undefined,
+    },
+  );
+}
+
 export type OpenMaterialContentParams = {
   userId: string;
   role: UserRole;
@@ -376,12 +520,22 @@ export async function openMaterialContentStream(
   if (isOfficeMaterialFileType(ft)) {
     const ps = m.previewPdfStatus;
     if (ps !== MaterialPreviewPdfStatus.READY) {
+      let repairQueued = false;
+      let repairQueueError: string | undefined;
+      if (ps === MaterialPreviewPdfStatus.FAILED) {
+        try {
+          repairQueued = await enqueuePreviewRepairIfFailed(m.id);
+        } catch (e) {
+          repairQueueError = e instanceof Error ? e.message : String(e);
+        }
+      }
       throw new ApiError(425, "PREVIEW_NOT_READY", "Preview PDF is not ready yet", {
         preview_pdf_status: ps,
+        repair_queued: repairQueued,
+        repair_queue_error: repairQueueError ? repairQueueError.slice(0, 500) : undefined,
       });
     }
-    const key = previewPdfObjectKey(m.minioPath);
-    const { body, contentType } = await readObjectStreamForMaterial(key);
+    const { body, contentType } = await readOfficePreviewStreamWithFallback(m);
     return {
       body,
       contentType: contentType || "application/pdf",

@@ -113,6 +113,9 @@ class SubAgent:
         overrides = AgentConfig(model=model_hint) if model_hint else None
 
         rt = resolve_provider_runtime(settings, overrides, "subagent") if settings is not None else None
+        llm_extra_body: dict[str, Any] = {}
+        if rt is not None and rt.llm_extra_body:
+            llm_extra_body = dict(rt.llm_extra_body)
 
         if self._injected_client is None:
             if settings is None or rt is None:
@@ -177,16 +180,18 @@ class SubAgent:
                 )
             )
             try:
-                return await self._run_isolated_async(config, settings)
+                return await self._run_isolated_async(config, settings, llm_extra_body=llm_extra_body)
             finally:
                 reset_current_runtime(sub_tok)
 
-        return await self._run_isolated_async(config, settings)
+        return await self._run_isolated_async(config, settings, llm_extra_body=llm_extra_body)
 
     async def _run_isolated_async(
         self,
         config: SubAgentConfig,
         settings: EduSettings | None,
+        *,
+        llm_extra_body: dict[str, Any] | None = None,
     ) -> SubTaskResult:
         system = config.system_prompt.strip() or _MINIMAL_SYSTEM
         if settings is None:
@@ -213,6 +218,8 @@ class SubAgent:
             )
             if tool_schemas:
                 create_kwargs["tools"] = cast(list[Any], tool_schemas)
+            if llm_extra_body:
+                create_kwargs["extra_body"] = dict(llm_extra_body)
 
             try:
                 response = self._client.chat.completions.create(**create_kwargs)

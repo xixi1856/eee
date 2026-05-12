@@ -20,6 +20,7 @@ import httpx
 from edu_agent.agent import EduAgent
 from edu_agent.auth.checker import AuthorizationChecker
 from edu_agent.channels import CLIChannelAdapter
+from edu_agent.cli_preflight import emit_edu_chat_startup_warnings
 from edu_agent.channels.weixin import run_weixin_qr_login
 from edu_agent.config_loader import load_settings
 from edu_agent.context.manager import ContextManager
@@ -391,6 +392,8 @@ def chat(
     )
     adapter = CLIChannelAdapter(gateway)
     mode_state: list[str] = [progress]
+
+    emit_edu_chat_startup_warnings(settings, user_id=user)
 
     if enable_cron:
         from edu_agent.cron import CronDaemon

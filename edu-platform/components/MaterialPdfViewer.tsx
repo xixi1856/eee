@@ -39,20 +39,46 @@ export default function MaterialPdfViewer({
         const pdfjs = await import("pdfjs-dist");
         pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
 
-        const res = await fetch(`/api/v1/materials/${materialId}/content`, {
-          credentials: "include",
-        });
-
-        if (!res.ok) {
-          let msg = `无法加载 PDF（HTTP ${res.status}）`;
+        let res: Response | null = null;
+        let retryMsg = "预览 PDF 尚未生成，正在自动重试…";
+        for (let attempt = 1; attempt <= 6; attempt++) {
+          res = await fetch(`/api/v1/materials/${materialId}/content`, {
+            credentials: "include",
+          });
+          if (res.ok) {
+            break;
+          }
           const ct = res.headers.get("content-type") ?? "";
+          const j = ct.includes("application/json")
+            ? ((await res.json().catch(() => null)) as {
+                error?: { message?: string; code?: string };
+              } | null)
+            : null;
+          if (j?.error?.code !== "PREVIEW_NOT_READY") {
+            break;
+          }
+          retryMsg = j?.error?.message || retryMsg;
+          if (attempt < 6) {
+            if (!cancelled) setError(retryMsg);
+            await new Promise((r) => setTimeout(r, 700 * attempt));
+            continue;
+          }
+        }
+
+        if (!res || !res.ok) {
+          let msg = `无法加载 PDF（HTTP ${res?.status ?? 0}）`;
+          const ct = res?.headers.get("content-type") ?? "";
           if (ct.includes("application/json")) {
-            const j = (await res.json().catch(() => null)) as {
+            const j = (await res?.json().catch(() => null)) as {
               error?: { message?: string; code?: string };
             } | null;
             if (j?.error?.message) msg = j.error.message;
             if (j?.error?.code === "PREVIEW_NOT_READY") {
-              msg = "预览 PDF 尚未生成，请稍候或下载原文件。";
+              msg = "预览 PDF 正在生成/修复中，请稍后重试。";
+            }
+            if (j?.error?.code === "NOT_FOUND") {
+              msg =
+                "内联预览使用的 PDF 在存储中缺失（例如仅有旧版预览键或对象被清理），原文件仍可正常下载。请使用下方「下载原文件」。";
             }
           }
           if (!cancelled) setError(msg);

@@ -360,3 +360,25 @@ export async function completeBindCredential(
     channel_token,
   };
 }
+
+/**
+ * Regenerate a credential for the calling user (self-service).
+ * Any existing ACTIVE credential is immediately expired, then a fresh one is issued.
+ * Subject to the same per-hour rate limit as createAdminCredentialForUser.
+ */
+export async function regenerateCredentialForSelf(
+  userId: string,
+): Promise<CredentialCreatedDto> {
+  await assertCredentialGenerationAllowed(userId);
+  const expiresAt = new Date(
+    Date.now() + getSelfCredentialMaxExpiresMinutes() * 60 * 1000,
+  );
+  return prisma.$transaction(async (tx) => {
+    // Expire all currently active credentials for this user
+    await tx.credential.updateMany({
+      where: { userId, status: CredentialStatus.ACTIVE },
+      data: { status: CredentialStatus.EXPIRED },
+    });
+    return allocateUniqueCredentialCore(tx, userId, expiresAt, true);
+  });
+}

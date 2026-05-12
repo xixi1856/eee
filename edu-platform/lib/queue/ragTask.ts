@@ -5,17 +5,24 @@ import { getRedis } from "@/lib/redis";
 export type RagQueueTask = {
   task_id: string;
   material_id: string;
-  operation: "parse_and_index" | "delete_material";
+  operation: "parse_and_index" | "index_only" | "delete_material" | "repair_preview";
   created_at: string;
+  text_only?: boolean;
 };
 
 export async function enqueueRagTask(task: RagQueueTask): Promise<void> {
   const redis = await getRedis();
   const stream = getRagTaskStreamName();
-  await redis.xAdd(stream, "*", {
+  const fields: Record<string, string> = {
     task_id: task.task_id,
     material_id: task.material_id,
     operation: task.operation,
     created_at: task.created_at,
+  };
+  if (typeof task.text_only === "boolean") {
+    fields.text_only = task.text_only ? "true" : "false";
+  }
+  await redis.xAdd(stream, "*", {
+    ...fields,
   });
 }

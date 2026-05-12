@@ -93,6 +93,27 @@ def test_resolve_provider_runtime_missing_api_key_raises(monkeypatch: pytest.Mon
         resolve_provider_runtime(settings, None, "main")
 
 
+def test_resolve_provider_runtime_llm_extra_body():
+    settings = EduSettings(
+        agent=AgentDefaults(
+            workspace=Path("."),
+            model="m",
+            provider="dashscope",
+            llm_extra_body={"thinking": {"type": "disabled"}},
+        ),
+        providers=ProvidersSettings(
+            entries={
+                "dashscope": ProviderCredentials(
+                    api_key="k",
+                    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                ),
+            },
+        ),
+    )
+    rt = resolve_provider_runtime(settings, None, "main")
+    assert rt.llm_extra_body == {"thinking": {"type": "disabled"}}
+
+
 def test_build_openai_client_delegates_to_sdk():
     from edu_agent.providers.types import ResolvedProviderRuntime
 

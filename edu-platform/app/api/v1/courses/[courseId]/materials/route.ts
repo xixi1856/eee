@@ -14,6 +14,13 @@ export const dynamic = "force-dynamic";
 
 type Ctx = { params: Promise<{ courseId: string }> };
 
+function parseTextOnly(v: FormDataEntryValue | null): boolean {
+  if (typeof v !== "string") return true;
+  const s = v.trim().toLowerCase();
+  if (!s) return true;
+  return s === "1" || s === "true" || s === "yes" || s === "on";
+}
+
 export async function GET(req: NextRequest, ctx: Ctx) {
   try {
     const auth = requireAuthenticated(await getAuthFromRequest(req));
@@ -47,8 +54,10 @@ export async function POST(req: NextRequest, ctx: Ctx) {
       throw new ApiError(400, "VALIDATION_ERROR", "multipart field 'file' is required");
     }
     const lessonRaw = form.get("lesson_id");
+    const textOnlyRaw = form.get("text_only");
     const lessonId =
       typeof lessonRaw === "string" && lessonRaw.trim() ? lessonRaw.trim() : null;
+    const textOnly = parseTextOnly(textOnlyRaw);
     const size = file.size;
     if (size <= 0) {
       throw new ApiError(400, "VALIDATION_ERROR", "Empty file");
@@ -63,6 +72,7 @@ export async function POST(req: NextRequest, ctx: Ctx) {
       contentLength: size,
       body,
       lessonId,
+      textOnly,
     });
     return jsonOk(created, 201);
   } catch (e) {

@@ -44,11 +44,42 @@ _SAFETY_BLOCK = """\
 _TOOL_GUIDANCE = """\
 ## 工具使用指南
 - 遇到知识性问题（概念、原理、定义、事实）时，优先调用 `knowledge_query` 从知识库获取准确信息，再结合自身能力作答。
+- 用户询问课程文档内容（如 PPT 讲了什么、课件有哪些重点、某份资料的结论）时，必须先调用 `knowledge_query` 检索再回答。
 - 用户要求练习、做题、出题或测验时，调用 `generate_quiz` 生成题目。
 - 工具返回空结果或失败时，诚实告知用户，并给出力所能及的解释。
 - **重要区分**：`<available_skills>` 列出的是**知识指南**，不是可直接调用的函数名。
   阅读技能指南请调用 `view_skill(name)`；可直接调用的函数名仅限工具列表（tools）中的条目。
 """
+
+_COURSE_MODE_BLOCK = """\
+## 当前会话：课程知识库模式
+当前对话已绑定课程知识库。课程资料（PPT、PDF、讲义等）已上传并建立索引，
+可通过 `knowledge_query(question=..., sources="course")` 进行检索。
+
+重要规则：
+- 用户询问课程资料内容时，必须先调用 `knowledge_query`，不得要求用户重新上传文件。
+- 仅当工具结果为空或失败时，才退回通用解释，并明确说明未检索到相关内容。
+"""
+
+_HUB_MODE_BLOCK = """\
+## 当前会话模式（问答中心）
+当前未绑定单一课程。调用 `knowledge_query` 时必须使用 `sources=enrolled_courses`
+（检索用户有权限的全部课程知识库）或 `sources=personal`；不得使用 `sources=course` 或 `sources=all`。
+"""
+
+
+def _render_course_mode_block(course_material_names: list[str] | None = None) -> str:
+    if not course_material_names:
+        return _COURSE_MODE_BLOCK
+    names = [n.strip() for n in course_material_names if isinstance(n, str) and n.strip()]
+    if not names:
+        return _COURSE_MODE_BLOCK
+    preview = "、".join(names[:12])
+    extra = f" 等 {len(names)} 份" if len(names) > 12 else ""
+    return (
+        f"{_COURSE_MODE_BLOCK}\n"
+        f"已索引材料：{preview}{extra}。"
+    )
 
 
 def _build_skills_index(entries: list[SkillEntry]) -> str:
@@ -90,6 +121,8 @@ def build_system_prompt(
     available_tools: set[str] | None = None,
     skill_entries: list[SkillEntry] | None = None,
     memory_context: str = "",
+    course_id: str | None = None,
+    course_material_names: list[str] | None = None,
 ) -> str:
     """Assemble and return the full system prompt string.
 
@@ -102,6 +135,8 @@ def build_system_prompt(
             the index (Hermes-style gating). Pass ``None`` to skip filtering.
         memory_context: Optional short block of retrieved long-term memory
             (only injected when the caller enables memory prompt injection).
+        course_id: Bound course identifier for course-chat mode.
+        course_material_names: Indexed material names for bound course.
     """
     entries = skill_entries if skill_entries is not None else load_skill_entries(skills_dir)
 
@@ -136,6 +171,11 @@ def build_system_prompt(
         sections.append(_build_skills_index(index_entries))
 
     # 3. Learner profile summary
+    if (course_id or "").strip():
+        sections.append(_render_course_mode_block(course_material_names))
+    else:
+        sections.append(_HUB_MODE_BLOCK)
+
     if learner_profile_summary.strip():
         sections.append(
             f"## 学习者当前状态\n{learner_profile_summary.strip()}"

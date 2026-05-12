@@ -7,12 +7,31 @@ import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
-import { Send, User, Bot, AlertCircle, Paperclip, X, FileText, Loader2 } from "lucide-react";
+import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
+import {
+  Send,
+  User,
+  Bot,
+  AlertCircle,
+  Paperclip,
+  X,
+  FileText,
+  Loader2,
+  Copy,
+  Pencil,
+  RefreshCw,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   useChatStream,
   type AttachmentRef,
+  type ChatMessage,
   type UseChatStreamConfig,
 } from "@/lib/hooks/useChatStream";
 
@@ -58,9 +77,16 @@ function defaultEmptyHint(props: ChatComponentProps): string {
   return "向我提问关于本节课的任何问题";
 }
 
+async function copyToClipboard(text: string): Promise<void> {
+  await navigator.clipboard.writeText(text);
+}
+
 export default function ChatComponent(props: ChatComponentProps) {
   const [input, setInput] = useState("");
   const [agentIdentityBound, setAgentIdentityBound] = useState<boolean | null>(null);
+  const [editingClientId, setEditingClientId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState("");
+  const [supersededSheetText, setSupersededSheetText] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const {
     msgs,
@@ -70,6 +96,8 @@ export default function ChatComponent(props: ChatComponentProps) {
     lastMeta,
     errorMsg,
     sendMessage,
+    commitUserEditReplace,
+    regenerateAssistantAt,
     pendingAttachments,
     attachmentUploading,
     addAttachment,
@@ -77,6 +105,17 @@ export default function ChatComponent(props: ChatComponentProps) {
   } = useChatStream(buildStreamConfig(props));
   const scrollRef = useRef<HTMLDivElement>(null);
   const emptyHint = props.emptyHint ?? defaultEmptyHint(props);
+
+  const threadKey =
+    props.variant === "qa_center"
+      ? props.sessionId ?? ""
+      : `${props.courseId}:${props.hydrateSessionId ?? ""}`;
+
+  useEffect(() => {
+    setEditingClientId(null);
+    setEditDraft("");
+    setSupersededSheetText(null);
+  }, [threadKey]);
 
   const loadUser = useCallback(async () => {
     const res = await fetch("/api/v1/user", { credentials: "include" });
@@ -110,7 +149,9 @@ export default function ChatComponent(props: ChatComponentProps) {
 
   useEffect(() => {
     if (scrollRef.current) {
-      const scrollElement = scrollRef.current.querySelector('[data-radix-scroll-area-viewport]');
+      const scrollElement = scrollRef.current.querySelector(
+        "[data-radix-scroll-area-viewport]",
+      );
       if (scrollElement) {
         scrollElement.scrollTop = scrollElement.scrollHeight;
       }
@@ -119,7 +160,7 @@ export default function ChatComponent(props: ChatComponentProps) {
 
   const handleSend = () => {
     if ((!input.trim() && pendingAttachments.length === 0) || busy) return;
-    sendMessage(input);
+    void sendMessage(input);
     setInput("");
   };
 
@@ -136,8 +177,38 @@ export default function ChatComponent(props: ChatComponentProps) {
     e.target.value = "";
   };
 
+  const startEdit = (msg: ChatMessage) => {
+    setEditingClientId(msg.clientId);
+    setEditDraft(msg.text);
+  };
+
+  const cancelEdit = () => {
+    setEditingClientId(null);
+    setEditDraft("");
+  };
+
+  const submitEdit = (msgIndex: number) => {
+    if (busy) return;
+    void commitUserEditReplace(msgIndex, editDraft).then((ok) => {
+      if (ok) cancelEdit();
+    });
+  };
+
   return (
     <div className="flex flex-col h-full bg-background relative">
+      <Sheet open={supersededSheetText !== null} onOpenChange={(o) => !o && setSupersededSheetText(null)}>
+        <SheetContent side="right" className="w-full sm:max-w-lg overflow-y-auto">
+          <SheetHeader>
+            <SheetTitle>此前的回答</SheetTitle>
+          </SheetHeader>
+          <div className="mt-4 prose prose-sm dark:prose-invert max-w-none">
+            {supersededSheetText !== null && (
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{supersededSheetText}</ReactMarkdown>
+            )}
+          </div>
+        </SheetContent>
+      </Sheet>
+
       {agentIdentityBound === false && (
         <div className="shrink-0 border-b border-amber-500/25 bg-amber-500/10 px-4 py-2.5 text-sm text-amber-950 dark:text-amber-100">
           <div className="max-w-3xl mx-auto flex flex-wrap items-center gap-2">
@@ -164,59 +235,182 @@ export default function ChatComponent(props: ChatComponentProps) {
             </div>
           )}
 
-          {msgs.map((msg, i) => (
-            <div
-              key={i}
-              className={cn(
-                "flex w-full gap-4",
-                msg.role === "user" ? "flex-row-reverse" : "flex-row"
-              )}
-            >
-              <Avatar className={cn("w-8 h-8", msg.role === "user" ? "bg-muted" : "bg-primary text-primary-foreground")}>
-                <AvatarFallback>{msg.role === "user" ? <User size={18}/> : <Bot size={18}/>}</AvatarFallback>
-              </Avatar>
+          {msgs.map((msg, i) => {
+            const isEditing = editingClientId === msg.clientId;
+            return (
               <div
+                key={msg.clientId}
                 className={cn(
-                  "flex flex-col max-w-[80%]",
-                  msg.role === "user" ? "items-end" : "items-start"
+                  "group flex w-full gap-4",
+                  msg.role === "user" ? "flex-row-reverse" : "flex-row",
                 )}
               >
-                {msg.attachments && msg.attachments.length > 0 && (
-                  <div className="flex flex-wrap gap-1.5 mb-1.5 justify-end">
-                    {msg.attachments.map((att) => (
-                      <AttachmentBubble key={att.id} att={att} />
-                    ))}
-                  </div>
-                )}
-                <div
+                <Avatar
                   className={cn(
-                    "px-4 py-3 rounded-2xl",
-                    msg.role === "user"
-                      ? "bg-muted text-foreground rounded-tr-sm"
-                      : "bg-transparent text-foreground prose prose-sm dark:prose-invert"
+                    "w-8 h-8 shrink-0",
+                    msg.role === "user" ? "bg-muted" : "bg-primary text-primary-foreground",
                   )}
                 >
-                  {msg.role === "user" ? (
-                    <div className="whitespace-pre-wrap">{msg.text}</div>
-                  ) : (
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                      {msg.text}
-                    </ReactMarkdown>
+                  <AvatarFallback>
+                    {msg.role === "user" ? <User size={18} /> : <Bot size={18} />}
+                  </AvatarFallback>
+                </Avatar>
+                <div
+                  className={cn(
+                    "flex min-w-0 flex-1 flex-col max-w-[80%]",
+                    msg.role === "user" ? "items-end" : "items-start",
                   )}
+                >
+                  {msg.attachments && msg.attachments.length > 0 && (
+                    <div
+                      className={cn(
+                        "flex flex-wrap gap-1.5 mb-1.5",
+                        msg.role === "user" ? "justify-end" : "justify-start",
+                      )}
+                    >
+                      {msg.attachments.map((att) => (
+                        <AttachmentBubble key={att.id} att={att} />
+                      ))}
+                    </div>
+                  )}
+
+                  <div
+                    className={cn(
+                      "relative rounded-2xl",
+                      msg.role === "user"
+                        ? "bg-muted text-foreground rounded-tr-sm"
+                        : "bg-transparent text-foreground",
+                    )}
+                  >
+                    {msg.role === "user" && isEditing ? (
+                      <div className="flex flex-col gap-2 p-3 min-w-[min(100%,280px)]">
+                        <Textarea
+                          value={editDraft}
+                          onChange={(e) => setEditDraft(e.target.value)}
+                          className="min-h-[100px] resize-y text-sm"
+                          disabled={busy}
+                          autoFocus
+                        />
+                        <div className="flex justify-end gap-2">
+                          <Button type="button" variant="ghost" size="sm" onClick={cancelEdit} disabled={busy}>
+                            取消
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            onClick={() => submitEdit(i)}
+                            disabled={
+                              busy ||
+                              (!editDraft.trim() && (msg.attachments?.length ?? 0) === 0)
+                            }
+                          >
+                            发送
+                          </Button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div
+                        className={cn(
+                          "px-4 py-3",
+                          msg.role === "assistant" && "prose prose-sm dark:prose-invert",
+                        )}
+                      >
+                        {msg.role === "user" ? (
+                          <div className="whitespace-pre-wrap">{msg.text}</div>
+                        ) : (
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.text}</ReactMarkdown>
+                        )}
+                      </div>
+                    )}
+
+                    {msg.role === "user" &&
+                      msg.supersededAssistantReply &&
+                      !isEditing && (
+                        <div className="px-4 pb-2 pt-0 flex justify-end">
+                          <button
+                            type="button"
+                            className="text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+                            onClick={() => setSupersededSheetText(msg.supersededAssistantReply!)}
+                          >
+                            查看此前的回答
+                          </button>
+                        </div>
+                      )}
+                  </div>
+
+                  <div
+                    className={cn(
+                      "mt-1 flex items-center gap-0.5 opacity-100 sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100",
+                      msg.role === "user" ? "flex-row-reverse" : "flex-row",
+                    )}
+                  >
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                      disabled={busy}
+                      aria-label="复制消息"
+                      onClick={() => void copyToClipboard(msg.text).catch(() => {})}
+                    >
+                      <Copy size={14} strokeWidth={2} />
+                    </Button>
+                    {msg.role === "user" && !isEditing && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                        disabled={busy}
+                        aria-label="编辑消息"
+                        onClick={() => startEdit(msg)}
+                      >
+                        <Pencil size={14} strokeWidth={2} />
+                      </Button>
+                    )}
+                    {msg.role === "assistant" && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                        disabled={busy}
+                        aria-label="重新生成"
+                        onClick={() => void regenerateAssistantAt(i)}
+                      >
+                        <RefreshCw size={14} strokeWidth={2} />
+                      </Button>
+                    )}
+                  </div>
                 </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
 
           {streaming && (
-            <div className="flex w-full gap-4 flex-row">
-              <Avatar className="w-8 h-8 bg-primary text-primary-foreground">
-                <AvatarFallback><Bot size={18}/></AvatarFallback>
+            <div className="group flex w-full gap-4 flex-row">
+              <Avatar className="w-8 h-8 shrink-0 bg-primary text-primary-foreground">
+                <AvatarFallback>
+                  <Bot size={18} />
+                </AvatarFallback>
               </Avatar>
-              <div className="flex flex-col max-w-[80%] items-start">
+              <div className="flex min-w-0 flex-1 flex-col max-w-[80%] items-start">
                 <div className="px-4 py-3 bg-transparent text-foreground prose prose-sm dark:prose-invert">
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>{streaming}</ReactMarkdown>
-                  <span className="inline-block w-2 h-4 bg-primary animate-pulse ml-1 align-middle"></span>
+                  <span className="inline-block w-2 h-4 bg-primary animate-pulse ml-1 align-middle" />
+                </div>
+                <div className="mt-1 flex opacity-100 sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                    disabled={streaming.length === 0}
+                    aria-label="复制正在生成的内容"
+                    onClick={() => void copyToClipboard(streaming).catch(() => {})}
+                  >
+                    <Copy size={14} strokeWidth={2} />
+                  </Button>
                 </div>
               </div>
             </div>
@@ -230,19 +424,24 @@ export default function ChatComponent(props: ChatComponentProps) {
                     {citations.map((c, ci) => (
                       <button
                         key={ci}
+                        type="button"
                         onClick={() => {
-                          window.dispatchEvent(new CustomEvent("edu:open-material-preview", {
-                            detail: {
-                              materialId: c.material_id,
-                              chunkId: c.chunk_id,
-                              sourceLabel: c.source_label ?? `引用 ${ci + 1}`,
-                            },
-                          }));
+                          window.dispatchEvent(
+                            new CustomEvent("edu:open-material-preview", {
+                              detail: {
+                                materialId: c.material_id,
+                                chunkId: c.chunk_id,
+                                sourceLabel: c.source_label ?? `引用 ${ci + 1}`,
+                              },
+                            }),
+                          );
                         }}
                         className="inline-flex items-center gap-1 rounded-full border border-primary/25 bg-primary/8 px-2.5 py-0.5 text-[11px] font-medium text-primary hover:bg-primary/15 transition-colors"
                       >
                         <span className="font-mono font-bold opacity-60">[{ci + 1}]</span>
-                        <span className="max-w-[140px] truncate">{c.source_label ?? `引用 ${ci + 1}`}</span>
+                        <span className="max-w-[140px] truncate">
+                          {c.source_label ?? `引用 ${ci + 1}`}
+                        </span>
                       </button>
                     ))}
                   </div>
@@ -253,14 +452,14 @@ export default function ChatComponent(props: ChatComponentProps) {
               </div>
             </div>
           )}
-          
+
           {errorMsg && (
-             <div className="flex w-full justify-center">
-                <div className="flex items-center gap-2 text-xs text-destructive bg-destructive/10 px-3 py-1.5 rounded-full">
-                  <AlertCircle size={14} />
-                  <span>{errorMsg}</span>
-                </div>
-             </div>
+            <div className="flex w-full justify-center">
+              <div className="flex items-center gap-2 text-xs text-destructive bg-destructive/10 px-3 py-1.5 rounded-full">
+                <AlertCircle size={14} />
+                <span>{errorMsg}</span>
+              </div>
+            </div>
           )}
         </div>
       </ScrollArea>
@@ -284,6 +483,7 @@ export default function ChatComponent(props: ChatComponentProps) {
                     </div>
                   )}
                   <button
+                    type="button"
                     onClick={() => removeAttachment(att.id)}
                     className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-foreground text-background flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
                     aria-label="移除附件"
@@ -307,12 +507,19 @@ export default function ChatComponent(props: ChatComponentProps) {
               <Button
                 size="icon"
                 variant="ghost"
-                className={cn("h-8 w-8 rounded-full text-muted-foreground hover:text-foreground", attachmentUploading && "opacity-50")}
+                className={cn(
+                  "h-8 w-8 rounded-full text-muted-foreground hover:text-foreground",
+                  attachmentUploading && "opacity-50",
+                )}
                 onClick={() => fileInputRef.current?.click()}
                 disabled={attachmentUploading || busy}
                 aria-label="上传附件"
               >
-                {attachmentUploading ? <Loader2 size={16} className="animate-spin" /> : <Paperclip size={16} />}
+                {attachmentUploading ? (
+                  <Loader2 size={16} className="animate-spin" />
+                ) : (
+                  <Paperclip size={16} />
+                )}
               </Button>
             </div>
             <Textarea
@@ -327,7 +534,10 @@ export default function ChatComponent(props: ChatComponentProps) {
             <div className="pr-2 pb-2 flex-shrink-0">
               <Button
                 size="icon"
-                className={cn("h-8 w-8 rounded-full", (!input.trim() && pendingAttachments.length === 0) || busy ? "opacity-50" : "")}
+                className={cn(
+                  "h-8 w-8 rounded-full",
+                  ((!input.trim() && pendingAttachments.length === 0) || busy) && "opacity-50",
+                )}
                 onClick={handleSend}
                 disabled={(!input.trim() && pendingAttachments.length === 0) || busy}
               >
@@ -345,10 +555,15 @@ export default function ChatComponent(props: ChatComponentProps) {
 }
 
 function AttachmentBubble({ att }: { att: AttachmentRef }) {
-  if (att.mime_type.startsWith("image/") && att.localPreviewUrl) {
+  const imgSrc =
+    att.mime_type.startsWith("image/") && (att.localPreviewUrl ?? att.presigned_url)
+      ? (att.localPreviewUrl ?? att.presigned_url)
+      : null;
+
+  if (imgSrc) {
     return (
       <img
-        src={att.localPreviewUrl}
+        src={imgSrc}
         alt={att.name}
         className="max-w-[200px] max-h-[200px] rounded-xl object-cover border border-border"
       />

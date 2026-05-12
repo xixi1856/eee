@@ -17,6 +17,25 @@ from edu_agent.toolsets.registry import toolset_registry
 
 logger = logging.getLogger(__name__)
 
+
+def _resolve_platform_rag_base_key(platform_base_url_fallback: str) -> tuple[str, str]:
+    """Match agent.py: env EDU_PLATFORM_BASE_URL, else yaml ``platform_base_url``; key from env only."""
+    import os
+
+    base = (os.environ.get("EDU_PLATFORM_BASE_URL") or "").strip().rstrip("/")
+    if not base:
+        base = (platform_base_url_fallback or "").strip().rstrip("/")
+    key = (os.environ.get("EDU_PLATFORM_INTERNAL_API_KEY") or "").strip()
+    return base, key
+
+
+def _platform_rag_config_runtime_error() -> RuntimeError:
+    return RuntimeError(
+        "课程 RAG 需要 EDU_PLATFORM_INTERNAL_API_KEY（≥16 字符，与平台 INTERNAL_API_KEY 相同），"
+        "以及可访问的平台地址：环境变量 EDU_PLATFORM_BASE_URL 或 edu_agent.yaml 的 platform_base_url"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -24,7 +43,7 @@ logger = logging.getLogger(__name__)
 _SCHEMA_KNOWLEDGE_QUERY = {
     "name": "knowledge_query",
     "description": (
-        "从知识库中检索信息，回答关于已导入文档的任何知识性问题。"
+        "从知识库中检索信息，回答关于已导入文档/课程资料（如 PPT、PDF、讲义）的任何问题。"
         "在回答概念、原理、定义、事实类问题时应首先调用此工具。"
     ),
     "parameters": {
@@ -184,50 +203,66 @@ def _sync_verify_and_query_course(
     question: str,
     top_k: int,
     mode: str,
+    platform_base_url_fallback: str = "",
 ) -> list[dict[str, Any]]:
-    import os
-
     import httpx
     from rag_mvp.course_lightrag import course_retrieval_hits_sync
 
-    base = os.environ.get("EDU_PLATFORM_BASE_URL", "").rstrip("/")
-    key = os.environ.get("EDU_PLATFORM_INTERNAL_API_KEY", "").strip()
+    base, key = _resolve_platform_rag_base_key(platform_base_url_fallback)
     if not base or len(key) < 16:
-        raise RuntimeError(
-            "EDU_PLATFORM_BASE_URL and EDU_PLATFORM_INTERNAL_API_KEY (16+ chars) are required for course RAG",
-        )
+        raise _platform_rag_config_runtime_error()
     with httpx.Client(timeout=120.0) as client:
-        r = client.get(
-            f"{base}/api/v1/internal/course-rag-access",
-            params={"course_id": course_id, "user_id": user_id},
-            headers={"X-Internal-Key": key},
-        )
-        r.raise_for_status()
+        try:
+            r = client.get(
+                f"{base}/api/v1/internal/course-rag-access",
+                params={"course_id": course_id, "user_id": user_id},
+                headers={"X-Internal-Key": key},
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            raise RuntimeError(
+                f"无法连接教育平台 ({base})，请确认 edu-platform 已启动且地址正确: {exc}"
+            ) from exc
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                f"教育平台 course-rag-access 返回 HTTP {exc.response.status_code}，"
+                f"请核对 EDU_PLATFORM_INTERNAL_API_KEY 是否与平台 INTERNAL_API_KEY 一致（{base}）"
+            ) from exc
         body = r.json()
         if not body.get("access"):
             raise PermissionError("User has no access to this course")
     return course_retrieval_hits_sync(course_id, question, mode=mode, top_k=top_k)
 
 
-def _sync_list_enrolled_course_ids(user_id: str) -> list[str]:
+def _sync_list_enrolled_course_ids(
+    user_id: str,
+    platform_base_url_fallback: str = "",
+) -> list[str]:
     """Platform internal: course UUIDs the agent user may RAG (enrollments + teaching)."""
-    import os
-
     import httpx
 
-    base = os.environ.get("EDU_PLATFORM_BASE_URL", "").rstrip("/")
-    key = os.environ.get("EDU_PLATFORM_INTERNAL_API_KEY", "").strip()
+    base, key = _resolve_platform_rag_base_key(platform_base_url_fallback)
     if not base or len(key) < 16:
-        raise RuntimeError(
-            "EDU_PLATFORM_BASE_URL and EDU_PLATFORM_INTERNAL_API_KEY (16+ chars) are required",
-        )
+        raise _platform_rag_config_runtime_error()
     with httpx.Client(timeout=60.0) as client:
-        r = client.get(
-            f"{base}/api/v1/internal/enrolled-courses-rag",
-            params={"user_id": user_id},
-            headers={"X-Internal-Key": key},
-        )
-        r.raise_for_status()
+        try:
+            r = client.get(
+                f"{base}/api/v1/internal/enrolled-courses-rag",
+                params={"user_id": user_id},
+                headers={"X-Internal-Key": key},
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            raise RuntimeError(
+                f"无法连接教育平台 ({base})，请确认 edu-platform 已启动且地址正确: {exc}"
+            ) from exc
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                f"教育平台 enrolled-courses-rag 返回 HTTP {exc.response.status_code}，"
+                f"请核对 EDU_PLATFORM_INTERNAL_API_KEY 是否与平台 INTERNAL_API_KEY 一致（{base}）"
+            ) from exc
         body = r.json()
     raw = body.get("course_ids")
     if not isinstance(raw, list):
@@ -287,6 +322,8 @@ async def _handle_knowledge_query(args: dict) -> str:
         ctx = get_current_runtime()
         user_id = ctx.user_id
         course_id = str(ctx.course_id).strip() if ctx.course_id else ""
+        _fb_raw = getattr(getattr(ctx, "settings", None), "platform_base_url", "")
+        platform_url_fb = str(_fb_raw).strip() if isinstance(_fb_raw, str) else ""
     except RuntimeError as exc:
         return tool_error(f"缺少运行上下文: {exc}")
 
@@ -308,7 +345,11 @@ async def _handle_knowledge_query(args: dict) -> str:
 
     if sources == "enrolled_courses":
         try:
-            cids = await asyncio.to_thread(_sync_list_enrolled_course_ids, user_id)
+            cids = await asyncio.to_thread(
+                _sync_list_enrolled_course_ids,
+                user_id,
+                platform_url_fb,
+            )
         except Exception as exc:
             logger.error("knowledge_query enrolled_courses list failed: %s", exc)
             return tool_error(f"无法获取可检索课程列表: {exc}")
@@ -325,6 +366,7 @@ async def _handle_knowledge_query(args: dict) -> str:
                     str(question),
                     top_k,
                     str(mode),
+                    platform_url_fb,
                 )
             except PermissionError:
                 continue
@@ -371,6 +413,7 @@ async def _handle_knowledge_query(args: dict) -> str:
                 str(question),
                 top_k,
                 str(mode),
+                platform_url_fb,
             )
         except PermissionError as exc:
             return tool_error(str(exc))

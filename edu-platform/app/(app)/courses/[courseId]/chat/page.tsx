@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { ChevronLeft } from "lucide-react";
-import CourseChatWorkspace from "@/components/CourseChatWorkspace";
+import CourseChatDockview from "@/components/CourseChatDockview";
 
 export default function CourseChatPage() {
   const params = useParams();
@@ -31,7 +31,7 @@ export default function CourseChatPage() {
         <div className="w-20" />
       </div>
 
-      <CourseChatWorkspace courseId={courseId} />
+      <CourseChatDockview courseId={courseId} />
     </div>
   );
 }

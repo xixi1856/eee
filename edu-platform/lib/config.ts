@@ -71,6 +71,7 @@ export function getSelfCredentialMaxExpiresMinutes(): number {
 }
 
 export const ACCESS_COOKIE_NAME = "edu_access";
+export const REFRESH_COOKIE_NAME = "edu_refresh";
 
 /** Redis URL for bind challenges and bind rate limits. If unset, bind/start returns 503; bind rate limit falls back to Postgres. */
 export function getRedisUrl(): string | undefined {
@@ -85,6 +86,16 @@ export function getRedisKeyPrefix(): string {
 /** TTL for bind challenge token (seconds). Default 10 minutes. */
 export function getBindChallengeTtlSec(): number {
   return readInt("BIND_CHALLENGE_TTL_SEC", 600);
+}
+
+/**
+ * Signing secret for short-lived bind challenge JWTs.
+ * Falls back to JWT_SECRET if BIND_CHALLENGE_SECRET is not set.
+ */
+export function getBindChallengeSecret(): string {
+  const s = process.env.BIND_CHALLENGE_SECRET?.trim();
+  if (s && s.length >= 16) return s;
+  return getJwtSecret();
 }
 
 /**

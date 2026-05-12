@@ -140,6 +140,122 @@ export async function getCourseAnalytics(
   };
 }
 
+export type KnowledgeAnalyticsRange = "7d" | "30d" | "all";
+
+export type KnowledgeAnalyticsResult = {
+  high_frequency_questions: {
+    question: string;
+    frequency: number;
+    related_knowledge_points: string[];
+  }[];
+  error_prone_knowledge_points: {
+    knowledge_point: string;
+    error_rate: number;
+    error_count: number;
+  }[];
+  knowledge_heatmap: {
+    knowledge_point: string;
+    heat_score: number;
+  }[];
+};
+
+/**
+ * Lightweight knowledge analytics for the course analytics panel (teachers only).
+ * - high_frequency_questions: top 5 by count with resolved material names
+ * - error_prone_knowledge_points: placeholder ([]); ready for future extension
+ * - knowledge_heatmap: top 10 materials by hit count
+ */
+export async function getKnowledgeAnalytics(
+  courseId: string,
+  range: KnowledgeAnalyticsRange,
+): Promise<KnowledgeAnalyticsResult> {
+  const now = new Date();
+  let start: Date;
+  if (range === "7d") {
+    start = new Date(now.getTime() - 7 * 24 * 3600 * 1000);
+  } else if (range === "30d") {
+    start = new Date(now.getTime() - 30 * 24 * 3600 * 1000);
+  } else {
+    // "all" — epoch start
+    start = new Date(0);
+  }
+
+  // --- High-frequency questions top 5 ---
+  const topQuestions = await prisma.$queryRaw<
+    { question: string; count: number; hit_materials: string[] }[]
+  >`
+    SELECT
+      question,
+      COUNT(*)::int AS count,
+      array_agg(DISTINCT m) FILTER (WHERE m IS NOT NULL) AS hit_materials
+    FROM qa_logs, LATERAL unnest(hit_materials) AS m
+    WHERE course_id = ${courseId}::uuid
+      AND deleted_at IS NULL
+      AND created_at >= ${start}
+      AND created_at <= ${now}
+    GROUP BY question
+    ORDER BY count DESC
+    LIMIT 5
+  `;
+
+  // Resolve material IDs → filenames (batch)
+  const allMaterialIds = [...new Set(topQuestions.flatMap((r) => r.hit_materials ?? []))];
+  const materialMap: Record<string, string> = {};
+  if (allMaterialIds.length > 0) {
+    const mats = await prisma.material.findMany({
+      where: { id: { in: allMaterialIds }, isDeleted: false },
+      select: { id: true, originalFilename: true },
+    });
+    for (const m of mats) materialMap[m.id] = m.originalFilename;
+  }
+
+  const high_frequency_questions = topQuestions.map((r) => ({
+    question: r.question,
+    frequency: r.count,
+    related_knowledge_points: (r.hit_materials ?? [])
+      .map((id) => materialMap[id] ?? id)
+      .filter(Boolean),
+  }));
+
+  // --- Knowledge heatmap: top 10 materials by hit count ---
+  const matHits = await prisma.$queryRaw<
+    { material_id: string; hit_count: bigint }[]
+  >`
+    SELECT m AS material_id, COUNT(*)::bigint AS hit_count
+    FROM qa_logs, unnest(hit_materials) AS m
+    WHERE course_id = ${courseId}::uuid
+      AND deleted_at IS NULL
+      AND created_at >= ${start}
+      AND created_at <= ${now}
+    GROUP BY m
+    ORDER BY hit_count DESC
+    LIMIT 10
+  `;
+
+  // Resolve any IDs not already in materialMap
+  const newIds = matHits
+    .map((r) => r.material_id)
+    .filter((id) => !(id in materialMap));
+  if (newIds.length > 0) {
+    const extra = await prisma.material.findMany({
+      where: { id: { in: newIds }, isDeleted: false },
+      select: { id: true, originalFilename: true },
+    });
+    for (const m of extra) materialMap[m.id] = m.originalFilename;
+  }
+
+  const knowledge_heatmap = matHits.map((r) => ({
+    knowledge_point: materialMap[r.material_id] ?? r.material_id,
+    heat_score: Number(r.hit_count),
+  }));
+
+  return {
+    high_frequency_questions,
+    error_prone_knowledge_points: [], // reserved for future assignment-submission data
+    knowledge_heatmap,
+  };
+}
+
 export type LearningProgressResult = {
   student_id: string;
   total_questions: number;

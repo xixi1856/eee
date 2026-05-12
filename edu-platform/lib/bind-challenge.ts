@@ -1,38 +1,28 @@
-import crypto from "node:crypto";
-import { getBindChallengeTtlSec, getRedisKeyPrefix } from "@/lib/config";
 import { ApiError } from "@/lib/http/api-error";
-import { getRedis, isRedisConfigured } from "@/lib/redis";
+import { signBindChallengeToken, verifyBindChallengeToken } from "@/lib/jwt";
 
-function challengeKey(token: string): string {
-  return `${getRedisKeyPrefix()}bind:ch:${token}`;
-}
-
+/**
+ * Create a short-lived bind challenge token that embeds the codeHash.
+ * Uses a signed JWT so no external storage (Redis) is required.
+ */
 export async function createBindChallenge(codeHash: string): Promise<string> {
-  if (!isRedisConfigured()) {
-    throw new ApiError(
-      503,
-      "SERVICE_UNAVAILABLE",
-      "Redis is required for the bind challenge flow; set REDIS_URL",
-    );
-  }
-  const r = await getRedis();
-  const token = crypto.randomBytes(32).toString("hex");
-  await r.set(challengeKey(token), codeHash, { EX: getBindChallengeTtlSec() });
-  return token;
+  return signBindChallengeToken(codeHash);
 }
 
-/** Atomically read and delete challenge; returns codeHash or null if missing. */
+/**
+ * Verify a bind challenge token and return the embedded codeHash.
+ * Returns null if the token is missing, malformed, or expired.
+ * NOTE: Unlike the previous Redis getDel approach this token is not
+ * single-use at the storage level. Replay protection is provided by
+ * the DB transaction in completeBindCredential (credential status ACTIVE→USED).
+ */
 export async function consumeBindChallenge(
   challengeToken: string,
 ): Promise<string | null> {
-  if (!isRedisConfigured()) {
+  if (!challengeToken || typeof challengeToken !== "string") return null;
+  try {
+    return await verifyBindChallengeToken(challengeToken.trim());
+  } catch {
     return null;
   }
-  const t = challengeToken.trim();
-  if (!/^[a-f0-9]{64}$/i.test(t)) {
-    return null;
-  }
-  const r = await getRedis();
-  const v = await r.getDel(challengeKey(t));
-  return typeof v === "string" && v.length > 0 ? v : null;
 }

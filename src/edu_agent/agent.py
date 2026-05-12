@@ -12,8 +12,10 @@ The agent's ``run_turn`` is async; CLI uses ``asyncio.run`` (or an existing loop
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import tempfile
 import time
 import uuid
@@ -131,6 +133,7 @@ class EduAgent:
         self._mcp_registered = False
 
         self.messages: list[dict] = []
+        self._course_material_cache: dict[str, list[str]] = {}
 
         self._paths = build_paths(
             settings,
@@ -143,6 +146,9 @@ class EduAgent:
         self._model = self._main_runtime.model
         self._temperature = self._main_runtime.temperature
         self._max_tokens = self._main_runtime.max_tokens
+        self._llm_extra_body = (
+            dict(self._main_runtime.llm_extra_body) if self._main_runtime.llm_extra_body else {}
+        )
         self._skills_dir: Path = self._paths.skills_dir
         self._skill_entries = load_skill_entries(self._skills_dir)
 
@@ -391,6 +397,7 @@ class EduAgent:
                 ],
                 temperature=min(self._temperature, 0.3),
                 max_tokens=min(2048, self._max_tokens),
+                **self._chat_completion_extra(),
             )
             msg = resp.choices[0].message
             text = (msg.content or "").strip()
@@ -577,6 +584,52 @@ class EduAgent:
         header += "]"
         return f"{header}\n{snippet}"
 
+    def _sync_fetch_course_material_names(self, course_id: str) -> list[str]:
+        import httpx
+
+        base = os.environ.get("EDU_PLATFORM_BASE_URL", "").rstrip("/")
+        if not base:
+            base = self._settings.platform_base_url.rstrip("/")
+        key = os.environ.get("EDU_PLATFORM_INTERNAL_API_KEY", "").strip()
+        if not base or len(key) < 16:
+            return []
+
+        with httpx.Client(timeout=30.0) as client:
+            r = client.get(
+                f"{base}/api/v1/internal/course-materials",
+                params={"course_id": course_id, "user_id": self.config.user_id},
+                headers={"X-Internal-Key": key},
+            )
+            r.raise_for_status()
+            body = r.json()
+
+        raw = body.get("materials")
+        if not isinstance(raw, list):
+            return []
+        out: list[str] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            title = item.get("original_filename")
+            if isinstance(title, str) and title.strip():
+                out.append(title.strip())
+        return out
+
+    async def _get_course_material_names(self, course_id: str) -> list[str]:
+        cid = course_id.strip()
+        if not cid:
+            return []
+        cached = self._course_material_cache.get(cid)
+        if cached is not None:
+            return cached
+        try:
+            names = await asyncio.to_thread(self._sync_fetch_course_material_names, cid)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("course materials preload skipped: %s", exc)
+            names = []
+        self._course_material_cache[cid] = names
+        return names
+
     async def _run_turn_inner_stream(
         self,
         user_input: str,
@@ -661,20 +714,18 @@ class EduAgent:
             ]
         else:
             _skill_entries = self._skill_entries
+        _course_material_names: list[str] = []
+        if (self.config.course_id or "").strip():
+            _course_material_names = await self._get_course_material_names(self.config.course_id)
         system_prompt = build_system_prompt(
             skills_dir=self._skills_dir,
             learner_profile_summary=self._profile_summary,
             available_tools={s.name for s in _specs},
             skill_entries=_skill_entries,
             memory_context=memory_context,
+            course_id=self.config.course_id,
+            course_material_names=_course_material_names,
         )
-        if not (self.config.course_id or "").strip():
-            system_prompt += (
-                "\n\n## 当前会话模式（问答中心）\n"
-                "当前未绑定单一课程。调用 `knowledge_query` 时必须使用 "
-                "`sources=enrolled_courses`（检索用户有权限的全部课程知识库）"
-                "或 `sources=personal`；不得使用 `sources=course` 或 `sources=all`。\n"
-            )
 
         for iteration in range(1, self.config.max_iterations + 1):
             logger.debug("Iteration %d/%d", iteration, self.config.max_iterations)
@@ -836,6 +887,12 @@ class EduAgent:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Callback %s raised: %s", fn, exc)
 
+    def _chat_completion_extra(self) -> dict[str, Any]:
+        """Optional ``extra_body`` for OpenAI-compatible APIs (e.g. DeepSeek ``thinking`` toggle)."""
+        if not self._llm_extra_body:
+            return {}
+        return {"extra_body": dict(self._llm_extra_body)}
+
     async def _llm_stream_outbounds(
         self,
         system_prompt: str,
@@ -857,6 +914,7 @@ class EduAgent:
             temperature=self._temperature,
             max_tokens=self._max_tokens,
             stream=True,
+            **self._chat_completion_extra(),
         )
         tc_acc: dict[int, dict[str, str]] = {}
         thinking_ended = False
@@ -1024,6 +1082,7 @@ class EduAgent:
                 tools=cast(list[Any], openai_tools),
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
+                **self._chat_completion_extra(),
             )
             choice = response.choices[0]
             msg: ChatCompletionMessage = choice.message
@@ -1049,6 +1108,7 @@ class EduAgent:
             temperature=self._temperature,
             max_tokens=self._max_tokens,
             stream=True,
+            **self._chat_completion_extra(),
         )
 
         content_parts: list[str] = []

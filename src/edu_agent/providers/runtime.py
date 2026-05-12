@@ -72,6 +72,9 @@ def resolve_provider_runtime(
     if not model:
         raise ValueError(f"No model resolved for provider {provider_id!r}.")
 
+    extra = settings.agent.llm_extra_body
+    llm_extra_body = dict(extra) if isinstance(extra, dict) and extra else {}
+
     return ResolvedProviderRuntime(
         provider_id=provider_id,
         model=model,
@@ -81,6 +84,7 @@ def resolve_provider_runtime(
         client_kind=spec.client_kind,
         temperature=settings.agent.temperature,
         max_tokens=settings.agent.max_tokens,
+        llm_extra_body=llm_extra_body,
     )
 
 

@@ -12,7 +12,12 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from rag_mvp.db import connect_sync
-from rag_mvp.material_processor import process_delete_material, process_parse_and_index
+from rag_mvp.material_processor import (
+    process_delete_material,
+    process_index_only,
+    process_parse_and_index,
+    process_repair_preview,
+)
 from rag_mvp.worker_async_loop import start_worker_async_loop, stop_worker_async_loop
 
 
@@ -72,8 +77,18 @@ def _parse_autoclaim_messages(resp: Any) -> list[tuple[str, dict[str, str]]]:
     return out
 
 
+def _parse_bool_field(raw: str | None, default: bool = True) -> bool:
+    if raw is None:
+        return default
+    s = str(raw).strip().lower()
+    if not s:
+        return default
+    return s in ("1", "true", "yes", "on")
+
+
 def _process_one(conn: Any, fields: dict[str, str]) -> None:
     op = fields.get("operation")
+    text_only = _parse_bool_field(fields.get("text_only"), default=True)
     if op == "assignment.generate":
         from rag_mvp.assignment_gen import generate_assignment
         import json as _json
@@ -90,9 +105,13 @@ def _process_one(conn: Any, fields: dict[str, str]) -> None:
     if not material_id:
         raise ValueError("missing material_id")
     if op == "parse_and_index":
-        process_parse_and_index(conn, material_id)
+        process_parse_and_index(conn, material_id, text_only=text_only)
+    elif op == "index_only":
+        process_index_only(conn, material_id, text_only=text_only)
     elif op == "delete_material":
         process_delete_material(conn, material_id)
+    elif op == "repair_preview":
+        process_repair_preview(conn, material_id)
     else:
         raise ValueError(f"unknown operation: {op!r}")
 
@@ -114,6 +133,12 @@ def _handle_entries(
             r.xack(stream, group, msg_id)
         except Exception:
             logger.exception("Task failed stream_id={}", msg_id)
+            # ACK so the message leaves the PEL immediately; material/index paths persist FAILED in DB.
+            # Retries: index_only or re-enqueue (see material_processor / assignment_gen).
+            try:
+                r.xack(stream, group, msg_id)
+            except redis.ResponseError:
+                logger.exception("XACK failed stream_id={}", msg_id)
 
 
 def main() -> None:

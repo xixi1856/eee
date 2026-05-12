@@ -7,11 +7,14 @@ import {
   BookOpen, ChevronLeft, FileText, GraduationCap, LayoutList,
   MessageSquare, BarChart3, Loader2, Trash2, AlertCircle,
   CheckCircle2, Clock, Cpu, BookMarked, Pencil, FileQuestion, Sparkles, Copy,
+  RotateCcw,
 } from "lucide-react";
 import type { AssignmentSummaryDto } from "@/lib/dto/assignment.dto";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import MaterialUpload from "@/components/MaterialUpload";
+import KnowledgeGraphPanel from "@/components/KnowledgeGraphPanel";
+import { formatApiErrorFromResponse } from "@/lib/http/format-api-error";
 import { cn } from "@/lib/utils";
 
 type Course = {
@@ -30,7 +33,24 @@ type Lesson = {
   id: string; title: string; description: string | null; order_index: number;
 };
 
-type Tab = "overview" | "materials" | "lessons" | "assignments";
+type KnowledgeAnalyticsData = {
+  high_frequency_questions: {
+    question: string;
+    frequency: number;
+    related_knowledge_points: string[];
+  }[];
+  error_prone_knowledge_points: {
+    knowledge_point: string;
+    error_rate: number;
+    error_count: number;
+  }[];
+  knowledge_heatmap: {
+    knowledge_point: string;
+    heat_score: number;
+  }[];
+};
+
+type Tab = "overview" | "materials" | "lessons" | "assignments" | "analytics";
 
 const ASSIGNMENT_STATUS_LABELS: Record<string, string> = {
   GENERATING: "生成中", FAILED: "失败", DRAFT: "草稿", PUBLISHED: "已发布", ARCHIVED: "已归档",
@@ -97,13 +117,39 @@ function MaterialRow({
   m,
   isTeacher,
   onDelete,
+  courseId,
+  onMaterialsRefresh,
+  onNotify,
   indent = false,
 }: {
   m: Material;
   isTeacher: boolean;
   onDelete: (id: string) => void;
+  courseId: string;
+  onMaterialsRefresh: () => void;
+  onNotify: (type: "success" | "error", msg: string) => void;
   indent?: boolean;
 }) {
+  const [retrying, setRetrying] = useState(false);
+
+  async function retryIndex() {
+    setRetrying(true);
+    try {
+      const res = await fetch(
+        `/api/v1/courses/${courseId}/materials/${m.id}/retry-index`,
+        { method: "POST", credentials: "include" },
+      );
+      if (!res.ok) {
+        const detail = formatApiErrorFromResponse(res.status, await res.text());
+        onNotify("error", detail);
+        return;
+      }
+      onMaterialsRefresh();
+    } finally {
+      setRetrying(false);
+    }
+  }
+
   return (
     <div
       className={cn(
@@ -125,8 +171,23 @@ function MaterialRow({
       </div>
       <div className="flex items-center gap-2 shrink-0">
         <MaterialStatusBadge status={m.status} />
+        {isTeacher && m.status === "FAILED" && (
+          <button
+            type="button"
+            title="重试索引（使用已解析的本地缓存）"
+            disabled={retrying}
+            onClick={() => void retryIndex()}
+            className={cn(
+              "flex h-7 w-7 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground transition-colors",
+              retrying && "opacity-60 pointer-events-none",
+            )}
+          >
+            <RotateCcw size={13} className={retrying ? "animate-spin" : ""} />
+          </button>
+        )}
         {isTeacher && (
           <button
+            type="button"
             onClick={() => onDelete(m.id)}
             className="flex h-7 w-7 items-center justify-center rounded-lg text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors"
           >
@@ -151,6 +212,9 @@ export default function CourseDetailPage() {
   const [notification, setNotification] = useState<{type:"success"|"error"; msg:string} | null>(null);
   const [assignments, setAssignments] = useState<AssignmentSummaryDto[]>([]);
   const [assignmentsLoaded, setAssignmentsLoaded] = useState(false);
+  const [analyticsData, setAnalyticsData] = useState<KnowledgeAnalyticsData | null>(null);
+  const [analyticsLoaded, setAnalyticsLoaded] = useState(false);
+  const [analyticsRange, setAnalyticsRange] = useState<"7d" | "30d" | "all">("7d");
 
   function notify(type: "success" | "error", msg: string) {
     setNotification({ type, msg });
@@ -230,6 +294,18 @@ export default function CourseDetailPage() {
     return () => clearInterval(id);
   }, [activeTab, courseId, assignments]);
 
+  // Lazy-load analytics when tab is activated; reload when range changes
+  useEffect(() => {
+    if (activeTab !== "analytics" || !courseId || role !== "TEACHER" || analyticsLoaded) return;
+    void fetch(`/api/v1/courses/${courseId}/analytics/knowledge?range=${analyticsRange}`, { credentials: "include" })
+      .then((r) => r.json())
+      .then((d: KnowledgeAnalyticsData) => {
+        setAnalyticsData(d);
+        setAnalyticsLoaded(true);
+      })
+      .catch(() => setAnalyticsLoaded(true));
+  }, [activeTab, courseId, role, analyticsLoaded, analyticsRange]);
+
   async function deleteMaterial(mid: string) {
     if (!courseId) return;
     if (!window.confirm("确定删除该资料？此操作不可撤销。")) return;
@@ -259,6 +335,7 @@ export default function CourseDetailPage() {
     { id: "materials", label: "材料", icon: FileText },
     { id: "lessons", label: "课时", icon: LayoutList },
     { id: "assignments", label: "作业", icon: FileQuestion },
+    ...(isTeacher ? [{ id: "analytics" as Tab, label: "分析", icon: BarChart3 }] : []),
   ];
 
   return (
@@ -440,6 +517,8 @@ export default function CourseDetailPage() {
                   </div>
                 )}
 
+                <KnowledgeGraphPanel courseId={courseId!} isTeacher={isTeacher} />
+
                 <div className="flex flex-wrap gap-2">
                   <Button variant="outline" size="sm" asChild>
                     <Link href={`/courses/${courseId}/lessons`}>
@@ -485,7 +564,15 @@ export default function CourseDetailPage() {
                 {materials.length > 0 && (
                   <div className="space-y-2">
                     {materials.map((m) => (
-                      <MaterialRow key={m.id} m={m} isTeacher={isTeacher} onDelete={deleteMaterial} />
+                      <MaterialRow
+                        key={m.id}
+                        m={m}
+                        isTeacher={isTeacher}
+                        onDelete={deleteMaterial}
+                        courseId={courseId}
+                        onMaterialsRefresh={() => void load(courseId)}
+                        onNotify={notify}
+                      />
                     ))}
                   </div>
                 )}
@@ -521,7 +608,16 @@ export default function CourseDetailPage() {
                           </div>
                         )}
                         {lessonMaterials.map((m) => (
-                          <MaterialRow key={m.id} m={m} isTeacher={isTeacher} onDelete={deleteMaterial} indent />
+                          <MaterialRow
+                            key={m.id}
+                            m={m}
+                            isTeacher={isTeacher}
+                            onDelete={deleteMaterial}
+                            courseId={courseId}
+                            onMaterialsRefresh={() => void load(courseId)}
+                            onNotify={notify}
+                            indent
+                          />
                         ))}
                       </div>
 
@@ -555,7 +651,16 @@ export default function CourseDetailPage() {
                       {unassigned.length > 0 && (
                         <div className="divide-y divide-border/50">
                           {unassigned.map((m) => (
-                            <MaterialRow key={m.id} m={m} isTeacher={isTeacher} onDelete={deleteMaterial} indent />
+                            <MaterialRow
+                              key={m.id}
+                              m={m}
+                              isTeacher={isTeacher}
+                              onDelete={deleteMaterial}
+                              courseId={courseId}
+                              onMaterialsRefresh={() => void load(courseId)}
+                              onNotify={notify}
+                              indent
+                            />
                           ))}
                         </div>
                       )}
@@ -669,6 +774,118 @@ export default function CourseDetailPage() {
                   </Link>
                 ))}
               </div>
+            )}
+          </div>
+        )}
+
+        {/* Analytics */}
+        {activeTab === "analytics" && isTeacher && (
+          <div className="space-y-6">
+            {/* Time range selector */}
+            <div className="flex items-center justify-between">
+              <p className="text-sm text-muted-foreground">
+                {!analyticsLoaded ? "加载中…" : "学习行为分析"}
+              </p>
+              <select
+                value={analyticsRange}
+                onChange={(e) => {
+                  setAnalyticsRange(e.target.value as "7d" | "30d" | "all");
+                  setAnalyticsLoaded(false);
+                }}
+                className="text-sm border border-border rounded-lg px-2.5 py-1.5 bg-background text-foreground cursor-pointer"
+              >
+                <option value="7d">最近 7 天</option>
+                <option value="30d">最近 30 天</option>
+                <option value="all">全部时间</option>
+              </select>
+            </div>
+
+            {!analyticsLoaded ? (
+              <div className="space-y-3">
+                {[1, 2, 3].map((i) => <Skeleton key={i} className="h-20 rounded-xl" />)}
+              </div>
+            ) : (
+              <>
+                {/* High-frequency questions */}
+                <section className="space-y-3">
+                  <h2 className="font-display text-base font-semibold text-foreground flex items-center gap-2">
+                    <MessageSquare size={15} className="text-primary" />
+                    高频问题 Top 5
+                  </h2>
+                  {!analyticsData || analyticsData.high_frequency_questions.length === 0 ? (
+                    <p className="text-sm text-muted-foreground py-4">暂无问答数据</p>
+                  ) : (
+                    <div className="space-y-2">
+                      {analyticsData.high_frequency_questions.map((q, idx) => (
+                        <div key={idx} className="rounded-xl border border-border bg-card px-4 py-3 space-y-2">
+                          <div className="flex items-start justify-between gap-4">
+                            <div className="flex items-start gap-3">
+                              <span className="shrink-0 flex h-5 w-5 items-center justify-center rounded-full bg-primary/10 text-primary text-[10px] font-bold mt-0.5">
+                                {idx + 1}
+                              </span>
+                              <p className="text-sm text-foreground leading-relaxed">{q.question}</p>
+                            </div>
+                            <span className="shrink-0 text-xs font-semibold text-muted-foreground whitespace-nowrap">{q.frequency} 次</span>
+                          </div>
+                          {q.related_knowledge_points.length > 0 && (
+                            <div className="flex flex-wrap gap-1.5 pl-8">
+                              {q.related_knowledge_points.map((kp, ki) => (
+                                <span key={ki} className="inline-flex items-center rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground font-medium">
+                                  {kp}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </section>
+
+                {/* Knowledge heatmap */}
+                <section className="space-y-3">
+                  <h2 className="font-display text-base font-semibold text-foreground flex items-center gap-2">
+                    <BarChart3 size={15} className="text-primary" />
+                    知识点热度排行
+                  </h2>
+                  {!analyticsData || analyticsData.knowledge_heatmap.length === 0 ? (
+                    <p className="text-sm text-muted-foreground py-4">暂无资料命中数据</p>
+                  ) : (
+                    <div className="rounded-xl border border-border bg-card divide-y divide-border overflow-hidden">
+                      {(() => {
+                        const maxScore = Math.max(...analyticsData.knowledge_heatmap.map((h) => h.heat_score), 1);
+                        return analyticsData.knowledge_heatmap.map((item, idx) => (
+                          <div key={idx} className="flex items-center gap-3 px-4 py-3">
+                            <span className="text-xs text-muted-foreground w-4 shrink-0 text-right">{idx + 1}</span>
+                            <div className="flex-1 min-w-0 space-y-1.5">
+                              <p className="text-sm font-medium text-foreground truncate">{item.knowledge_point}</p>
+                              <div className="h-1.5 w-full bg-muted rounded-full overflow-hidden">
+                                <div
+                                  className="h-full bg-primary/70 rounded-full"
+                                  style={{ width: `${Math.round((item.heat_score / maxScore) * 100)}%` }}
+                                />
+                              </div>
+                            </div>
+                            <span className="text-xs font-semibold text-muted-foreground shrink-0">{item.heat_score} 次</span>
+                          </div>
+                        ));
+                      })()}
+                    </div>
+                  )}
+                </section>
+
+                {/* Error-prone knowledge points (placeholder for future) */}
+                <section className="space-y-3">
+                  <h2 className="font-display text-base font-semibold text-foreground flex items-center gap-2">
+                    <AlertCircle size={15} className="text-muted-foreground" />
+                    易错知识点
+                  </h2>
+                  <div className="flex items-center gap-3 rounded-xl border border-dashed border-border bg-muted/20 px-4 py-5">
+                    <AlertCircle size={16} className="text-muted-foreground/40 shrink-0" />
+                    <p className="text-sm text-muted-foreground">待接入作业提交功能后自动统计易错知识点</p>
+                  </div>
+                </section>
+              </>
             )}
           </div>
         )}

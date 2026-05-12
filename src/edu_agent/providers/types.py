@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -37,3 +37,4 @@ class ResolvedProviderRuntime(BaseModel):
     client_kind: str
     temperature: float
     max_tokens: int
+    llm_extra_body: dict[str, Any] = Field(default_factory=dict)

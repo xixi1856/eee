@@ -25,6 +25,7 @@ function parseExtension(filename: string): string {
 export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
+  const [textOnly, setTextOnly] = useState(true);
   const [pct, setPct] = useState(0);
   const [status, setStatus] = useState<"idle" | "success" | "error">("idle");
   const [msg, setMsg] = useState<string | null>(null);
@@ -49,6 +50,7 @@ export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props
         const fd = new FormData();
         fd.set("file", file);
         if (lessonId) fd.set("lesson_id", lessonId);
+        fd.set("text_only", textOnly ? "true" : "false");
         const xhr = new XMLHttpRequest();
         await new Promise<void>((resolve, reject) => {
           xhr.open("POST", `/api/v1/courses/${courseId}/materials`);
@@ -85,6 +87,20 @@ export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props
   return (
     <div className="space-y-3">
       <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">上传资料</p>
+
+      <label className="flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-xs text-foreground">
+        <input
+          type="checkbox"
+          checked={textOnly}
+          disabled={busy}
+          onChange={(e) => setTextOnly(e.target.checked)}
+          className="h-3.5 w-3.5 accent-primary"
+        />
+        <span className="font-medium">仅文本索引（节省 token）</span>
+      </label>
+      <p className="text-[11px] text-muted-foreground px-1">
+        开启后跳过 list、image、table、equation、chart、code 等多模态块。
+      </p>
 
       {/* Drop zone */}
       <button

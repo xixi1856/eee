@@ -67,7 +67,7 @@ def _ensure_conn_alive(conn: psycopg.Connection) -> psycopg.Connection:
         conn.rollback()
         return conn
     except Exception:
-        logger.warning("DB connection lost; reconnecting before next task")
+        logger.warning("DB connection lost; attempting to reconnect before next task")
         try:
             conn.close()
         except Exception:

@@ -389,9 +389,17 @@ async function selfHealPendingPreview(m: Material): Promise<MaterialPreviewPdfSt
       previewPdfObjectKey(m.minioPath),
       legacyConvertedPdfObjectKey(m.minioPath, m.id),
     ];
-    const found = (
-      await Promise.allSettled(keys.map((k) => objectExists(k)))
-    ).some((r) => r.status === "fulfilled" && r.value === true);
+    let found = false;
+    for (const key of keys) {
+      try {
+        if (await objectExists(key)) {
+          found = true;
+          break;
+        }
+      } catch {
+        // Treat individual key check failures as "not found" and continue.
+      }
+    }
 
     if (!found) return m.previewPdfStatus;
 
@@ -415,8 +423,12 @@ async function selfHealPendingPreview(m: Material): Promise<MaterialPreviewPdfSt
           text_only: true,
           skip_kg: true,
         });
-      } catch {
+      } catch (enqueueErr) {
         // Non-fatal: preview is fixed; indexing can be retried later.
+        console.error(
+          `[selfHealPendingPreview] Failed to enqueue parse_and_index for material ${m.id}:`,
+          enqueueErr,
+        );
       }
     }
 
@@ -626,8 +638,12 @@ export async function openMaterialContentStream(
               text_only: true,
               skip_kg: true,
             });
-          } catch {
+          } catch (enqueueErr) {
             // Non-fatal: preview is fixed; indexing can be retried later.
+            console.error(
+              `[openMaterialContentStream] Failed to enqueue parse_and_index for material ${m.id}:`,
+              enqueueErr,
+            );
           }
         }
         return {

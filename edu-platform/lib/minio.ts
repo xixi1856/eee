@@ -86,23 +86,34 @@ export async function objectExists(objectKey: string): Promise<boolean> {
 
 export async function getObjectStream(params: {
   objectKey: string;
+  /** HTTP Range header value, e.g. "bytes=0-1023". Enables 206 Partial Content. */
+  range?: string;
 }): Promise<{
   body: BodyInit;
   contentType: string | undefined;
   contentLength: number | undefined;
+  contentRange: string | undefined;
+  isPartial: boolean;
 }> {
   const c = getMinioConfig();
   const client = getS3Client();
   const res = await client.send(
-    new GetObjectCommand({ Bucket: c.bucket, Key: params.objectKey }),
+    new GetObjectCommand({
+      Bucket: c.bucket,
+      Key: params.objectKey,
+      ...(params.range ? { Range: params.range } : {}),
+    }),
   );
   if (!res.Body) {
     throw new Error("S3 GetObject returned empty body");
   }
+  const isPartial = res.$metadata?.httpStatusCode === 206;
   return {
     body: res.Body.transformToWebStream() as unknown as BodyInit,
     contentType: res.ContentType,
     contentLength:
       typeof res.ContentLength === "number" ? res.ContentLength : undefined,
+    contentRange: res.ContentRange,
+    isPartial,
   };
 }

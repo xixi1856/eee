@@ -5,6 +5,20 @@ const px = prisma as any;
 import { createAgentSession, postChatCompletionsStream } from "@/lib/agentClient";
 import { ApiError } from "@/lib/http/api-error";
 
+type ToolCallRecord = {
+  name: string;
+  status: "done";
+  success?: boolean;
+  durationMs?: number;
+};
+
+type PersistedCitation = {
+  chunk_id?: string;
+  material_id?: string;
+  source_label?: string;
+  chunk_text?: string;
+};
+
 export type B3SseEvent =
   | { type: "text"; content: string }
   | {
@@ -172,6 +186,8 @@ type PersistArgs = {
   answer: string;
   persist: boolean;
   b3?: Record<string, unknown>;
+  toolCalls?: ToolCallRecord[];
+  citations?: PersistedCitation[];
 };
 
 async function maybePersistQaLog(a: PersistArgs): Promise<void> {
@@ -200,6 +216,8 @@ async function maybePersistQaLog(a: PersistArgs): Promise<void> {
         ? (b3.hit_materials as string[])
         : [],
       hitSources: Array.isArray(b3.hit_sources) ? (b3.hit_sources as string[]) : [],
+      toolCalls: a.toolCalls ?? [],
+      citations: a.citations ?? [],
     } as Parameters<typeof prisma.qaLog.create>[0]["data"],
   });
 }
@@ -216,6 +234,9 @@ export function createB3SseTransformFromAgent(
   let lastB3: Record<string, unknown> | undefined;
   let sawDoneMarker = false;
   let streamError: string | undefined;
+  const collectedToolCalls: ToolCallRecord[] = [];
+  // pending: tool_call events waiting to be matched with a tool_result
+  const pendingToolCalls = new Map<string, ToolCallRecord>();
 
   return new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
@@ -229,7 +250,8 @@ export function createB3SseTransformFromAgent(
         if (raw === null) continue;
         if (raw === "[DONE]") {
           sawDoneMarker = true;
-          for (const c of citationsFromB3(lastB3 ?? {})) {
+          const citationEvents = citationsFromB3(lastB3 ?? {});
+          for (const c of citationEvents) {
             controller.enqueue(sseDataLine(c));
           }
           const tokens =
@@ -280,9 +302,27 @@ export function createB3SseTransformFromAgent(
           controller.enqueue(sseDataLine({ type: "text", content }));
         }
         const tcEv = toolCallEventFromAgentFrame(frame);
-        if (tcEv) controller.enqueue(sseDataLine(tcEv));
+        if (tcEv) {
+          controller.enqueue(sseDataLine(tcEv));
+          const key = tcEv.tool_call_id ?? tcEv.name;
+          pendingToolCalls.set(key, { name: tcEv.name, status: "done" });
+        }
         const trEv = toolResultEventFromAgentFrame(frame);
-        if (trEv) controller.enqueue(sseDataLine(trEv));
+        if (trEv) {
+          controller.enqueue(sseDataLine(trEv));
+          // match by name (tool_call_id may differ between call and result)
+          let matchKey: string | undefined;
+          for (const [k, v] of pendingToolCalls) {
+            if (v.name === trEv.name) { matchKey = k; break; }
+          }
+          if (matchKey !== undefined) {
+            const rec = pendingToolCalls.get(matchKey)!;
+            collectedToolCalls.push({ ...rec, success: trEv.success, durationMs: trEv.duration_ms });
+            pendingToolCalls.delete(matchKey);
+          } else {
+            collectedToolCalls.push({ name: trEv.name, status: "done", success: trEv.success, durationMs: trEv.duration_ms });
+          }
+        }
         const traceEv = traceEventFromAgentFrame(frame);
         if (traceEv) controller.enqueue(sseDataLine(traceEv));
         const b3 = eduMeta?.b3 as Record<string, unknown> | undefined;
@@ -304,10 +344,24 @@ export function createB3SseTransformFromAgent(
         return;
       }
       if (!streamError) {
+        const persistedCitations: PersistedCitation[] = citationsFromB3(lastB3 ?? {}).map(
+          (ev) => ({
+            chunk_id: (ev as { chunk_id?: string }).chunk_id,
+            material_id: (ev as { material_id?: string }).material_id,
+            source_label: (ev as { source_label?: string }).source_label,
+            chunk_text: (ev as { chunk_text?: string }).chunk_text,
+          }),
+        );
+        // flush any unmatched tool_calls (no result received)
+        for (const rec of pendingToolCalls.values()) {
+          collectedToolCalls.push(rec);
+        }
         await maybePersistQaLog({
           ...persistCtx,
           answer: fullAnswer,
           b3: lastB3,
+          toolCalls: collectedToolCalls,
+          citations: persistedCitations,
         });
       }
     },

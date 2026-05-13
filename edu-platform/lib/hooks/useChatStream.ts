@@ -9,6 +9,10 @@ export type ChatMessage = {
   attachments?: AttachmentRef[];
   /** Same QaLog row id for hydrated user/assistant pair */
   qaLogId?: string;
+  /** Tool calls recorded during this turn (populated from history) */
+  toolActivity?: ToolActivityItem[];
+  /** Citations recorded during this turn (populated from history) */
+  citations?: Citation[];
 };
 
 /**
@@ -121,6 +125,8 @@ type HydratedRow = {
   id?: string;
   question: string;
   answer: string | null;
+  tool_calls?: unknown[];
+  citations?: unknown[];
 };
 
 function logToMsgs(rows: HydratedRow[]): ChatMessage[] {
@@ -139,6 +145,12 @@ function logToMsgs(rows: HydratedRow[]): ChatMessage[] {
         role: "assistant",
         text: r.answer,
         ...(qaLogId ? { qaLogId } : {}),
+        toolActivity: Array.isArray(r.tool_calls)
+          ? (r.tool_calls as ToolActivityItem[])
+          : [],
+        citations: Array.isArray(r.citations)
+          ? (r.citations as Citation[])
+          : [],
       });
     }
   }
@@ -376,6 +388,7 @@ export function useChatStream(config: UseChatStreamConfig) {
                 chunk_id?: string;
                 material_id?: string;
                 source_label?: string;
+                chunk_text?: string;
                 tokens?: number;
                 exec_time_ms?: number;
                 error?: string;

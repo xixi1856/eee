@@ -10,7 +10,8 @@ export type RagQueueTask = {
     | "index_only"
     | "delete_material"
     | "repair_preview"
-    | "convert_preview";
+    | "convert_preview"
+    | "transcribe_and_index";
   created_at: string;
   text_only?: boolean;
   /** When true (default), skip LLM entity/relation extraction at ingest (chunks + embeddings only). */

@@ -1,6 +1,7 @@
 /**
  * Course material upload extensions. Keep in sync with RAG worker
- * (`parse_material` / `_OFFICE_SUFFIXES` in `src/rag_mvp/material_processor.py`).
+ * (`parse_material` / `_OFFICE_SUFFIXES` / `_VIDEO_SUFFIXES` / `_AUDIO_SUFFIXES`
+ * in `src/rag_mvp/material_processor.py` and `video_transcribe.py`).
  */
 export const MATERIAL_UPLOAD_ALLOWED_EXTENSIONS = [
   "pdf",
@@ -10,6 +11,21 @@ export const MATERIAL_UPLOAD_ALLOWED_EXTENSIONS = [
   "pptx",
   "doc",
   "docx",
+  // Video
+  "mp4",
+  "mov",
+  "mkv",
+  "webm",
+  "avi",
+  "m4v",
+  "wmv",
+  // Audio
+  "mp3",
+  "wav",
+  "m4a",
+  "flac",
+  "ogg",
+  "opus",
 ] as const;
 
 export const MATERIAL_UPLOAD_ALLOWED_EXT_SET = new Set<string>(

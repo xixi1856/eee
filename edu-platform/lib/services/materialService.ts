@@ -54,6 +54,14 @@ async function enqueueRagTaskWithRetry(task: RagQueueTask, maxAttempts = 5): Pro
 /** Must match worker `parse_material` (see review_phase7 H4). */
 const ALLOWED_EXT = MATERIAL_UPLOAD_ALLOWED_EXT_SET;
 
+const _VIDEO_FILE_TYPES = new Set(["mp4", "mov", "mkv", "webm", "avi", "m4v", "wmv"]);
+const _AUDIO_FILE_TYPES = new Set(["mp3", "wav", "m4a", "flac", "ogg", "opus"]);
+
+function isVideoOrAudioFileType(fileType: string): boolean {
+  const t = fileType.toLowerCase();
+  return _VIDEO_FILE_TYPES.has(t) || _AUDIO_FILE_TYPES.has(t);
+}
+
 function extToFileType(ext: string): string {
   const e = ext.toLowerCase();
   if (e === "jpg" || e === "jpeg" || e === "png" || e === "webp") return "image";
@@ -358,6 +366,15 @@ export async function uploadMaterialStream(params: {
         text_only: textOnly,
         skip_kg: skipKg,
       }
+    : isVideoOrAudioFileType(fileType)
+    ? {
+        task_id: randomUUID(),
+        material_id: materialId,
+        operation: "transcribe_and_index",
+        created_at: new Date().toISOString(),
+        text_only: textOnly,
+        skip_kg: skipKg,
+      }
     : {
         task_id: randomUUID(),
         material_id: materialId,
@@ -572,6 +589,36 @@ function guessContentTypeByFileType(fileType: string): string {
   if (ft === "pdf") return "application/pdf";
   if (ft === "md") return "text/markdown; charset=utf-8";
   if (ft === "txt") return "text/plain; charset=utf-8";
+  // Video
+  if (ft === "mp4") return "video/mp4";
+  if (ft === "webm") return "video/webm";
+  if (ft === "mov") return "video/quicktime";
+  if (ft === "mkv") return "video/x-matroska";
+  if (ft === "avi") return "video/x-msvideo";
+  if (ft === "m4v") return "video/x-m4v";
+  if (ft === "wmv") return "video/x-ms-wmv";
+  // Audio
+  if (ft === "mp3") return "audio/mpeg";
+  if (ft === "wav") return "audio/wav";
+  if (ft === "m4a") return "audio/mp4";
+  if (ft === "flac") return "audio/flac";
+  if (ft === "ogg") return "audio/ogg";
+  if (ft === "opus") return "audio/ogg; codecs=opus";
+  // Video
+  if (ft === "mp4") return "video/mp4";
+  if (ft === "webm") return "video/webm";
+  if (ft === "mov") return "video/quicktime";
+  if (ft === "mkv") return "video/x-matroska";
+  if (ft === "avi") return "video/x-msvideo";
+  if (ft === "m4v") return "video/x-m4v";
+  if (ft === "wmv") return "video/x-ms-wmv";
+  // Audio
+  if (ft === "mp3") return "audio/mpeg";
+  if (ft === "wav") return "audio/wav";
+  if (ft === "m4a") return "audio/mp4";
+  if (ft === "flac") return "audio/flac";
+  if (ft === "ogg") return "audio/ogg";
+  if (ft === "opus") return "audio/ogg; codecs=opus";
   return "application/octet-stream";
 }
 
@@ -727,6 +774,8 @@ export type OpenMaterialContentParams = {
   materialId: string;
   /** `original` streams the uploaded object as attachment (for download). */
   variant: "inline" | "original";
+  /** HTTP Range header forwarded from client (enables 206 Partial Content for video seek). */
+  range?: string;
 };
 
 export type OpenMaterialContentResult = {
@@ -734,6 +783,9 @@ export type OpenMaterialContentResult = {
   body: BodyInit;
   contentType: string;
   contentDisposition: string;
+  contentLength?: number;
+  contentRange?: string;
+  isPartial?: boolean;
 };
 
 export async function openMaterialContentStream(
@@ -747,13 +799,14 @@ export async function openMaterialContentStream(
   const ft = m.fileType.toLowerCase();
 
   if (params.variant === "original") {
-    const { body, contentType } = await readObjectStreamForMaterial(m.minioPath);
+    const { body, contentType, contentLength } = await readObjectStreamForMaterial(m.minioPath);
     const ct = contentType || guessContentTypeByFileType(ft);
     const name = encodeURIComponent(m.originalFilename);
     return {
       body,
       contentType: ct,
       contentDisposition: `attachment; filename*=UTF-8''${name}`,
+      contentLength,
     };
   }
 
@@ -799,11 +852,25 @@ export async function openMaterialContentStream(
   }
 
   if (ft === "pdf" || ft === "md" || ft === "txt") {
-    const { body, contentType } = await readObjectStreamForMaterial(m.minioPath);
+    const { body, contentType, contentLength } = await readObjectStreamForMaterial(m.minioPath);
     return {
       body,
       contentType: contentType || guessContentTypeByFileType(ft),
       contentDisposition: "inline",
+      contentLength,
+    };
+  }
+
+  if (isVideoOrAudioFileType(ft)) {
+    const { body, contentType, contentLength, contentRange, isPartial } =
+      await getObjectStream({ objectKey: m.minioPath, range: params.range });
+    return {
+      body,
+      contentType: contentType || guessContentTypeByFileType(ft),
+      contentDisposition: "inline",
+      contentLength,
+      contentRange,
+      isPartial,
     };
   }
 

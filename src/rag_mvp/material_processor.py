@@ -47,6 +47,8 @@ from rag_mvp.engine import (
     delete_material_course_sync,
     ingest_parsed_material_into_course_async,
     ingest_parsed_material_into_course_sync,
+    ingest_text_into_course_async,
+    ingest_text_into_course_sync,
     parse_file,
 
 )
@@ -144,6 +146,33 @@ def _ingest_parsed_dispatch(
         local_file,
         original_filename=original_filename,
         text_only=text_only,
+        skip_entity_extraction=skip_kg,
+    )
+
+
+def _ingest_text_dispatch(
+    course_id: str,
+    material_id: str,
+    text: str,
+    original_filename: str | None,
+    skip_kg: bool,
+) -> int:
+    async def _ingest_text_worker_async() -> int:
+        return await ingest_text_into_course_async(
+            course_id,
+            material_id,
+            text,
+            original_filename=original_filename,
+            skip_entity_extraction=skip_kg,
+        )
+
+    if is_worker_async_loop_started():
+        return run_worker_coroutine(_ingest_text_worker_async(), timeout=None)
+    return ingest_text_into_course_sync(
+        course_id,
+        material_id,
+        text,
+        original_filename=original_filename,
         skip_entity_extraction=skip_kg,
     )
 
@@ -1158,5 +1187,149 @@ def process_repair_preview(conn: psycopg.Connection, material_id: str) -> None:
                 "FAILED",
                 f"PREVIEW_REPAIR_FAILED: {str(exc)[:1800]}",
             )
+    finally:
+        shutil.rmtree(work_parent, ignore_errors=True)
+
+
+def process_transcribe_and_index(
+    conn: psycopg.Connection,
+    material_id: str,
+    *,
+    text_only: bool = True,
+    skip_kg: bool = True,
+    r: "redis.Redis | None" = None,
+) -> None:
+    """Transcribe a video/audio file with Whisper, build a structured summary, then ingest into LightRAG.
+
+    Pipeline:
+      1. Claim material row → PARSING (reuses ``_claim_material_for_parse``).
+      2. Download media from MinIO to a temp directory.
+      3. Whisper transcription via ``transcribe_media_to_txt_file``.
+      4. LLM structured time-segment summary via ``build_structured_summary_from_transcript_text``.
+         Falls back to raw transcript text if no timestamps are detected.
+      5. Commit PARSED → INDEXING.
+      6. Ingest the summary (or raw transcript) text into the course LightRAG workspace.
+      7. Commit READY with chunk count.
+
+    Requires:
+      - ffmpeg on PATH (or FFMPEG_PATH env)
+      - ``uv sync --extra video`` (faster-whisper)
+      - LLM credentials for structured summary
+    """
+    from rag_mvp.video_transcribe import transcribe_media_to_txt_file
+    from rag_mvp.video_transcript_summary import (
+        build_structured_summary_from_transcript_text,
+        parse_timestamped_transcript,
+    )
+
+    # Checkpoint 0: bail before claiming if already cancelled.
+    if r is not None and _is_cancel_requested(r, material_id):
+        logger.info(
+            "process_transcribe_and_index: cancel signal detected before claim for material {}",
+            material_id,
+        )
+        return
+
+    claimed = _claim_material_for_parse(conn, material_id)
+    if not claimed:
+        return
+
+    course_id = claimed["course_id"]
+    minio_path = claimed["minio_path"]
+    original_filename = claimed.get("original_filename")
+
+    work_parent = Path(tempfile.mkdtemp(prefix="edu_vid_"))
+    parsed_committed = False
+
+    try:
+        suffix = Path(minio_path).suffix or ".mp4"
+        local_file = work_parent / f"{material_id}{suffix}"
+        download_object_to_path(minio_path, local_file)
+
+        # Checkpoint 1: before the expensive Whisper step.
+        if r is not None:
+            _raise_if_cancelled(r, material_id, "pre-transcribe")
+
+        logger.info("Transcribing media for material {} ({})", material_id, local_file.name)
+        txt_path = transcribe_media_to_txt_file(local_file, transcript_dir=work_parent)
+        transcript_text = txt_path.read_text(encoding="utf-8")
+        logger.info("Transcription done for material {} ({} chars)", material_id, len(transcript_text))
+
+        # Checkpoint 2: before LLM summary / embedding starts.
+        if r is not None:
+            _raise_if_cancelled(r, material_id, "pre-summary")
+
+        ts_lines = parse_timestamped_transcript(transcript_text)
+        if ts_lines:
+            try:
+                _, _json_path, summary_md_path = build_structured_summary_from_transcript_text(
+                    transcript_text,
+                    txt_path.stem,
+                    work_parent,
+                )
+                ingest_text = summary_md_path.read_text(encoding="utf-8")
+                logger.info(
+                    "Structured summary built for material {} ({} chars)",
+                    material_id,
+                    len(ingest_text),
+                )
+            except Exception as summ_exc:
+                logger.warning(
+                    "Structured summary failed for material {} (falling back to raw transcript): {}",
+                    material_id,
+                    summ_exc,
+                )
+                ingest_text = transcript_text
+        else:
+            logger.info(
+                "No timestamp lines in transcript for material {}; ingesting raw transcript",
+                material_id,
+            )
+            ingest_text = transcript_text
+
+        with conn.transaction():
+            update_material_status(
+                conn, material_id, "PARSED", None, expect_status_in=("PARSING",)
+            )
+        parsed_committed = True
+
+        with conn.transaction():
+            update_material_status(
+                conn, material_id, "INDEXING", None, expect_status_in=("PARSED",)
+            )
+
+        n = _ingest_text_dispatch(
+            course_id,
+            material_id,
+            ingest_text,
+            str(original_filename) if original_filename else None,
+            skip_kg,
+        )
+
+        with conn.transaction():
+            ok = update_material_status(
+                conn,
+                material_id,
+                "READY",
+                None,
+                indexed_chunk_count=n,
+                expect_status_in=("INDEXING",),
+            )
+            if not ok:
+                raise RuntimeError(
+                    f"Material {material_id} lost INDEXING state before READY commit",
+                )
+
+        logger.success(
+            "transcribe_and_index: material {} indexed ({} chunks)", material_id, n
+        )
+    except MaterialCancelledError:
+        logger.info(
+            "Material {} transcription/indexing cancelled; skipping ingest", material_id
+        )
+    except Exception as exc:
+        logger.exception("transcribe_and_index failed for material {}", material_id)
+        with conn.transaction():
+            update_material_status(conn, material_id, "FAILED", str(exc)[:2000])
     finally:
         shutil.rmtree(work_parent, ignore_errors=True)

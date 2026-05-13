@@ -1,6 +1,6 @@
 """EduAgent: single-turn and multi-turn conversational loop.
 
-Follows the Hermes-style ReAct pattern:
+Follows the ReAct pattern:
   1. Build system prompt.
   2. Call LLM (with tool schemas).
   3. If LLM returns tool_calls → execute tools → append results → go to 2.

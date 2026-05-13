@@ -18,6 +18,7 @@ from rag_mvp.material_processor import (
     process_index_only,
     process_parse_and_index,
     process_repair_preview,
+    process_transcribe_and_index,
     update_material_status,
 )
 from rag_mvp.worker_async_loop import start_worker_async_loop, stop_worker_async_loop
@@ -157,6 +158,8 @@ def _process_one(conn: Any, r: redis.Redis, fields: dict[str, str]) -> None:
         process_repair_preview(conn, material_id)
     elif op == "convert_preview":
         process_convert_preview(conn, material_id, text_only=text_only, skip_kg=skip_kg)
+    elif op == "transcribe_and_index":
+        process_transcribe_and_index(conn, material_id, text_only=text_only, skip_kg=skip_kg, r=r)
     else:
         raise ValueError(f"unknown operation: {op!r}")
 

@@ -1265,6 +1265,82 @@ def ingest_parsed_material_into_course_sync(
         _invalidate_course_rag_cache_for(course_id)
 
 
+async def ingest_text_into_course_async(
+    course_id: str,
+    material_id: str,
+    text: str,
+    original_filename: str | None = None,
+    skip_entity_extraction: bool = True,
+) -> int:
+    """Insert plain text (e.g. video transcript / structured summary) into course LightRAG.
+
+    Unlike ``ingest_parsed_material_into_course_async`` this path skips MinerU entirely
+    and works directly with a text string.  Used by the ``transcribe_and_index`` worker.
+
+    Returns the number of chunks indexed.
+    """
+    ensure_embedding_backend_reachable()
+
+    if not text or not text.strip():
+        raise ValueError(f"Empty text for material {material_id}; nothing to ingest.")
+
+    try:
+        rag = await get_course_rag_anything(course_id)
+        doc_id = material_stable_doc_id(material_id)
+        lr = rag.lightrag
+        assert lr is not None
+
+        display_stem = Path(original_filename).stem if original_filename else material_id
+        rag_file_path = _make_material_file_path(material_id, display_stem)
+
+        if skip_entity_extraction:
+            chunks = _custom_kg_chunks_from_text(lr, text.strip(), rag_file_path)
+            if not chunks:
+                raise RuntimeError(
+                    f"No text chunks produced for material {material_id}; "
+                    "check that the transcript / summary is non-empty."
+                )
+            await lr.ainsert_custom_kg({"chunks": chunks}, full_doc_id=doc_id)
+            logger.success(
+                "Indexed material {} ({} chunks via ainsert_custom_kg, no entity extraction)",
+                material_id,
+                len(chunks),
+            )
+            return len(chunks)
+        else:
+            await lr.ainsert(text.strip(), ids=[doc_id], file_paths=[rag_file_path])
+            logger.success(
+                "Indexed material {} via ainsert (with entity extraction)",
+                material_id,
+            )
+            # ainsert does not return chunk count; approximate via tokeniser
+            chunks = _custom_kg_chunks_from_text(lr, text.strip(), rag_file_path)
+            return len(chunks)
+    finally:
+        await _finalize_course_rag(course_id)
+
+
+def ingest_text_into_course_sync(
+    course_id: str,
+    material_id: str,
+    text: str,
+    original_filename: str | None = None,
+    skip_entity_extraction: bool = True,
+) -> int:
+    try:
+        return asyncio.run(
+            ingest_text_into_course_async(
+                course_id,
+                material_id,
+                text,
+                original_filename=original_filename,
+                skip_entity_extraction=skip_entity_extraction,
+            ),
+        )
+    finally:
+        _invalidate_course_rag_cache_for(course_id)
+
+
 async def delete_material_course_async(course_id: str, material_id: str) -> None:
     try:
         rag = await get_course_rag_anything(course_id)

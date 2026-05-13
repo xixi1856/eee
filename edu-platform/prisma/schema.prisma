@@ -316,6 +316,8 @@ model QaLog {
   hitChunks         String[]  @default([]) @map("hit_chunks")
   hitMaterials      String[]  @default([]) @map("hit_materials")
   hitSources        String[]  @default([]) @map("hit_sources")
+  toolCalls         Json?     @default("[]") @map("tool_calls")
+  citations         Json?     @default("[]") @map("citations")
   responseQuality   Int?      @map("response_quality") @db.SmallInt
   isHelpful         Boolean?  @map("is_helpful")
   agentFeedback     String?   @map("agent_feedback")

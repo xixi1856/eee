@@ -19,21 +19,29 @@ export async function GET(req: NextRequest, ctx: Ctx) {
       req.nextUrl.searchParams.get("variant") === "original"
         ? "original"
         : "inline";
-    const { body, contentType, contentDisposition } =
+    const range = req.headers.get("range") ?? undefined;
+    const { body, contentType, contentDisposition, contentLength, contentRange, isPartial } =
       await openMaterialContentStream({
         userId: auth.sub,
         role: auth.role as UserRole,
         materialId,
         variant,
+        range,
       });
-    return new NextResponse(body, {
-      status: 200,
-      headers: {
-        "Content-Type": contentType,
-        "Content-Disposition": contentDisposition,
-        "Cache-Control": "private, max-age=120",
-      },
-    });
+    const status = isPartial ? 206 : 200;
+    const headers: Record<string, string> = {
+      "Content-Type": contentType,
+      "Content-Disposition": contentDisposition,
+      "Cache-Control": "private, max-age=120",
+      "Accept-Ranges": "bytes",
+    };
+    if (typeof contentLength === "number") {
+      headers["Content-Length"] = String(contentLength);
+    }
+    if (contentRange) {
+      headers["Content-Range"] = contentRange;
+    }
+    return new NextResponse(body, { status, headers });
   } catch (e) {
     if (e instanceof ApiError) return jsonError(e);
     return jsonError(

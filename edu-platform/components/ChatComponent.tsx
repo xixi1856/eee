@@ -394,6 +394,58 @@ export default function ChatComponent(props: ChatComponentProps) {
                       </Button>
                     )}
                   </div>
+                  {/* Historical tool activity & citations (loaded from DB) */}
+                  {msg.role === "assistant" && (msg.toolActivity?.length ?? 0) + (msg.citations?.length ?? 0) > 0 && (
+                    <div className="flex flex-col gap-1.5 mt-1.5">
+                      {(msg.toolActivity?.length ?? 0) > 0 && (
+                        <ul className="m-0 flex list-none flex-col gap-1.5 p-0 text-sm text-muted-foreground">
+                          {msg.toolActivity!.map((row, ri) => (
+                            <li
+                              key={row.clientKey ?? `${msg.clientId}-tc-${ri}`}
+                              className="flex flex-wrap items-center gap-2 rounded-md border border-border/60 bg-muted/40 px-2.5 py-1.5"
+                            >
+                              <span className="tabular-nums" aria-hidden>{toolEmoji(row.name)}</span>
+                              <span className="font-mono text-xs text-foreground/90">{row.name}</span>
+                              <span className="text-xs">
+                                <span className={row.success === false ? "text-destructive" : "text-emerald-600 dark:text-emerald-400"}>
+                                  {row.success === false ? "✗" : "✓"}
+                                </span>
+                                {typeof row.durationMs === "number" && (
+                                  <span className="ml-1.5 opacity-80">{(row.durationMs / 1000).toFixed(1)}s</span>
+                                )}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {(msg.citations?.length ?? 0) > 0 && (
+                        <div className="flex flex-wrap gap-1.5">
+                          {msg.citations!.map((c, ci) => (
+                            <button
+                              key={ci}
+                              type="button"
+                              onClick={() => {
+                                window.dispatchEvent(
+                                  new CustomEvent("edu:open-material-preview", {
+                                    detail: {
+                                      materialId: c.material_id,
+                                      chunkId: c.chunk_id,
+                                      sourceLabel: c.source_label ?? `引用 ${ci + 1}`,
+                                      chunkText: c.chunk_text,
+                                    },
+                                  }),
+                                );
+                              }}
+                              className="inline-flex items-center gap-1 rounded-full border border-primary/25 bg-primary/8 px-2.5 py-0.5 text-[11px] font-medium text-primary hover:bg-primary/15 transition-colors"
+                            >
+                              <span className="font-mono font-bold opacity-60">[{ci + 1}]</span>
+                              <span className="max-w-[140px] truncate">{c.source_label ?? `引用 ${ci + 1}`}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
               </div>

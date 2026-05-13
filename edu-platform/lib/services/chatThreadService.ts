@@ -153,6 +153,8 @@ export type ChatThreadMessage = {
   question: string;
   answer: string | null;
   created_at: string;
+  tool_calls: unknown[];
+  citations: unknown[];
 };
 
 export async function assertThreadAccess(
@@ -196,6 +198,8 @@ export async function getThreadMessages(
       question: true,
       answer: true,
       createdAt: true,
+      toolCalls: true,
+      citations: true,
     },
   });
   return rows.map((r) => ({
@@ -203,6 +207,8 @@ export async function getThreadMessages(
     question: r.question,
     answer: r.answer,
     created_at: r.createdAt.toISOString(),
+    tool_calls: Array.isArray(r.toolCalls) ? r.toolCalls : [],
+    citations: Array.isArray(r.citations) ? r.citations : [],
   }));
 }
 

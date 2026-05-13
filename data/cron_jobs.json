@@ -5,8 +5,8 @@
     "schedule": "0 8 * * *",
     "created_at": "2026-05-10T01:18:58",
     "status": "active",
-    "last_run": "2026-05-10T11:57:36",
-    "next_run": "2026-05-11T08:00:00",
+    "last_run": "2026-05-13T10:40:55",
+    "next_run": "2026-05-14T08:00:00",
     "output_dir": "output\\cron\\b2abfd5f"
   },
   {
@@ -15,8 +15,8 @@
     "schedule": "0 7 * * *",
     "created_at": "2026-05-12T04:29:44",
     "status": "active",
-    "last_run": "",
-    "next_run": "2026-05-12T07:00:00",
+    "last_run": "2026-05-13T10:40:55",
+    "next_run": "2026-05-14T07:00:00",
     "output_dir": "output\\cron\\4780f28d"
   },
   {
@@ -25,8 +25,8 @@
     "schedule": "6 11 * * *",
     "created_at": "2026-05-12T11:04:58",
     "status": "active",
-    "last_run": "",
-    "next_run": "2026-05-12T11:06:00",
+    "last_run": "2026-05-13T11:06:56",
+    "next_run": "2026-05-14T11:06:00",
     "output_dir": "output\\cron\\d868f054"
   },
   {
@@ -35,8 +35,48 @@
     "schedule": "12 11 * * *",
     "created_at": "2026-05-12T11:10:33",
     "status": "active",
-    "last_run": "",
-    "next_run": "2026-05-12T11:12:00",
+    "last_run": "2026-05-13T11:12:56",
+    "next_run": "2026-05-14T11:12:00",
     "output_dir": "output\\cron\\b1b24a60"
+  },
+  {
+    "id": "99fb30f9",
+    "prompt": "生成一道计算机网络相关的练习题，题型为单选题，包含题目、四个选项和正确答案及解析。",
+    "schedule": "10 14 * * *",
+    "created_at": "2026-05-13T10:13:42",
+    "status": "active",
+    "last_run": "2026-05-13T14:10:58",
+    "next_run": "2026-05-14T14:10:00",
+    "output_dir": "output\\cron\\99fb30f9"
+  },
+  {
+    "id": "a769ba64",
+    "prompt": "请生成一道关于计算机网络的练习题，题型可以是单选、多选或简答，并附带答案和解析。",
+    "schedule": "10:34",
+    "created_at": "2026-05-13T10:33:09",
+    "status": "active",
+    "last_run": "2026-05-13T10:40:56",
+    "next_run": "2026-05-14T10:34:00",
+    "output_dir": "output\\cron\\a769ba64"
+  },
+  {
+    "id": "825656d0",
+    "prompt": "请生成一道关于计算机网络的练习题，题型可以是单选、多选或简答，并附带答案和解析。",
+    "schedule": "10:40",
+    "created_at": "2026-05-13T10:39:06",
+    "status": "active",
+    "last_run": "2026-05-13T10:40:56",
+    "next_run": "2026-05-14T10:40:00",
+    "output_dir": "output\\cron\\825656d0"
+  },
+  {
+    "id": "e6eec039",
+    "prompt": "生成一道计算机网络相关的练习题目（单选或多选），包含题目、选项和正确答案解析。将结果保存到 output/cron/ 目录。",
+    "schedule": "10:57",
+    "created_at": "2026-05-13T10:56:42",
+    "status": "active",
+    "last_run": "2026-05-13T10:57:56",
+    "next_run": "2026-05-14T10:57:00",
+    "output_dir": "output\\cron\\e6eec039"
   }
 ]

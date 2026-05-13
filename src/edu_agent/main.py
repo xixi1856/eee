@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 
@@ -80,6 +81,13 @@ async def _async_main(host: str | None, port: int | None) -> None:
             except NotImplementedError:
                 pass
 
+    # Start CronDaemon if enabled in yaml (runtime.cron.enabled: true)
+    cron_cfg = settings.runtime.cron
+    if cron_cfg.get("enabled", False):
+        from edu_agent.cron import CronDaemon
+        _cron_daemon = CronDaemon()
+        logger.info("CronDaemon started")
+
     await gateway.start()
     logger.info("EduAgent HTTP listening on http://%s:%s", eff_host, eff_port)
     await stop.wait()
@@ -91,8 +99,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="EduAgent HTTP Gateway")
     parser.add_argument("--host", default=None, help="Bind host (default: yaml runtime.gateway.host)")
     parser.add_argument("--port", type=int, default=None, help="Bind port (default: yaml runtime.gateway.port)")
+    parser.add_argument(
+        "--log-level",
+        default=None,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level for gateway process.",
+    )
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    env_level = str(os.getenv("EDU_AGENT_LOG_LEVEL", "")).strip().upper()
+    level_name = str(args.log_level or env_level or "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
     try:
         asyncio.run(_async_main(args.host, args.port))
     except KeyboardInterrupt:

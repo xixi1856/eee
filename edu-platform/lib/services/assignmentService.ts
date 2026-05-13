@@ -8,6 +8,7 @@ import type {
   AssignmentDetailDto,
   AssignmentSummaryDto,
   Blueprint,
+  CompleteQuestionBody,
   GenerateAssignmentBody,
   PatchAssignmentBody,
   QualityReport,
@@ -250,6 +251,7 @@ export async function regenerateQuestion(
       objective: body.objective,
       q_id: body.qId,
       extra_requirements: body.extraRequirements ?? "",
+      current_question: body.currentQuestion ?? "",
     }),
   });
 
@@ -273,4 +275,101 @@ export async function regenerateQuestion(
   });
 
   return newQuestion;
+}
+
+/** Preview-only: call AI to complete a teacher question without writing to DB. */
+export async function previewTeacherQuestion(
+  teacherId: string,
+  role: UserRole,
+  courseId: string,
+  assignmentId: string,
+  body: Omit<CompleteQuestionBody, "score">,
+): Promise<QuestionItem> {
+  const assignment = await getAssignment(teacherId, role, courseId, assignmentId);
+  if (assignment.status !== AssignmentStatus.DRAFT)
+    throw new ApiError(409, "CONFLICT", "Can only preview questions for DRAFT assignments");
+
+  const agentBase = getEduAgentBaseUrl();
+  if (!agentBase)
+    throw new ApiError(503, "AGENT_UNAVAILABLE", "EDU_AGENT_BASE_URL is not configured");
+
+  const headers = new Headers({ "Content-Type": "application/json" });
+  const apiKey = getEduAgentApiKey();
+  if (apiKey) headers.set("Authorization", `Bearer ${apiKey}`);
+
+  const res = await fetch(`${agentBase}/v1/assignment/complete-question`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      course_id: courseId,
+      entity_name: body.entityName,
+      question_stem: body.questionStem,
+      answer_hint: body.answerHint ?? "",
+      q_type: body.qType,
+      objective: body.objective,
+      q_id: 0, // temporary, not saved
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new ApiError(502, "AGENT_CHAT_FAILED", `Agent preview failed: ${res.status} ${text.slice(0, 200)}`);
+  }
+
+  return (await res.json()) as QuestionItem;
+}
+
+export async function completeTeacherQuestion(
+  teacherId: string,
+  role: UserRole,
+  courseId: string,
+  assignmentId: string,
+  body: CompleteQuestionBody,
+): Promise<QuestionItem> {
+  const assignment = await getAssignment(teacherId, role, courseId, assignmentId);
+  if (assignment.status !== AssignmentStatus.DRAFT)
+    throw new ApiError(409, "CONFLICT", "Can only add questions to DRAFT assignments");
+
+  const agentBase = getEduAgentBaseUrl();
+  if (!agentBase)
+    throw new ApiError(503, "AGENT_UNAVAILABLE", "EDU_AGENT_BASE_URL is not configured");
+
+  const headers = new Headers({ "Content-Type": "application/json" });
+  const apiKey = getEduAgentApiKey();
+  if (apiKey) headers.set("Authorization", `Bearer ${apiKey}`);
+
+  // Allocate a new question ID (max existing + 1)
+  const questions = (assignment.questions ?? []) as QuestionItem[];
+  const newQId = questions.length > 0 ? Math.max(...questions.map((q) => q.id)) + 1 : 1;
+
+  const res = await fetch(`${agentBase}/v1/assignment/complete-question`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      course_id: courseId,
+      entity_name: body.entityName,
+      question_stem: body.questionStem,
+      answer_hint: body.answerHint ?? "",
+      q_type: body.qType,
+      objective: body.objective,
+      q_id: newQId,
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new ApiError(502, "AGENT_CHAT_FAILED", `Agent complete-question failed: ${res.status} ${text.slice(0, 200)}`);
+  }
+
+  const newQuestion = (await res.json()) as QuestionItem;
+  const score = body.score ?? 5;
+  const appended = [...questions, { ...newQuestion, score }];
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  await prisma.assignment.update({
+    where: { id: assignmentId },
+    data: { questions: appended as any },
+  });
+
+  return { ...newQuestion, score };
 }

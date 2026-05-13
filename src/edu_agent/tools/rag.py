@@ -173,16 +173,15 @@ def _fetch_material_titles(material_ids: set[str]) -> dict[str, str]:
 
     if not material_ids:
         return {}
-    dsn = os.environ.get("DATABASE_URL", "").strip()
-    if not dsn:
+    if not os.environ.get("DATABASE_URL", "").strip():
         return {}
     try:
-        import psycopg
+        from rag_mvp.db import connect_sync
     except ImportError:
         return {}
     out: dict[str, str] = {}
     try:
-        with psycopg.connect(dsn) as conn:
+        with connect_sync() as conn:
             with conn.cursor() as cur:
                 for mid in material_ids:
                     cur.execute(

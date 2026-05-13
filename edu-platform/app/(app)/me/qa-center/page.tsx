@@ -8,12 +8,21 @@ import {
   Pencil,
   Trash2,
   Loader2,
+  X,
+  FileText,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import ChatComponent from "@/components/ChatComponent";
+
+type CitationPanel = {
+  materialId: string;
+  chunkId?: string;
+  sourceLabel?: string;
+  chunkText?: string;
+};
 
 type ThreadRow = {
   session_id: string;
@@ -32,6 +41,18 @@ export default function QaCenterPage() {
   const [listCollapsed, setListCollapsed] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
+  const [citationPanel, setCitationPanel] = useState<CitationPanel | null>(null);
+
+  useEffect(() => {
+    const h = (ev: Event) => {
+      const ce = ev as CustomEvent<CitationPanel>;
+      if (ce.detail?.materialId) {
+        setCitationPanel(ce.detail);
+      }
+    };
+    window.addEventListener("edu:open-material-preview", h as EventListener);
+    return () => window.removeEventListener("edu:open-material-preview", h as EventListener);
+  }, []);
 
   const loadThreads = useCallback(async () => {
     try {
@@ -210,7 +231,8 @@ export default function QaCenterPage() {
           </Button>
         )}
 
-        <div className="flex-1 flex flex-col min-w-0 min-h-0">
+        <div className="flex-1 flex min-w-0 min-h-0">
+          <div className="flex-1 flex flex-col min-w-0 min-h-0">
           {selected && (
             <div className="flex items-center gap-2 border-b border-border px-3 py-2 shrink-0 bg-background/95">
               {editingTitle ? (
@@ -277,6 +299,54 @@ export default function QaCenterPage() {
               />
             )}
           </div>
+          </div>
+
+          {/* Citation preview sidebar */}
+          <aside
+            className={cn(
+              "flex flex-col border-l border-border bg-background transition-[width,opacity] duration-200 ease-out shrink-0 overflow-hidden",
+              citationPanel
+                ? "w-[min(420px,44vw)] min-w-[280px] opacity-100"
+                : "w-0 min-w-0 opacity-0",
+            )}
+          >
+            {citationPanel && (
+              <>
+                <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0 bg-muted/30">
+                  <span className="text-xs font-medium text-muted-foreground truncate flex-1">
+                    {citationPanel.sourceLabel ?? "引用资料"}
+                  </span>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="h-7 w-7 shrink-0"
+                    aria-label="关闭引用面板"
+                    onClick={() => setCitationPanel(null)}
+                  >
+                    <X size={15} />
+                  </Button>
+                </div>
+                <div className="flex-1 min-h-0 overflow-y-auto">
+                  {citationPanel.chunkText ? (
+                    <div className="p-4 space-y-3">
+                      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                        <FileText size={13} />
+                        <span>检索文本块</span>
+                      </div>
+                      <pre className="whitespace-pre-wrap text-xs leading-relaxed font-mono bg-muted/40 rounded-lg p-3 border border-border text-foreground">
+                        {citationPanel.chunkText}
+                      </pre>
+                    </div>
+                  ) : (
+                    <div className="flex flex-col items-center justify-center h-full min-h-[120px] text-muted-foreground text-xs gap-2 p-6 text-center">
+                      <FileText size={24} className="opacity-40" />
+                      <span>暂无文本块内容</span>
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </aside>
         </div>
       </div>
     </div>

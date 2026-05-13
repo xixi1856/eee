@@ -83,6 +83,11 @@ class Settings(BaseSettings):
     # LLM generation
     llm_max_tokens: int = 4096
     llm_temperature: float = 0.1
+    llm_extra_body: dict = Field(
+        default_factory=dict,
+        validation_alias="LLM_EXTRA_BODY",
+        description="Optional JSON dict forwarded to OpenAI-compatible chat extra_body (e.g. {\"enable_thinking\": false}).",
+    )
 
     # Paths
     working_dir: Path = Path("rag_storage")

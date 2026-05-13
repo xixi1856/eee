@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { GripVertical, RefreshCw, ChevronDown, ChevronUp, Star, Trash2 } from "lucide-react";
+import { useState, useRef } from "react";
+import { GripVertical, RefreshCw, ChevronDown, ChevronUp, Star, Trash2, X } from "lucide-react";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { Button } from "@/components/ui/button";
@@ -22,7 +22,7 @@ interface QuestionCardProps {
   index: number;
   onUpdate: (id: number, updates: Partial<QuestionItem>) => void;
   onDelete: (id: number) => void;
-  onRegenerate: (id: number) => Promise<void>;
+  onRegenerate: (id: number, extraRequirements: string) => Promise<void>;
   regenerating?: boolean;
 }
 
@@ -35,6 +35,9 @@ export function QuestionCard({
   regenerating = false,
 }: QuestionCardProps) {
   const [expanded, setExpanded] = useState(true);
+  const [showRegenInput, setShowRegenInput] = useState(false);
+  const [regenText, setRegenText] = useState("");
+  const regenInputRef = useRef<HTMLInputElement>(null);
 
   const {
     attributes,
@@ -89,17 +92,66 @@ export function QuestionCard({
 
         <div className="flex-1" />
 
-        <Button
-          size="sm"
-          variant="ghost"
-          className="h-7 gap-1 text-xs"
-          disabled={regenerating}
-          onClick={() => void onRegenerate(question.id)}
-          // id is number; parent handles the numeric id
-        >
-          <RefreshCw size={13} className={cn(regenerating && "animate-spin")} />
-          AI 重新生成
-        </Button>
+        {showRegenInput ? (
+          <div className="flex items-center gap-1.5 flex-1">
+            <input
+              ref={regenInputRef}
+              className="flex-1 h-7 rounded-md border border-input bg-background px-2 text-xs focus:outline-none focus:ring-1 focus:ring-ring min-w-0"
+              placeholder="额外要求（如：换一道更难的题）"
+              value={regenText}
+              disabled={regenerating}
+              onChange={(e) => setRegenText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !regenerating) {
+                  void onRegenerate(question.id, regenText).then(() => {
+                    setShowRegenInput(false);
+                    setRegenText("");
+                  });
+                } else if (e.key === "Escape") {
+                  setShowRegenInput(false);
+                  setRegenText("");
+                }
+              }}
+            />
+            <Button
+              size="sm"
+              variant="default"
+              className="h-7 px-2 text-xs"
+              disabled={regenerating}
+              onClick={() =>
+                void onRegenerate(question.id, regenText).then(() => {
+                  setShowRegenInput(false);
+                  setRegenText("");
+                })
+              }
+            >
+              <RefreshCw size={12} className={cn(regenerating && "animate-spin")} />
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-7 px-1.5 text-xs"
+              disabled={regenerating}
+              onClick={() => { setShowRegenInput(false); setRegenText(""); }}
+            >
+              <X size={12} />
+            </Button>
+          </div>
+        ) : (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 gap-1 text-xs"
+            disabled={regenerating}
+            onClick={() => {
+              setShowRegenInput(true);
+              setTimeout(() => regenInputRef.current?.focus(), 50);
+            }}
+          >
+            <RefreshCw size={13} className={cn(regenerating && "animate-spin")} />
+            AI 重新生成
+          </Button>
+        )}
 
         <Button
           size="sm"
@@ -122,6 +174,16 @@ export function QuestionCard({
       {/* Card body */}
       {expanded && (
         <div className="p-4 space-y-3">
+          {/* Knowledge point tag */}
+          {question.entity && (
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-medium text-muted-foreground">相关知识点</span>
+              <span className="rounded-full bg-secondary text-secondary-foreground px-2.5 py-0.5 text-xs font-medium">
+                {question.entity}
+              </span>
+            </div>
+          )}
+
           {/* Question stem */}
           <div>
             <label className="text-xs font-medium text-muted-foreground mb-1 block">题目</label>

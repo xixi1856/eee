@@ -79,6 +79,14 @@ export function getRedisUrl(): string | undefined {
   return u || undefined;
 }
 
+/**
+ * Seconds before a PARSING/INDEXING material with no DB update is considered abandoned.
+ * Mirrors RAG_MATERIAL_STALE_SEC used by the Python worker (default 1800 = 30 min).
+ */
+export function getMaterialStaleSec(): number {
+  return readInt("RAG_MATERIAL_STALE_SEC", 1800);
+}
+
 export function getRedisKeyPrefix(): string {
   return process.env.REDIS_KEY_PREFIX?.trim() || "edu:";
 }

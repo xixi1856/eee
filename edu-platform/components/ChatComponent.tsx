@@ -8,12 +8,6 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
-  Sheet,
-  SheetContent,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet";
-import {
   Send,
   Bot,
   AlertCircle,
@@ -22,8 +16,11 @@ import {
   FileText,
   Loader2,
   Copy,
+  Check,
   Pencil,
   RefreshCw,
+  ChevronLeft,
+  ChevronRight,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -86,7 +83,8 @@ export default function ChatComponent(props: ChatComponentProps) {
   const [agentIdentityBound, setAgentIdentityBound] = useState<boolean | null>(null);
   const [editingClientId, setEditingClientId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
-  const [supersededSheetText, setSupersededSheetText] = useState<string | null>(null);
+  const [copiedClientId, setCopiedClientId] = useState<string | null>(null);
+  const copyFeedbackTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const {
     msgs,
@@ -99,6 +97,8 @@ export default function ChatComponent(props: ChatComponentProps) {
     sendMessage,
     commitUserEditReplace,
     regenerateAssistantAt,
+    navigateBranch,
+    branchRecords,
     pendingAttachments,
     attachmentUploading,
     addAttachment,
@@ -115,7 +115,6 @@ export default function ChatComponent(props: ChatComponentProps) {
   useEffect(() => {
     setEditingClientId(null);
     setEditDraft("");
-    setSupersededSheetText(null);
   }, [threadKey]);
 
   const loadUser = useCallback(async () => {
@@ -209,19 +208,6 @@ export default function ChatComponent(props: ChatComponentProps) {
 
   return (
     <div className="flex flex-col h-full bg-background relative">
-      <Sheet open={supersededSheetText !== null} onOpenChange={(o) => !o && setSupersededSheetText(null)}>
-        <SheetContent side="right" className="w-full sm:max-w-lg overflow-y-auto">
-          <SheetHeader>
-            <SheetTitle>此前的回答</SheetTitle>
-          </SheetHeader>
-          <div className="mt-4 prose prose-sm dark:prose-invert max-w-none">
-            {supersededSheetText !== null && (
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{supersededSheetText}</ReactMarkdown>
-            )}
-          </div>
-        </SheetContent>
-      </Sheet>
-
       {agentIdentityBound === false && (
         <div className="shrink-0 border-b border-amber-500/25 bg-amber-500/10 px-4 py-2.5 text-sm text-amber-950 dark:text-amber-100">
           <div className="w-full max-w-none flex flex-wrap items-center gap-2">
@@ -250,6 +236,8 @@ export default function ChatComponent(props: ChatComponentProps) {
 
           {msgs.map((msg, i) => {
             const isEditing = editingClientId === msg.clientId;
+            const branchRecord = branchRecords.find((r) => r.position === i);
+            const hasBranch = !!branchRecord && branchRecord.entries.length > 1;
             return (
               <div key={msg.clientId} className="group flex w-full flex-col">
                 <div
@@ -328,21 +316,39 @@ export default function ChatComponent(props: ChatComponentProps) {
                         )}
                       </div>
                     )}
-
-                    {msg.role === "user" &&
-                      msg.supersededAssistantReply &&
-                      !isEditing && (
-                        <div className="px-4 pb-2 pt-0 flex justify-end">
-                          <button
-                            type="button"
-                            className="text-[11px] text-muted-foreground underline-offset-2 hover:underline"
-                            onClick={() => setSupersededSheetText(msg.supersededAssistantReply!)}
-                          >
-                            查看此前的回答
-                          </button>
-                        </div>
-                      )}
                   </div>
+
+                  {/* Branch navigation arrows — shown below each message bubble */}
+                  {hasBranch && !isEditing && (
+                    <div
+                      className={cn(
+                        "flex items-center gap-0.5 mt-0.5 text-xs text-muted-foreground",
+                        msg.role === "user" ? "justify-end" : "justify-start",
+                      )}
+                    >
+                      <button
+                        type="button"
+                        disabled={branchRecord.activeIdx === 0 || busy}
+                        onClick={() => navigateBranch(i, -1)}
+                        className="h-5 w-5 inline-flex items-center justify-center rounded hover:bg-muted disabled:opacity-30 transition-colors"
+                        aria-label="上一个版本"
+                      >
+                        <ChevronLeft size={13} />
+                      </button>
+                      <span className="tabular-nums px-0.5 select-none">
+                        {branchRecord.activeIdx + 1}&thinsp;/&thinsp;{branchRecord.entries.length}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={branchRecord.activeIdx === branchRecord.entries.length - 1 || busy}
+                        onClick={() => navigateBranch(i, 1)}
+                        className="h-5 w-5 inline-flex items-center justify-center rounded hover:bg-muted disabled:opacity-30 transition-colors"
+                        aria-label="下一个版本"
+                      >
+                        <ChevronRight size={13} />
+                      </button>
+                    </div>
+                  )}
 
                   <div
                     className={cn(
@@ -490,6 +496,7 @@ export default function ChatComponent(props: ChatComponentProps) {
                                 materialId: c.material_id,
                                 chunkId: c.chunk_id,
                                 sourceLabel: c.source_label ?? `引用 ${ci + 1}`,
+                                chunkText: c.chunk_text,
                               },
                             }),
                           );

@@ -236,8 +236,21 @@ class SessionRunner:
 
         cid = str(inbound.metadata.get("platform_course_id") or "").strip()
         lid = str(inbound.metadata.get("platform_lesson_id") or "").strip()
+        trace_id = str(inbound.metadata.get("trace_id") or "").strip()
+        debug_trace = bool(inbound.metadata.get("debug_trace", False))
         self._agent.config.course_id = cid
         self._agent.config.lesson_id = lid
+        self._agent.config.trace_id = trace_id
+        self._agent.config.debug_trace = debug_trace
+
+        logger.debug(
+            "SessionRunner turn_start session_id=%s user_id=%s trace_id=%s course_id=%s lesson_id=%s",
+            self.session_id,
+            inbound.user_id,
+            trace_id,
+            cid,
+            lid,
+        )
 
         if inbound.channel == ChannelKind.CLI:
             from edu_agent.cli import build_callbacks

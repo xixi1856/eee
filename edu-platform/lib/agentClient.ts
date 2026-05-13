@@ -17,6 +17,8 @@ export type AgentChatRequest = {
   userMessage: string;
   stream: boolean;
   attachments?: AgentAttachment[];
+  traceId?: string | null;
+  debugTrace?: boolean;
 };
 
 const MSG_AGENT_BASE_MISSING =
@@ -126,11 +128,21 @@ export async function postChatCompletionsStream(
     session_id: req.sessionId,
     user_id: req.agentUserId,
   });
+  if (req.debugTrace) {
+    q.set("debug_trace", "1");
+  }
   const url = `${base}/v1/chat/completions?${q.toString()}`;
+  const headers = agentHeaders(req.agentUserId, req.courseId ?? null, req.lessonId ?? undefined);
+  if (req.traceId?.trim()) {
+    headers.set("X-Trace-Id", req.traceId.trim());
+  }
+  if (req.debugTrace) {
+    headers.set("X-Debug-Trace", "1");
+  }
   try {
     return await fetch(url, {
       method: "POST",
-      headers: agentHeaders(req.agentUserId, req.courseId ?? null, req.lessonId ?? undefined),
+      headers,
       body: JSON.stringify({
         model: "",
         messages: [{ role: "user", content: req.userMessage }],

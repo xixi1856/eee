@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from typing import Any, AsyncIterator
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, WebSocket
@@ -18,6 +19,12 @@ from edu_agent.sessions.store import SessionStore
 from edu_agent.toolsets.registry import discover_builtin_tools, toolset_registry
 
 logger = logging.getLogger(__name__)
+
+
+def _is_truthy(raw: str | None) -> bool:
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
 class CreateSessionBody(BaseModel):
@@ -43,6 +50,17 @@ class RegenerateQuestionBody(BaseModel):
     objective: str
     q_id: int
     extra_requirements: str = ""
+    current_question: str = ""
+
+
+class CompleteQuestionBody(BaseModel):
+    course_id: str
+    entity_name: str
+    question_stem: str
+    answer_hint: str = ""
+    q_type: str
+    objective: str
+    q_id: int
 
 
 def _verify_or_401(gateway: Gateway, auth: AuthContext) -> None:
@@ -202,12 +220,29 @@ def create_app(
         if not text.strip():
             raise HTTPException(status_code=400, detail="no user message")
 
+        trace_id = (
+            (request.headers.get("x-trace-id") or "").strip()
+            or (request.headers.get("x-request-id") or "").strip()
+            or str(uuid.uuid4())
+        )
+        debug_trace = _is_truthy(request.headers.get("x-debug-trace")) or _is_truthy(
+            request.query_params.get("debug_trace")
+        )
+
+        inbound_meta = _platform_chat_metadata(request, user_id=user_id, auth_api_key=auth.api_key)
+        inbound_meta["trace_id"] = trace_id
+        inbound_meta["request_id"] = str(uuid.uuid4())
+        inbound_meta["debug_trace"] = debug_trace
+        parent_span_id = (request.headers.get("x-parent-span-id") or "").strip()
+        if parent_span_id:
+            inbound_meta["parent_span_id"] = parent_span_id
+
         inbound = InboundMessage.user_text(
             channel=ChannelKind.HTTP,
             session_id=session_id,
             user_id=user_id,
             content=text.strip(),
-            metadata=_platform_chat_metadata(request, user_id=user_id, auth_api_key=auth.api_key),
+            metadata=inbound_meta,
         )
 
         if payload.stream:
@@ -259,6 +294,7 @@ def create_app(
                         edu_meta: dict[str, Any] = {
                             "content_type": ob.content_type.value,
                             "is_final": ob.is_final,
+                            "trace_id": trace_id,
                         }
                         if ob.metadata:
                             edu_meta["b3"] = ob.metadata
@@ -269,7 +305,11 @@ def create_app(
                     err = {"error": str(exc), "choices": []}
                     yield _sse_line(err).encode("utf-8")
 
-            return StreamingResponse(event_stream(), media_type="text/event-stream")
+            return StreamingResponse(
+                event_stream(),
+                media_type="text/event-stream",
+                headers={"X-Trace-Id": trace_id},
+            )
 
         # non-stream: aggregate final TEXT
         final_text = ""
@@ -287,7 +327,8 @@ def create_app(
                         "finish_reason": "stop",
                     }
                 ],
-            }
+            },
+            headers={"X-Trace-Id": trace_id},
         )
 
     @app.websocket("/v1/ws")
@@ -313,11 +354,38 @@ def create_app(
             objective=payload.objective,
             q_id=payload.q_id,
             extra_requirements=payload.extra_requirements,
+            current_question=payload.current_question,
         )
         if result is None:
             raise HTTPException(
                 status_code=422,
                 detail="Could not regenerate question: no usable context found in course RAG",
+            )
+        return JSONResponse(result)
+
+    @app.post("/v1/assignment/complete-question")
+    async def complete_question(
+        request: Request,
+        payload: CompleteQuestionBody = Body(...),
+        gw: Gateway = Depends(gw_dep),
+    ) -> JSONResponse:
+        auth = _auth_from_request(request)
+        _verify_or_401(gw, auth)
+        from rag_mvp.assignment_gen import complete_teacher_question
+
+        result = await complete_teacher_question(
+            course_id=payload.course_id,
+            entity_name=payload.entity_name,
+            question_stem=payload.question_stem,
+            answer_hint=payload.answer_hint,
+            q_type=payload.q_type,
+            objective=payload.objective,
+            q_id=payload.q_id,
+        )
+        if result is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Could not complete question: LLM generation failed",
             )
         return JSONResponse(result)
 

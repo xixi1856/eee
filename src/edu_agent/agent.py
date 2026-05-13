@@ -242,17 +242,58 @@ class EduAgent:
             metadata=dict(metadata or {}),
         )
 
+    def _trace_enabled(self) -> bool:
+        return bool(self.config.debug_trace)
+
+    def _trace_id(self) -> str:
+        return (self.config.trace_id or "").strip()
+
+    def _make_trace_metadata(self, event: str, **attrs: Any) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "trace_event": event,
+            "trace_id": self._trace_id(),
+            "turn_id": self._trace_turn_id,
+            "session_id": self.config.session_id,
+            "user_id": self.config.user_id,
+            "ts": ensure_aware_utc().isoformat(),
+        }
+        for k, v in attrs.items():
+            if v is not None:
+                data[k] = v
+        return data
+
+    def _trace_outbound(
+        self,
+        in_reply_to: UUID,
+        event: str,
+        **attrs: Any,
+    ) -> OutboundMessage:
+        return self._make_outbound(
+            in_reply_to,
+            content="",
+            content_type=OutboundContentType.META,
+            is_final=False,
+            metadata=self._make_trace_metadata(event, **attrs),
+        )
+
     def _reset_b3_turn_metrics(self) -> None:
         """Per user turn: timing, token usage (last LLM chunk), RAG hit lists for qa_logs / B3."""
         self._b3_turn_t0 = time.monotonic()
+        self._trace_turn_id = uuid.uuid4().hex
         self._b3_turn_prompt_tokens: int | None = None
         self._b3_turn_completion_tokens: int | None = None
+        self._b3_iteration_count: int = 0
         self._b3_hit_chunks: list[str] = []
+        self._b3_hit_chunk_texts: list[str] = []
         self._b3_hit_materials: list[str] = []
         self._b3_hit_sources: list[str] = []
+        self._b3_tools_called: list[str] = []
+        self._b3_skills_selected: list[str] = []
         self._b3_seen_chunk_ids: set[str] = set()
         self._b3_seen_material_ids: set[str] = set()
         self._b3_seen_source_labels: set[str] = set()
+        self._b3_seen_tools: set[str] = set()
+        self._b3_seen_skills: set[str] = set()
 
     def _b3_turn_metadata(self) -> dict[str, Any]:
         pt, ct = self._b3_turn_prompt_tokens, self._b3_turn_completion_tokens
@@ -264,12 +305,18 @@ class EduAgent:
         elif ct is not None:
             total = ct
         return {
+            "trace_id": self._trace_id() or None,
+            "turn_id": self._trace_turn_id,
+            "iteration_count": self._b3_iteration_count,
             "execution_time_ms": int((time.monotonic() - self._b3_turn_t0) * 1000),
             "model_used": self._model,
             "prompt_tokens": pt,
             "completion_tokens": ct,
             "total_tokens": total,
+            "tools_called": list(self._b3_tools_called),
+            "skills_selected": list(self._b3_skills_selected),
             "hit_chunks": list(self._b3_hit_chunks),
+            "hit_chunk_texts": list(self._b3_hit_chunk_texts),
             "hit_materials": list(self._b3_hit_materials),
             "hit_sources": list(self._b3_hit_sources),
         }
@@ -295,6 +342,8 @@ class EduAgent:
                 if c and c not in self._b3_seen_chunk_ids:
                     self._b3_seen_chunk_ids.add(c)
                     self._b3_hit_chunks.append(c)
+                    raw_text = item.get("text", "")
+                    self._b3_hit_chunk_texts.append(str(raw_text)[:2000] if raw_text else "")
             mid = item.get("material_id")
             if isinstance(mid, str):
                 m = mid.strip()
@@ -436,6 +485,15 @@ class EduAgent:
         )
         token = set_current_runtime(ctx)
         try:
+            if self._trace_enabled():
+                yield self._trace_outbound(
+                    in_reply_to,
+                    "turn_start",
+                    course_id=_cid or None,
+                    lesson_id=_lid or None,
+                    input_len=len(user_input or ""),
+                    attachments_count=len(attachments),
+                )
             async for ob in self._run_turn_inner_stream(
                 user_input,
                 in_reply_to=in_reply_to,
@@ -726,9 +784,23 @@ class EduAgent:
             course_id=self.config.course_id,
             course_material_names=_course_material_names,
         )
+        if self._trace_enabled():
+            injected_skills = [e.name for e in _skill_entries if e.always_inject]
+            indexed_skills = [e.name for e in _skill_entries if not e.always_inject]
+            yield self._trace_outbound(
+                in_reply_to,
+                "prompt_built",
+                injected_skills=injected_skills,
+                indexed_skills=indexed_skills,
+                available_tools=sorted({s.name for s in _specs}),
+                attachments_mode="multimodal" if attachments else "text",
+            )
 
         for iteration in range(1, self.config.max_iterations + 1):
             logger.debug("Iteration %d/%d", iteration, self.config.max_iterations)
+            self._b3_iteration_count = iteration
+            if self._trace_enabled():
+                yield self._trace_outbound(in_reply_to, "llm_iteration_start", iteration=iteration)
 
             self._safe_cb(self.callbacks and self.callbacks.on_thinking_start)
 
@@ -758,11 +830,32 @@ class EduAgent:
             tool_calls = state.tool_calls
 
             if finish_reason == "tool_calls" or tool_calls:
+                if self._trace_enabled():
+                    yield self._trace_outbound(
+                        in_reply_to,
+                        "llm_iteration_end",
+                        iteration=iteration,
+                        finish_reason=finish_reason or "tool_calls",
+                        output_len=len(content or ""),
+                        tool_calls_count=len(tool_calls),
+                    )
                 async for ob in self._handle_tool_calls_stream(
-                    tool_calls, _disabled, in_reply_to=in_reply_to
+                    tool_calls,
+                    _disabled,
+                    in_reply_to=in_reply_to,
+                    iteration=iteration,
                 ):
                     yield ob
                 continue
+
+            if self._trace_enabled():
+                yield self._trace_outbound(
+                    in_reply_to,
+                    "llm_iteration_end",
+                    iteration=iteration,
+                    finish_reason=finish_reason,
+                    output_len=len(content or ""),
+                )
 
             output_check = check_output(content)
             if not output_check.safe:
@@ -782,6 +875,14 @@ class EduAgent:
             logger.debug("Agent replied after %d iteration(s)", iteration)
             self._maybe_compress()
             self._maybe_memory_threshold_consolidate()
+            if self._trace_enabled():
+                yield self._trace_outbound(
+                    in_reply_to,
+                    "turn_end",
+                    status="ok",
+                    output_len=len(content or ""),
+                    metadata=self._b3_turn_metadata(),
+                )
             yield self._make_outbound(
                 in_reply_to,
                 content=content,
@@ -802,6 +903,14 @@ class EduAgent:
         self._persist_message(asst_msg)
         self._maybe_compress()
         self._maybe_memory_threshold_consolidate()
+        if self._trace_enabled():
+            yield self._trace_outbound(
+                in_reply_to,
+                "turn_end",
+                status="max_iterations",
+                output_len=len(budget_msg or ""),
+                metadata=self._b3_turn_metadata(),
+            )
         yield self._make_outbound(
             in_reply_to,
             content=budget_msg,
@@ -969,6 +1078,7 @@ class EduAgent:
         disabled_names: frozenset[str],
         *,
         in_reply_to: UUID,
+        iteration: int,
     ) -> AsyncIterator[OutboundMessage]:
         """Persist tool round, yield TOOL_CALL / TOOL_RESULT outbounds, mirror non-stream path."""
         tc_message_content = []
@@ -987,12 +1097,30 @@ class EduAgent:
         self._persist_message(asst_tool_msg)
 
         cb = self.callbacks
-        for tc in tool_calls:
+        for seq, tc in enumerate(tool_calls, start=1):
             tool_name = tc["name"]
             try:
                 args = json.loads(tc["arguments"])
             except json.JSONDecodeError:
                 args = {}
+
+            if tool_name not in self._b3_seen_tools:
+                self._b3_seen_tools.add(tool_name)
+                self._b3_tools_called.append(tool_name)
+
+            if tool_name == "view_skill" and isinstance(args, dict):
+                sk = str(args.get("name") or "").strip()
+                if sk and sk not in self._b3_seen_skills:
+                    self._b3_seen_skills.add(sk)
+                    self._b3_skills_selected.append(sk)
+                if self._trace_enabled() and sk:
+                    yield self._trace_outbound(
+                        in_reply_to,
+                        "skill_selected",
+                        iteration=iteration,
+                        tool_seq=seq,
+                        skill_name=sk,
+                    )
 
             payload = json.dumps(
                 {"id": tc["id"], "name": tool_name, "arguments": tc["arguments"]},
@@ -1003,11 +1131,34 @@ class EduAgent:
                 content=payload,
                 content_type=OutboundContentType.TOOL_CALL,
                 is_final=False,
-                metadata={"tool_name": tool_name},
+                metadata={
+                    "tool_name": tool_name,
+                    "trace_id": self._trace_id() or None,
+                    "turn_id": self._trace_turn_id,
+                    "iteration": iteration,
+                    "tool_seq": seq,
+                },
             )
 
+            if self._trace_enabled():
+                yield self._trace_outbound(
+                    in_reply_to,
+                    "tool_call",
+                    iteration=iteration,
+                    tool_seq=seq,
+                    tool_name=tool_name,
+                    arguments=args,
+                )
+
             self._safe_cb(cb and cb.on_tool_start, tool_name, args)
-            logger.info("Calling tool: %s(%s)", tool_name, args)
+            logger.info(
+                "Calling tool: %s(%s) trace_id=%s iteration=%s tool_seq=%s",
+                tool_name,
+                args,
+                self._trace_id() or "",
+                iteration,
+                seq,
+            )
 
             t0 = time.monotonic()
             ctx_rt = get_current_runtime()
@@ -1020,10 +1171,13 @@ class EduAgent:
             duration = time.monotonic() - t0
 
             logger.info(
-                "Tool %s → success=%s, content_len=%d",
+                "Tool %s → success=%s, content_len=%d trace_id=%s iteration=%s tool_seq=%s",
                 tool_name,
                 tr.success,
                 len(result_content),
+                self._trace_id() or "",
+                iteration,
+                seq,
             )
             self._safe_cb(cb and cb.on_tool_end, tool_name, args, result_content, duration)
 
@@ -1046,8 +1200,23 @@ class EduAgent:
                     "tool_name": tool_name,
                     "success": tr.success,
                     "duration_s": duration,
+                    "trace_id": self._trace_id() or None,
+                    "turn_id": self._trace_turn_id,
+                    "iteration": iteration,
+                    "tool_seq": seq,
                 },
             )
+
+            if self._trace_enabled():
+                yield self._trace_outbound(
+                    in_reply_to,
+                    "tool_result",
+                    iteration=iteration,
+                    tool_seq=seq,
+                    tool_name=tool_name,
+                    success=tr.success,
+                    duration_ms=int(duration * 1000),
+                )
 
     def _llm_call(
         self,
@@ -1175,5 +1344,6 @@ class EduAgent:
             tool_calls,
             disabled_names,
             in_reply_to=uuid.uuid4(),
+            iteration=0,
         ):
             pass

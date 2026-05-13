@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { Upload, CheckCircle2, AlertCircle, Loader2 } from "lucide-react";
+import { Upload, CheckCircle2, AlertCircle, Loader2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { formatApiErrorFromResponse } from "@/lib/http/format-api-error";
 import {
@@ -24,6 +24,7 @@ function parseExtension(filename: string): string {
 
 export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const xhrRef = useRef<XMLHttpRequest | null>(null);
   const [busy, setBusy] = useState(false);
   const [textOnly, setTextOnly] = useState(true);
   const [skipKg, setSkipKg] = useState(true);
@@ -31,6 +32,10 @@ export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props
   const [status, setStatus] = useState<"idle" | "success" | "error">("idle");
   const [msg, setMsg] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
+
+  function cancelUpload() {
+    xhrRef.current?.abort();
+  }
 
   async function handleFiles(files: FileList | null) {
     if (!files?.length) return;
@@ -55,6 +60,7 @@ export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props
         fd.set("skip_kg", skipKg ? "true" : "false");
         const xhr = new XMLHttpRequest();
         await new Promise<void>((resolve, reject) => {
+          xhrRef.current = xhr;
           xhr.open("POST", `/api/v1/courses/${courseId}/materials`);
           xhr.withCredentials = true;
           xhr.upload.onprogress = (ev) => {
@@ -70,6 +76,11 @@ export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props
             }
           };
           xhr.onerror = () => reject(new Error("网络错误，请检查连接后重试"));
+          xhr.onabort = () => {
+            const err = new Error("已取消");
+            (err as Error & { isAbort: boolean }).isAbort = true;
+            reject(err);
+          };
           xhr.send(fd);
         });
       }
@@ -77,11 +88,18 @@ export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props
       setMsg(`已上传 ${done} 个文件，等待后台处理…`);
       onUploaded?.();
     } catch (e) {
-      setStatus("error");
-      setMsg(e instanceof Error ? e.message : "上传失败");
+      if (e instanceof Error && (e as Error & { isAbort?: boolean }).isAbort) {
+        setStatus("idle");
+        setMsg("已取消");
+        setTimeout(() => setMsg(null), 2000);
+      } else {
+        setStatus("error");
+        setMsg(e instanceof Error ? e.message : "上传失败");
+      }
     } finally {
       setBusy(false);
       setPct(0);
+      xhrRef.current = null;
       if (inputRef.current) inputRef.current.value = "";
     }
   }
@@ -119,10 +137,12 @@ export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props
       </p>
 
       {/* Drop zone */}
-      <button
-        type="button"
-        disabled={busy}
-        onClick={() => inputRef.current?.click()}
+      <div
+        role="button"
+        tabIndex={busy ? -1 : 0}
+        aria-disabled={busy}
+        onClick={() => { if (!busy) inputRef.current?.click(); }}
+        onKeyDown={(e) => { if (!busy && (e.key === 'Enter' || e.key === ' ')) inputRef.current?.click(); }}
         onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
         onDragLeave={() => setDragging(false)}
         onDrop={(e) => {
@@ -131,7 +151,7 @@ export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props
           void handleFiles(e.dataTransfer.files);
         }}
         className={cn(
-          "relative w-full rounded-xl border-2 border-dashed px-4 py-6 text-center transition-colors",
+          "relative w-full rounded-xl border-2 border-dashed px-4 py-6 text-center transition-colors cursor-pointer",
           dragging ? "border-primary bg-primary/8" : "border-border hover:border-primary/50 hover:bg-muted/30",
           busy && "pointer-events-none opacity-60"
         )}
@@ -151,6 +171,14 @@ export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props
             <div className="w-40 h-1.5 rounded-full bg-muted overflow-hidden">
               <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${pct}%` }} />
             </div>
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); cancelUpload(); }}
+              className="mt-1 flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted/60 hover:text-foreground transition-colors"
+            >
+              <X size={12} />
+              取消上传
+            </button>
           </div>
         ) : (
           <div className="flex flex-col items-center gap-2">
@@ -161,7 +189,7 @@ export default function MaterialUpload({ courseId, lessonId, onUploaded }: Props
             </p>
           </div>
         )}
-      </button>
+      </div>
 
       {/* Status message */}
       {msg && (

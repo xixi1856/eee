@@ -160,6 +160,7 @@ class RuntimeSettings(BaseModel):
     env: Literal["dev", "staging", "prod"] = "dev"
     # A5 placeholders
     gateway: dict[str, Any] = Field(default_factory=dict)
+    cron: dict[str, Any] = Field(default_factory=dict)
     channels: ChannelsSettings = Field(default_factory=ChannelsSettings)
 
 

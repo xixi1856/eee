@@ -92,6 +92,10 @@ class AgentConfig:
     """Optional course scope for RAG routing (injected into turn runtime context)."""
     lesson_id: str = ""
     """Optional lesson scope (platform runtime; qa_logs / analytics)."""
+    trace_id: str = ""
+    """Optional correlation id for end-to-end tracing across gateway/agent/tools."""
+    debug_trace: bool = False
+    """When True, emit structured trace events as META outbound chunks."""
 
 
 @dataclass

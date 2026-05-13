@@ -45,6 +45,9 @@ export async function POST(req: NextRequest, ctx: Ctx) {
       }
       lessonId = le.id;
     }
+    const traceId = req.headers.get("x-trace-id")?.trim() || null;
+    const debugTraceRaw = req.headers.get("x-debug-trace")?.trim().toLowerCase() || "";
+    const debugTrace = ["1", "true", "yes", "on"].includes(debugTraceRaw);
     return await courseChatSseResponse({
       courseId,
       platformStudentId: auth.sub,
@@ -52,6 +55,8 @@ export async function POST(req: NextRequest, ctx: Ctx) {
       message,
       lessonId,
       attachments,
+      traceId,
+      debugTrace,
     });
   } catch (e) {
     if (e instanceof ApiError) return jsonError(e);

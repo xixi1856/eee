@@ -1,6 +1,7 @@
 import {
   DeleteObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
@@ -57,6 +58,30 @@ export async function deleteObject(objectKey: string): Promise<void> {
   await client.send(
     new DeleteObjectCommand({ Bucket: c.bucket, Key: objectKey }),
   );
+}
+
+export async function objectExists(objectKey: string): Promise<boolean> {
+  const c = getMinioConfig();
+  const client = getS3Client();
+  try {
+    await client.send(
+      new HeadObjectCommand({ Bucket: c.bucket, Key: objectKey }),
+    );
+    return true;
+  } catch (e) {
+    const err = e as {
+      name?: string;
+      code?: string;
+      Code?: string;
+      $metadata?: { httpStatusCode?: number };
+    };
+    const status = Number(err.$metadata?.httpStatusCode ?? 0);
+    const code = String(err.code ?? err.Code ?? err.name ?? "");
+    if (status === 404 || code === "NotFound" || code === "NoSuchKey") {
+      return false;
+    }
+    throw e;
+  }
 }
 
 export async function getObjectStream(params: {

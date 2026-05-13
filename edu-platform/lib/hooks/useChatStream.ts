@@ -9,14 +9,31 @@ export type ChatMessage = {
   attachments?: AttachmentRef[];
   /** Same QaLog row id for hydrated user/assistant pair */
   qaLogId?: string;
-  /** After editing this user turn, the assistant reply that was replaced (client-only). */
-  supersededAssistantReply?: string;
+};
+
+/**
+ * A single branch snapshot stored when the user edits a message or regenerates a reply.
+ * `tailMsgs` contains the msgs array starting from the branch position (inclusive).
+ */
+export type BranchEntry = {
+  tailMsgs: ChatMessage[];
+};
+
+/**
+ * Branch history for a specific position in the msgs array.
+ * `position` is the 0-based index of the message (user msg for edits, assistant msg for regen).
+ */
+export type BranchRecord = {
+  position: number;
+  entries: BranchEntry[];
+  activeIdx: number;
 };
 
 export type Citation = {
   chunk_id?: string;
   material_id?: string;
   source_label?: string;
+  chunk_text?: string;
 };
 export type DoneMeta = {
   type: "done";
@@ -156,12 +173,30 @@ export function useChatStream(config: UseChatStreamConfig) {
   const [attachmentUploading, setAttachmentUploading] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
+  const [branchRecords, setBranchRecords] = useState<BranchRecord[]>([]);
+  const branchRecordsRef = useRef<BranchRecord[]>([]);
+  branchRecordsRef.current = branchRecords;
+
+  /** Update branch records atomically (keeps ref in sync). */
+  const updateBranchRecords = useCallback(
+    (updater: (prev: BranchRecord[]) => BranchRecord[]) => {
+      const next = updater(branchRecordsRef.current);
+      branchRecordsRef.current = next;
+      setBranchRecords(next);
+    },
+    [],
+  );
+
   const historyLoadKey =
     config.kind === "qa_center_global"
       ? `q:${config.sessionId ?? ""}`
       : `c:${config.courseId}:h:${config.hydrateSessionId ?? ""}`;
 
   useEffect(() => {
+    // Clear branch history whenever we switch threads
+    branchRecordsRef.current = [];
+    setBranchRecords([]);
+
     const c = cfgRef.current;
     if (c.kind === "qa_center_global") {
       if (!c.sessionId) {
@@ -387,6 +422,7 @@ export function useChatStream(config: UseChatStreamConfig) {
                   chunk_id: event.chunk_id,
                   material_id: event.material_id,
                   source_label: event.source_label,
+                  chunk_text: event.chunk_text,
                 });
                 setCitations([...newCitations]);
               } else if (event.type === "done") {
@@ -480,34 +516,53 @@ export function useChatStream(config: UseChatStreamConfig) {
       const hasAtt = (row.attachments?.length ?? 0) > 0;
       if (!trimmed && !hasAtt) return false;
 
-      const nextAssistant = prev[replaceFromIndex + 1];
-      let superseded: string | undefined;
-      if (
-        nextAssistant?.role === "assistant" &&
-        !isAssistantErrorBubble(nextAssistant.text)
-      ) {
-        superseded = nextAssistant.text;
-      }
-
       const attachments = row.attachments ?? [];
       const newUser: ChatMessage = {
         clientId: newClientId(),
         role: "user",
         text: trimmed,
         ...(attachments.length ? { attachments } : {}),
-        ...(superseded !== undefined ? { supersededAssistantReply: superseded } : {}),
       };
 
-      const messageForApi = trimmed;
+      // ── Branch tracking: save the current tail before overwriting ──
+      const turnPosition = replaceFromIndex;
+      const oldTailMsgs = prev.slice(turnPosition);
+      updateBranchRecords((prevRecords) => {
+        const existingIdx = prevRecords.findIndex((r) => r.position === turnPosition);
+        if (existingIdx !== -1) {
+          // Branch already exists; current state is already stored as one of the entries.
+          return prevRecords;
+        }
+        // Remove stale records at positions >= turnPosition, then add new record.
+        const cleaned = prevRecords.filter((r) => r.position < turnPosition);
+        return [
+          ...cleaned,
+          { position: turnPosition, entries: [{ tailMsgs: oldTailMsgs }], activeIdx: 0 },
+        ];
+      });
 
       const newMsgs = [...prev.slice(0, replaceFromIndex), newUser];
       msgsRef.current = newMsgs;
       setMsgs(newMsgs);
 
-      await runChatRequest(messageForApi, lessonId, attachments);
+      await runChatRequest(trimmed, lessonId, attachments);
+
+      // After API response, capture new tail and add as the next branch entry.
+      const newTailMsgs = msgsRef.current.slice(turnPosition);
+      updateBranchRecords((prevRecords) => {
+        const idx = prevRecords.findIndex((r) => r.position === turnPosition);
+        if (idx === -1) return prevRecords;
+        const record = prevRecords[idx];
+        const newEntries = [...record.entries, { tailMsgs: newTailMsgs }];
+        const updated: BranchRecord = { ...record, entries: newEntries, activeIdx: newEntries.length - 1 };
+        const next = [...prevRecords];
+        next[idx] = updated;
+        return next;
+      });
+
       return true;
     },
-    [busy, runChatRequest],
+    [busy, runChatRequest, updateBranchRecords],
   );
 
   const regenerateAssistantAt = useCallback(
@@ -525,6 +580,22 @@ export function useChatStream(config: UseChatStreamConfig) {
         return;
       }
 
+      // ── Branch tracking: save the current assistant tail before overwriting ──
+      // We track at the assistant message position so arrows appear on the assistant bubble.
+      const turnPosition = assistantIndex;
+      const oldTailMsgs = prev.slice(turnPosition);
+      updateBranchRecords((prevRecords) => {
+        const existingIdx = prevRecords.findIndex((r) => r.position === turnPosition);
+        if (existingIdx !== -1) {
+          return prevRecords;
+        }
+        const cleaned = prevRecords.filter((r) => r.position < turnPosition);
+        return [
+          ...cleaned,
+          { position: turnPosition, entries: [{ tailMsgs: oldTailMsgs }], activeIdx: 0 },
+        ];
+      });
+
       const newMsgs = prev.slice(0, assistantIndex);
       msgsRef.current = newMsgs;
       setMsgs(newMsgs);
@@ -534,8 +605,50 @@ export function useChatStream(config: UseChatStreamConfig) {
         lessonId,
         userRow.attachments ?? [],
       );
+
+      // After API response, capture new assistant tail and add as next branch entry.
+      const newTailMsgs = msgsRef.current.slice(turnPosition);
+      updateBranchRecords((prevRecords) => {
+        const idx = prevRecords.findIndex((r) => r.position === turnPosition);
+        if (idx === -1) return prevRecords;
+        const record = prevRecords[idx];
+        const newEntries = [...record.entries, { tailMsgs: newTailMsgs }];
+        const updated: BranchRecord = { ...record, entries: newEntries, activeIdx: newEntries.length - 1 };
+        const next = [...prevRecords];
+        next[idx] = updated;
+        return next;
+      });
     },
-    [busy, runChatRequest],
+    [busy, runChatRequest, updateBranchRecords],
+  );
+
+  /** Navigate between historical branches at the given msg index. */
+  const navigateBranch = useCallback(
+    (position: number, direction: -1 | 1) => {
+      if (busy) return;
+      const records = branchRecordsRef.current;
+      const recordIdx = records.findIndex((r) => r.position === position);
+      if (recordIdx === -1) return;
+      const record = records[recordIdx];
+      const newIdx = record.activeIdx + direction;
+      if (newIdx < 0 || newIdx >= record.entries.length) return;
+
+      const newRecord: BranchRecord = { ...record, activeIdx: newIdx };
+      // Clear stale records at positions > this branch point (they belong to a different subtree).
+      const cleanedRecords = records
+        .filter((r) => r.position <= position)
+        .map((r) => (r.position === position ? newRecord : r));
+      branchRecordsRef.current = cleanedRecords;
+      setBranchRecords(cleanedRecords);
+
+      // Reconstruct msgs from the selected snapshot.
+      const targetEntry = record.entries[newIdx];
+      const prefix = msgsRef.current.slice(0, position);
+      const newMsgs = [...prefix, ...targetEntry.tailMsgs];
+      msgsRef.current = newMsgs;
+      setMsgs(newMsgs);
+    },
+    [busy],
   );
 
   return {
@@ -549,6 +662,8 @@ export function useChatStream(config: UseChatStreamConfig) {
     sendMessage,
     commitUserEditReplace,
     regenerateAssistantAt,
+    navigateBranch,
+    branchRecords,
     pendingAttachments,
     attachmentUploading,
     addAttachment,

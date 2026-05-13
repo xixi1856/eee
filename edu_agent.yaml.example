@@ -9,7 +9,11 @@ agent:
   max_tokens: 4096
   max_iterations: 20
   skills_dir: skills
-  # DeepSeek V4 (OpenAI SDK): pass provider-specific fields via extra_body, e.g. disable thinking:
+  # OpenAI-compatible models (Qwen / DeepSeek): pass provider-specific fields via extra_body.
+  # For qwen-plus/pro to reduce latency, you can disable thinking mode:
+  # llm_extra_body:
+  #   enable_thinking: false
+  # DeepSeek V4 example:
   # llm_extra_body:
   #   thinking:
   #     type: disabled

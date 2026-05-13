@@ -43,12 +43,17 @@ export async function POST(req: NextRequest) {
       typeof body.session_id === "string" && body.session_id.trim()
         ? body.session_id.trim()
         : null;
+    const traceId = req.headers.get("x-trace-id")?.trim() || null;
+    const debugTraceRaw = req.headers.get("x-debug-trace")?.trim().toLowerCase() || "";
+    const debugTrace = ["1", "true", "yes", "on"].includes(debugTraceRaw);
     return await qaCenterChatSseResponse({
       platformStudentId: auth.sub,
       agentUserId: auth.agent_user_id,
       message,
       sessionId,
       attachments,
+      traceId,
+      debugTrace,
     });
   } catch (e) {
     if (e instanceof ApiError) return jsonError(e);

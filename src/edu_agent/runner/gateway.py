@@ -109,6 +109,14 @@ class Gateway:
         auth: AuthContext,
     ) -> AsyncIterator[OutboundMessage]:
         """Authorize, resolve session, forward to ``SessionRunner`` (exclusive path)."""
+        logger.debug(
+            "Gateway inbound session_id=%s user_id=%s channel=%s trace_id=%s message_id=%s",
+            inbound.session_id,
+            inbound.user_id,
+            inbound.channel.value,
+            str(inbound.metadata.get("trace_id") or ""),
+            str(inbound.message_id),
+        )
         if self._closing:
             yield OutboundMessage(
                 message_id=new_message_id(),

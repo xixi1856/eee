@@ -157,6 +157,9 @@ async def llm_model_func(
     """Text LLM backed by qwen-plus (OpenAI-compatible, async)."""
     kwargs.setdefault("max_tokens", settings.llm_max_tokens)
     kwargs.setdefault("temperature", settings.llm_temperature)
+    if settings.llm_extra_body:
+        # Per-call explicit extra_body has higher priority than global defaults.
+        kwargs.setdefault("extra_body", settings.llm_extra_body)
     token = _llm_role.set(f"chat/{settings.llm_model}")
     try:
         return await openai_complete_if_cache(

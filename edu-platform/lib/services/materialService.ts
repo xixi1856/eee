@@ -18,6 +18,7 @@ import { assertTeacherOfCourse, getCourseIfMember, assertUuid } from "@/lib/cour
 import {
   deleteObject,
   getObjectStream,
+  objectExists,
   putObjectStream,
 } from "@/lib/minio";
 import {
@@ -26,6 +27,8 @@ import {
   previewPdfObjectKey,
 } from "@/lib/material-office";
 import { enqueueRagTask, type RagQueueTask } from "@/lib/queue/ragTask";
+import { getRedis } from "@/lib/redis";
+import { getMaterialStaleSec } from "@/lib/config";
 import type {
   MaterialCreatedDto,
   MaterialDetailDto,
@@ -67,6 +70,42 @@ function parseExtension(filename: string): string {
   return filename.slice(i + 1);
 }
 
+const STALE_PROCESSING_STATUSES = new Set<MaterialStatus>([
+  MaterialStatus.PARSING,
+  MaterialStatus.INDEXING,
+  MaterialStatus.PARSED,
+]);
+
+/**
+ * If a material is stuck in a processing state with no DB update beyond the stale
+ * threshold, mark it FAILED in-place so the frontend shows failure immediately,
+ * without waiting for the worker to restart.
+ *
+ * Returns the updated material if it was marked stale, otherwise the original.
+ */
+async function reconcileStaleProcessingMaterial(m: Material): Promise<Material> {
+  if (!STALE_PROCESSING_STATUSES.has(m.status)) return m;
+  const staleSec = getMaterialStaleSec();
+  const ageMs = Date.now() - m.updatedAt.getTime();
+  if (ageMs < staleSec * 1000) return m;
+  // Mark as FAILED — best effort; ignore race with worker re-claiming the row.
+  await prisma.material.updateMany({
+    where: {
+      id: m.id,
+      isDeleted: false,
+      status: { in: [...STALE_PROCESSING_STATUSES] },
+    },
+    data: {
+      status: MaterialStatus.FAILED,
+      statusMessage: "WORKER_ABANDONED: worker was likely interrupted or crashed",
+    },
+  });
+  const refreshed = await prisma.material.findFirst({
+    where: { id: m.id, isDeleted: false },
+  });
+  return refreshed ?? m;
+}
+
 function toSummary(m: Material): MaterialSummaryDto {
   return {
     id: m.id,
@@ -79,6 +118,94 @@ function toSummary(m: Material): MaterialSummaryDto {
     created_at: m.createdAt.toISOString(),
     status_message: m.statusMessage,
   };
+}
+
+function officePreviewKeys(m: Material): [string, string] {
+  return [
+    previewPdfObjectKey(m.minioPath),
+    legacyConvertedPdfObjectKey(m.minioPath, m.id),
+  ];
+}
+
+async function markOfficePreviewReadyAndMaybeQueueParse(m: Material): Promise<void> {
+  const moved = await prisma.material.updateMany({
+    where: {
+      id: m.id,
+      isDeleted: false,
+      previewPdfStatus: {
+        in: [
+          MaterialPreviewPdfStatus.PENDING,
+          MaterialPreviewPdfStatus.FAILED,
+        ],
+      },
+    },
+    data: {
+      previewPdfStatus: MaterialPreviewPdfStatus.READY,
+      statusMessage: null,
+    },
+  });
+  if (moved.count < 1) {
+    return;
+  }
+  if (m.status !== MaterialStatus.UPLOADED || !getRedisUrl()) {
+    return;
+  }
+  try {
+    await enqueueRagTaskWithRetry({
+      task_id: randomUUID(),
+      material_id: m.id,
+      operation: "parse_and_index",
+      created_at: new Date().toISOString(),
+      text_only: true,
+      skip_kg: true,
+    });
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    await prisma.material.updateMany({
+      where: {
+        id: m.id,
+        isDeleted: false,
+        status: MaterialStatus.UPLOADED,
+      },
+      data: {
+        statusMessage: `PREVIEW_READY_PARSE_QUEUE_FAILED: ${detail.slice(0, 500)}`,
+      },
+    });
+  }
+}
+
+async function reconcileOfficePreviewIfObjectReady(m: Material): Promise<Material> {
+  if (!isOfficeMaterialFileType(m.fileType)) {
+    return m;
+  }
+  if (
+    m.previewPdfStatus !== MaterialPreviewPdfStatus.PENDING &&
+    m.previewPdfStatus !== MaterialPreviewPdfStatus.FAILED
+  ) {
+    return m;
+  }
+
+  const keys = officePreviewKeys(m);
+  let previewExists = false;
+  for (const key of keys) {
+    try {
+      if (await objectExists(key)) {
+        previewExists = true;
+        break;
+      }
+    } catch {
+      return m;
+    }
+  }
+  if (!previewExists) {
+    return m;
+  }
+
+  await markOfficePreviewReadyAndMaybeQueueParse(m);
+  const refreshed = await prisma.material.findFirst({
+    where: { id: m.id, isDeleted: false },
+  });
+  return refreshed ?? m;
 }
 
 export async function listMaterials(
@@ -100,7 +227,12 @@ export async function listMaterials(
     where,
     orderBy: { createdAt: "desc" },
   });
-  return { materials: rows.map(toSummary) };
+  const reconciled = await Promise.all(
+    rows.map((m) =>
+      reconcileOfficePreviewIfObjectReady(m).then(reconcileStaleProcessingMaterial)
+    ),
+  );
+  return { materials: reconciled.map(toSummary) };
 }
 
 export async function uploadMaterialStream(params: {
@@ -343,6 +475,98 @@ export async function retryMaterialIndex(
   await enqueueRagTaskWithRetry(task);
 }
 
+/** Redis key used to signal the Python worker to abort processing. TTL = 2 h. */
+export function ragCancelKey(materialId: string): string {
+  return `edu:rag:cancel:${materialId}`;
+}
+
+const CANCEL_KEY_TTL_SEC = 7200;
+
+/**
+ * Cancel an in-progress RAG task for a material.
+ *
+ * Steps:
+ * 1. Validate caller is teacher of the owning course.
+ * 2. Set a Redis signal key so the Python worker aborts at its next checkpoint.
+ * 3. Soft-delete the material (isDeleted=true) so it disappears from listings.
+ * 4. Enqueue delete_material to clean up MinIO / LightRAG vectors after the worker stops.
+ *
+ * Safe to call on UPLOADED/PARSING/PARSED/INDEXING. Returns 404 for unknown or
+ * already-deleted materials, 409 for READY (use DELETE instead).
+ */
+export async function cancelMaterialProcessing(
+  userId: string,
+  role: UserRole,
+  materialId: string,
+): Promise<void> {
+  assertUuid(materialId, "material_id");
+  const m = await prisma.material.findFirst({
+    where: { id: materialId, isDeleted: false },
+    include: { course: true },
+  });
+  if (!m) {
+    throw new ApiError(404, "NOT_FOUND", "Material not found");
+  }
+  await assertTeacherOfCourse(userId, role, m.courseId);
+
+  const processingStatuses: MaterialStatus[] = [
+    MaterialStatus.UPLOADED,
+    MaterialStatus.PARSING,
+    MaterialStatus.PARSED,
+    MaterialStatus.INDEXING,
+  ];
+  if (!processingStatuses.includes(m.status)) {
+    throw new ApiError(
+      409,
+      "CONFLICT",
+      "Only materials currently being processed can be cancelled",
+      { status: m.status },
+    );
+  }
+  if (!getRedisUrl()) {
+    throw new ApiError(
+      503,
+      "SERVICE_UNAVAILABLE",
+      "REDIS_URL is required to send cancel signal",
+    );
+  }
+
+  // 1. Set Redis interrupt signal before soft-deleting so the worker sees it ASAP.
+  const redis = await getRedis();
+  await redis.set(ragCancelKey(materialId), "1", { EX: CANCEL_KEY_TTL_SEC });
+
+  // 2. Soft-delete the material record.
+  await prisma.material.update({
+    where: { id: materialId },
+    data: { isDeleted: true },
+  });
+
+  // 3. Enqueue cleanup (MinIO + LightRAG vectors). Best-effort — if this fails the
+  //    material is already hidden and the signal is set; log but don't surface error.
+  const task: RagQueueTask = {
+    task_id: randomUUID(),
+    material_id: materialId,
+    operation: "delete_material",
+    created_at: new Date().toISOString(),
+  };
+  try {
+    await enqueueRagTaskWithRetry(task);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    await prisma.material.update({
+      where: { id: materialId },
+      data: { statusMessage: `CANCEL_CLEANUP_QUEUE_FAILED: ${msg}` },
+    }).catch(() => {});
+  }
+
+  // 4. Clean up MinIO objects eagerly (fire-and-forget).
+  await deleteObject(m.minioPath).catch(() => {});
+  if (isOfficeMaterialFileType(m.fileType)) {
+    await deleteObject(previewPdfObjectKey(m.minioPath)).catch(() => {});
+    await deleteObject(legacyConvertedPdfObjectKey(m.minioPath, m.id)).catch(() => {});
+  }
+}
+
 function guessContentTypeByFileType(fileType: string): string {
   const ft = fileType.toLowerCase();
   if (ft === "pdf") return "application/pdf";
@@ -372,7 +596,11 @@ export async function getMaterialDetailDto(
   role: UserRole,
   materialId: string,
 ): Promise<MaterialDetailDto> {
-  const m = await assertMaterialReadAccess(userId, role, materialId);
+  const m = await reconcileStaleProcessingMaterial(
+    await reconcileOfficePreviewIfObjectReady(
+      await assertMaterialReadAccess(userId, role, materialId),
+    ),
+  );
   return {
     id: m.id,
     filename: m.originalFilename,
@@ -443,10 +671,7 @@ async function enqueuePreviewRepairIfFailed(materialId: string): Promise<boolean
 async function readOfficePreviewStreamWithFallback(
   m: Material,
 ): Promise<Awaited<ReturnType<typeof getObjectStream>>> {
-  const keys = [
-    previewPdfObjectKey(m.minioPath),
-    legacyConvertedPdfObjectKey(m.minioPath, m.id),
-  ];
+  const keys = officePreviewKeys(m);
   for (const objectKey of keys) {
     try {
       return await readObjectStreamForMaterial(objectKey);
@@ -538,22 +763,7 @@ export async function openMaterialContentStream(
       // Self-heal stale state: preview object may already exist while DB still says PENDING/FAILED.
       try {
         const preview = await readOfficePreviewStreamWithFallback(m);
-        await prisma.material.updateMany({
-          where: {
-            id: m.id,
-            isDeleted: false,
-            previewPdfStatus: {
-              in: [
-                MaterialPreviewPdfStatus.PENDING,
-                MaterialPreviewPdfStatus.FAILED,
-              ],
-            },
-          },
-          data: {
-            previewPdfStatus: MaterialPreviewPdfStatus.READY,
-            statusMessage: null,
-          },
-        });
+        await markOfficePreviewReadyAndMaybeQueueParse(m);
         return {
           body: preview.body,
           contentType: preview.contentType || "application/pdf",

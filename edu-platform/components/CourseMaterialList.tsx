@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { FileText, Loader2, Search } from "lucide-react";
+import { FileText, Loader2, Search, X } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { RetryMaterialIndexPopover } from "@/components/RetryMaterialIndexPopover";
@@ -41,6 +41,8 @@ function PreviewHint({ m }: { m: MaterialRow }) {
   return null;
 }
 
+const PROCESSING_STATUSES = new Set(["UPLOADED", "PARSING", "PARSED", "INDEXING"]);
+
 export default function CourseMaterialList({
   courseId,
   activeMaterialId,
@@ -49,6 +51,7 @@ export default function CourseMaterialList({
   const [materials, setMaterials] = useState<MaterialRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [q, setQ] = useState("");
+  const [cancellingIds, setCancellingIds] = useState<Set<string>>(new Set());
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -66,6 +69,23 @@ export default function CourseMaterialList({
       setLoading(false);
     }
   }, [courseId]);
+
+  const cancelMaterial = useCallback(async (materialId: string) => {
+    setCancellingIds((prev) => new Set(prev).add(materialId));
+    try {
+      await fetch(`/api/v1/materials/${materialId}/cancel`, {
+        method: "POST",
+        credentials: "include",
+      });
+      await load();
+    } finally {
+      setCancellingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(materialId);
+        return next;
+      });
+    }
+  }, [load]);
 
   useEffect(() => {
     void load();
@@ -140,6 +160,19 @@ export default function CourseMaterialList({
                   </div>
                 </div>
               </button>
+              {PROCESSING_STATUSES.has(m.status) && (
+                <button
+                  type="button"
+                  title="取消处理"
+                  disabled={cancellingIds.has(m.id)}
+                  onClick={(e) => { e.stopPropagation(); void cancelMaterial(m.id); }}
+                  className="shrink-0 mt-1.5 p-1.5 rounded-md text-muted-foreground hover:bg-muted hover:text-foreground transition-colors disabled:pointer-events-none disabled:opacity-60"
+                >
+                  {cancellingIds.has(m.id)
+                    ? <Loader2 size={12} className="animate-spin" />
+                    : <X size={12} />}
+                </button>
+              )}
               {m.status === "FAILED" && (
                 <RetryMaterialIndexPopover
                   courseId={courseId}

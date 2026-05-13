@@ -31,7 +31,13 @@ SCHEMA = {
             },
             "schedule": {
                 "type": "string",
-                "description": "（create 必填）调度表达式，如 'every 1h' 或 '0 9 * * *'",
+                "description": (
+                    "（create 必填）调度表达式。支持："
+                    "① 间隔格式：'every 30m'、'every 1h'、'every 1d'；"
+                    "② 时刻简写：'10:14'（每天 10:14）；"
+                    "③ 5 字段 cron：'分 时 日 月 周'，如 '14 10 * * *'（每天 10:14）。"
+                    "注意 cron 字段顺序：第一字段为分钟，第二字段为小时。"
+                ),
             },
             "job_id": {
                 "type": "string",

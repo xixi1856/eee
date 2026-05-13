@@ -6,7 +6,6 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
-import MaterialPdfViewer from "@/components/MaterialPdfViewer";
 import { isOfficeMaterialFileType } from "@/lib/material-office";
 import { captureScrollViewportToPngFile, EDU_CHAT_ADD_ATTACHMENT_EVENT } from "@/lib/captureElementToPngFile";
 
@@ -41,7 +40,6 @@ export default function CourseMaterialViewer({
   const [captureBusy, setCaptureBusy] = useState(false);
   const [pdfViewportReady, setPdfViewportReady] = useState(false);
   const textScrollRef = useRef<HTMLDivElement>(null);
-  const pdfScrollRef = useRef<HTMLDivElement>(null);
 
   const loadMaterial = useCallback(async () => {
     if (!materialId) {
@@ -178,7 +176,6 @@ export default function CourseMaterialViewer({
     (ft === "md" || ft === "txt") && textBody !== null;
 
   const screenshotTargetReady =
-    (showPdfIframe && pdfViewportReady) ||
     textPreviewReady ||
     previewFailed;
 
@@ -186,6 +183,7 @@ export default function CourseMaterialViewer({
     captureBusy ||
     loading ||
     previewPending ||
+    showPdfIframe ||
     !screenshotTargetReady;
 
   const safeScreenshotBase = material.filename
@@ -193,9 +191,7 @@ export default function CourseMaterialViewer({
     .slice(0, 80);
 
   const handleScreenshotToChat = async () => {
-    const el = showPdfIframe
-      ? pdfScrollRef.current
-      : textScrollRef.current;
+    const el = textScrollRef.current;
     if (!el || screenshotDisabled) return;
     setCaptureBusy(true);
     try {
@@ -313,13 +309,23 @@ export default function CourseMaterialViewer({
         )}
 
         {showPdfIframe && (
-          <MaterialPdfViewer
-            materialId={materialId}
-            downloadHref={`/api/v1/materials/${materialId}/content?variant=original`}
-            downloadName={material.filename}
-            scrollCaptureRef={pdfScrollRef}
-            onViewportCaptureReady={setPdfViewportReady}
-          />
+          <div className="flex-1 min-h-0 flex flex-col relative overflow-hidden">
+            {!pdfViewportReady && (
+              <div className="absolute inset-0 flex items-center justify-center bg-background/80 z-10 pointer-events-none">
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Loader2 size={14} className="animate-spin" />
+                  正在加载 PDF…
+                </div>
+              </div>
+            )}
+            <iframe
+              src={`/api/v1/materials/${materialId}/content`}
+              className="flex-1 w-full border-0"
+              style={{ minHeight: 0 }}
+              title={material.filename}
+              onLoad={() => setPdfViewportReady(true)}
+            />
+          </div>
         )}
 
         {(ft === "md" || ft === "txt") && textBody !== null && (

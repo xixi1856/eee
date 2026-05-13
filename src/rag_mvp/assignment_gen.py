@@ -34,6 +34,7 @@ from .question_gen import (
     assign_objective_format_pairs,
     generate_one,
     _is_meta_question,
+    _call_question_llm,
 )
 
 # ---------------------------------------------------------------------------
@@ -599,26 +600,36 @@ async def regenerate_one_question(
     objective: str,
     q_id: int,
     extra_requirements: str = "",
+    current_question: str = "",
 ) -> dict[str, Any] | None:
     """Regenerate a single question using course RAG context.
 
     Returns a question dict (same schema as generate_one output) or None on failure.
     Called from the edu-agent FastAPI server (async context).
     """
-    query = f"{entity_name} {extra_requirements}".strip()
+    # Build query: prefer entity_name, fall back to current_question excerpt or extra_requirements
+    query_parts = [p for p in [entity_name, extra_requirements] if p.strip()]
+    if not query_parts and current_question:
+        # Strip HTML tags simply and take first 80 chars as query seed
+        import re as _re
+        plain = _re.sub(r"<[^>]+>", "", current_question).strip()
+        query_parts = [plain[:80]]
+    query = " ".join(query_parts).strip() or "知识点"
+
     raw = await course_aquery_data(course_id, query, mode="local", top_k=10)
     data = raw.get("data") or {}
 
     chunks: list[dict] = list(data.get("chunks") or [])
-    chunk_map: dict[str, str] = {
-        str(ch.get("id", "")): str(ch.get("content", ""))
-        for ch in chunks
-        if ch.get("id") and ch.get("content")
-    }
+    chunk_map: dict[str, str] = {}
+    for ch in chunks:
+        cid = str(ch.get("id") or ch.get("chunk_id") or "").strip()
+        content = str(ch.get("content") or "").strip()
+        if cid and content:
+            chunk_map[cid] = content
 
     entity_chunk_ids = [
         cid for cid, content in chunk_map.items()
-        if entity_name.lower() in content.lower()
+        if entity_name and entity_name.lower() in content.lower()
     ][:3] or list(chunk_map.keys())[:3]
 
     context = "\n\n".join(chunk_map[cid] for cid in entity_chunk_ids if cid in chunk_map)[:2500]
@@ -630,8 +641,13 @@ async def regenerate_one_question(
         )
         return None
 
+    # Append teacher's extra requirements and the current question as reference
+    if current_question:
+        import re as _re
+        plain_q = _re.sub(r"<[^>]+>", "", current_question).strip()
+        context = f"{context}\n\n【当前题目（仅供参考，请生成不同的新题目）】\n{plain_q[:500]}"
     if extra_requirements:
-        context = f"{context}\n\n【教师额外要求】\n{extra_requirements}"
+        context = f"{context}\n\n【教师要求】\n{extra_requirements}"
 
     return await generate_one(
         entity_name=entity_name,
@@ -642,6 +658,137 @@ async def regenerate_one_question(
         chunk_ids=entity_chunk_ids,
         objective=objective,
     )
+
+
+# ---------------------------------------------------------------------------
+# Teacher custom question completion
+# ---------------------------------------------------------------------------
+
+_COMPLETE_SYSTEM_PROMPT = """\
+你是一位专业的考试助教。老师已经写好了题目的题干，你的任务是在**完全不改动题干**的前提下，
+补全题目的其余部分（选项、标准答案、解析）。
+
+规则：
+1. question 字段必须与老师提供的题干原文一字不差地输出，不得修改、润色或简化
+2. 对于单选题（single_choice）：生成四个选项（A/B/C/D），只有一个正确答案，answer 为正确选项字母
+3. 对于多选题（multi_choice）：生成四个选项（A/B/C/D），有两个或以上正确答案，answer 为各正确选项字母用逗号连接（如 "A,C"）
+4. 对于填空题（fill_blank）：options 为空数组，answer 为填入空白处的正确答案
+5. 对于简答题（short_answer）：options 为空数组，answer 为完整参考答案（3-8句话）
+6. explanation 字段：说明答案为什么正确；若提供了课程原文可引用，否则根据知识推理说明
+7. 若老师已提供参考答案，优先以其为基准（可适当完善表述，但不得与其矛盾）
+8. 输出必须是严格的 JSON 格式，不要包含任何其他文字或 markdown 代码块标记
+"""
+
+_TYPE_LABELS_COMPLETE = {
+    "single_choice": "单选题",
+    "multi_choice": "多选题",
+    "fill_blank": "填空题",
+    "short_answer": "简答题",
+}
+
+
+def _build_complete_prompt(
+    stem: str, answer_hint: str, q_type: str, context: str = ""
+) -> str:
+    label = _TYPE_LABELS_COMPLETE.get(q_type, "题目")
+    prompt = (
+        f"以下是老师写好的{label}题干（请原样保留，不得改动）：\n\n"
+        f"「{stem}」\n\n"
+    )
+    if answer_hint:
+        prompt += f"老师提供的参考答案（请以此为基准）：{answer_hint}\n\n"
+    if context:
+        prompt += f"【课程相关知识（供生成解析参考）】\n{context}\n\n"
+    prompt += "请在完全保留上方题干的前提下，补全以下字段：\n"
+    if q_type == "single_choice":
+        prompt += (
+            '\n【输出格式（JSON）】\n'
+            '{"question": "<原样复制老师题干>", '
+            '"options": ["A. ...", "B. ...", "C. ...", "D. ..."], '
+            '"answer": "A", '
+            '"explanation": "解析"}'
+        )
+    elif q_type == "multi_choice":
+        prompt += (
+            '\n【输出格式（JSON）】\n'
+            '{"question": "<原样复制老师题干>", '
+            '"options": ["A. ...", "B. ...", "C. ...", "D. ..."], '
+            '"answer": "A,C", '
+            '"explanation": "解析"}'
+        )
+    elif q_type == "fill_blank":
+        prompt += (
+            '\n【输出格式（JSON）】\n'
+            '{"question": "<原样复制老师题干>", '
+            '"options": [], '
+            '"answer": "填入答案", '
+            '"explanation": "解析"}'
+        )
+    else:  # short_answer
+        prompt += (
+            '\n【输出格式（JSON）】\n'
+            '{"question": "<原样复制老师题干>", '
+            '"options": [], '
+            '"answer": "完整参考答案", '
+            '"explanation": "评分要点"}'
+        )
+    return prompt
+
+
+async def complete_teacher_question(
+    course_id: str,
+    entity_name: str,
+    question_stem: str,
+    answer_hint: str,
+    q_type: str,
+    objective: str,
+    q_id: int,
+) -> dict[str, Any] | None:
+    """Complete a teacher-written question stem with AI-generated options/answer/explanation.
+
+    The question_stem is ALWAYS preserved exactly as written by the teacher.
+    AI only generates: options (for MCQ), canonical answer, explanation.
+    """
+    plain_stem = re.sub(r"<[^>]+>", "", question_stem).strip()
+    query = f"{entity_name} {plain_stem[:60]}".strip() or entity_name or "知识点"
+
+    raw = await course_aquery_data(course_id, query, mode="local", top_k=6)
+    data = raw.get("data") or {}
+    chunks: list[dict] = list(data.get("chunks") or [])
+    chunk_map: dict[str, str] = {}
+    for ch in chunks:
+        cid = str(ch.get("id") or ch.get("chunk_id") or "").strip()
+        content = str(ch.get("content") or "").strip()
+        if cid and content:
+            chunk_map[cid] = content
+    chunk_ids = list(chunk_map.keys())[:3]
+    context = "\n\n".join(chunk_map[cid] for cid in chunk_ids if cid in chunk_map)[:2000]
+
+    prompt = _build_complete_prompt(plain_stem, answer_hint, q_type, context)
+    parsed = await _call_question_llm(entity_name or "自定义", q_type, prompt, _COMPLETE_SYSTEM_PROMPT)
+
+    if parsed is None:
+        logger.warning(
+            "complete_teacher_question: LLM failed for stem={!r} course={}",
+            plain_stem[:60], course_id,
+        )
+        return None
+
+    return {
+        "id":               q_id,
+        "type":             q_type,
+        "objective":        objective,
+        "entity":           entity_name,
+        "tags":             [entity_name] if entity_name else [],
+        "importance_score": 1.0,
+        # Always use teacher's original stem — never the LLM's rewrite
+        "question":         plain_stem,
+        "options":          parsed.get("options", []),
+        "answer":           parsed.get("answer", "") or answer_hint,
+        "explanation":      parsed.get("explanation", ""),
+        "source_chunk_ids": chunk_ids[:2],
+        "source_images":    [],
+    }
 
 
 # ---------------------------------------------------------------------------

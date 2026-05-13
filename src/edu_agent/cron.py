@@ -77,13 +77,21 @@ def _cron_next(cron_expr: str, after: datetime) -> datetime:
     raise ValueError("Could not compute next run for cron expression")
 
 
+_HM_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+
 def compute_next_run(schedule: str, after: datetime | None = None) -> datetime:
     """Return the next scheduled datetime for *schedule*."""
     after = after or datetime.now()
     interval = _parse_interval_seconds(schedule)
     if interval is not None:
         return after + timedelta(seconds=interval)
-    # Try cron expression
+    # Support HH:MM shorthand, e.g. "10:14" → cron "14 10 * * *"
+    m = _HM_RE.match(schedule.strip())
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+        return _cron_next(f"{mi} {h} * * *", after)
+    # Try standard 5-field cron expression
     return _cron_next(schedule, after)
 
 
@@ -246,10 +254,10 @@ def _run_job(job: CronJob) -> str:
         out_dir = Path(job.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         out_file = out_dir / f"{ts}.md"
-        out_file.write_text(
-            f"# Cron Job {job.id} — {ts}\n\n**Prompt:** {job.prompt}\n\n---\n\n{reply}",
-            encoding="utf-8",
-        )
+        content = f"# Cron Job {job.id} — {ts}\n\n**Prompt:** {job.prompt}\n\n---\n\n{reply}"
+        out_file.write_text(content, encoding="utf-8")
+        # Also write a fixed-name alias so the agent can always read the latest result
+        (out_dir / "result.md").write_text(content, encoding="utf-8")
         logger.info("Cron job %s completed → %s", job.id, out_file)
         return f"任务 {job.id} 执行完毕，结果已保存至 {out_file}"
     except Exception as exc:

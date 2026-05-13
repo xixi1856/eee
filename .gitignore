@@ -37,3 +37,5 @@ AGENTS.md
 .gitignore
 test.py
 .env(1)
+data/cron_jobs.json
+scripts/test.sql

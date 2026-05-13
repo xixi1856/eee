@@ -171,3 +171,86 @@ def test_upload_preview_pdf_with_verify_raises_after_max_attempts(monkeypatch) -
         raise AssertionError("expected RuntimeError")
 
     assert upload_calls == [(pdf_file, preview_key), (pdf_file, preview_key)]
+
+
+def test_maybe_enqueue_convert_preview_reconciles_when_preview_exists(monkeypatch) -> None:
+    mid = "11111111-1111-1111-1111-111111111111"
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.fetchone.return_value = (
+        "pptx",
+        "UPLOADED",
+        "PENDING",
+        "materials/course/mid/slides.pptx",
+    )
+    conn.cursor.return_value.__enter__.return_value = cur
+
+    reconciled: list[tuple[str, str]] = []
+    parse_enqueued: list[tuple[str, bool, bool]] = []
+    convert_enqueued: list[str] = []
+
+    monkeypatch.setattr(mp, "_object_exists", lambda _k: True)
+    monkeypatch.setattr(
+        mp,
+        "update_material_preview_pdf_status",
+        lambda _conn, material_id, status, _status_message=None: reconciled.append((material_id, status)),
+    )
+    monkeypatch.setattr(
+        mp,
+        "_enqueue_parse_and_index_task",
+        lambda material_id, *, text_only, skip_kg: parse_enqueued.append((material_id, text_only, skip_kg)),
+    )
+    monkeypatch.setattr(
+        mp,
+        "_enqueue_convert_preview_task",
+        lambda material_id, *, text_only, skip_kg: convert_enqueued.append(material_id),
+    )
+
+    mp._maybe_enqueue_convert_preview_for_stuck_office(
+        conn,
+        mid,
+        text_only=False,
+        skip_kg=False,
+    )
+
+    assert reconciled == [(mid, "READY")]
+    assert parse_enqueued == [(mid, False, False)]
+    assert convert_enqueued == []
+
+
+def test_convert_preview_reconciles_when_preview_exists(monkeypatch) -> None:
+    mid = "11111111-1111-1111-1111-111111111111"
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.fetchone.return_value = (
+        "pptx",
+        "UPLOADED",
+        "PENDING",
+        "materials/course/mid/slides.pptx",
+    )
+    conn.cursor.return_value.__enter__.return_value = cur
+
+    reconciled: list[tuple[str, str]] = []
+    parse_enqueued: list[tuple[str, bool, bool]] = []
+
+    monkeypatch.setattr(mp, "_object_exists", lambda _k: True)
+    monkeypatch.setattr(
+        mp,
+        "update_material_preview_pdf_status",
+        lambda _conn, material_id, status, _status_message=None: reconciled.append((material_id, status)),
+    )
+    monkeypatch.setattr(
+        mp,
+        "_enqueue_parse_and_index_task",
+        lambda material_id, *, text_only, skip_kg: parse_enqueued.append((material_id, text_only, skip_kg)),
+    )
+    monkeypatch.setattr(
+        mp,
+        "_try_claim_convert_preview_row",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("should not claim when preview already exists")),
+    )
+
+    mp.process_convert_preview(conn, mid, text_only=False, skip_kg=True)
+
+    assert reconciled == [(mid, "READY")]
+    assert parse_enqueued == [(mid, False, True)]

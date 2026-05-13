@@ -79,6 +79,20 @@ export interface RegenerateQuestionBody {
   objective: ObjectiveType;
   qId: number;
   extraRequirements?: string;
+  /** Current question text, used by LLM as reference when regenerating */
+  currentQuestion?: string;
+}
+
+export interface CompleteQuestionBody {
+  entityName: string;
+  qType: QuestionType;
+  objective: ObjectiveType;
+  /** Teacher-written stem (HTML or plain text). AI will not modify this. */
+  questionStem: string;
+  /** Optional answer hint from the teacher. */
+  answerHint?: string;
+  /** Point value for the new question (default 5). */
+  score?: number;
 }
 
 // ── Response DTOs ───────────────────────────────────────────────────────────

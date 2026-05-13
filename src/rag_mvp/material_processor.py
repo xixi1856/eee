@@ -48,6 +48,7 @@ from rag_mvp.engine import (
     ingest_parsed_material_into_course_async,
     ingest_parsed_material_into_course_sync,
     parse_file,
+
 )
 from rag_mvp.worker_async_loop import is_worker_async_loop_started, run_worker_coroutine
 
@@ -171,6 +172,39 @@ def _rag_task_stream_name() -> str:
     return os.environ.get("RAG_TASK_STREAM_NAME", "edu:rag:tasks:stream").strip()
 
 
+# ---------------------------------------------------------------------------
+# Cancel-signal helpers (Option C: Redis key set by Next.js cancel API)
+# ---------------------------------------------------------------------------
+
+def _cancel_redis_key(material_id: str) -> str:
+    """Key used by Next.js cancelMaterialProcessing() to interrupt the worker."""
+    return f"edu:rag:cancel:{material_id}"
+
+
+class MaterialCancelledError(Exception):
+    """Raised when a cancel signal is detected during processing."""
+
+
+def _is_cancel_requested(r: "redis.Redis", material_id: str) -> bool:
+    """Return True if the Next.js cancel API has set the interrupt key."""
+    try:
+        return bool(r.exists(_cancel_redis_key(material_id)))
+    except Exception:
+        # If Redis is unreachable we conservatively continue processing.
+        return False
+
+
+def _raise_if_cancelled(r: "redis.Redis", material_id: str, checkpoint: str) -> None:
+    """Raise MaterialCancelledError if a cancel signal is present."""
+    if _is_cancel_requested(r, material_id):
+        logger.info(
+            "Cancel signal detected for material {} at checkpoint: {}",
+            material_id,
+            checkpoint,
+        )
+        raise MaterialCancelledError(f"Cancelled at {checkpoint}")
+
+
 def _enqueue_parse_and_index_task(
     material_id: str, *, text_only: bool, skip_kg: bool = True
 ) -> None:
@@ -220,7 +254,7 @@ def _maybe_enqueue_convert_preview_for_stuck_office(
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT LOWER(file_type::text), status::text, preview_pdf_status::text
+            SELECT LOWER(file_type::text), status::text, preview_pdf_status::text, minio_path::text
             FROM materials WHERE id = %s::uuid AND is_deleted = false
             """,
             (material_id,),
@@ -228,9 +262,31 @@ def _maybe_enqueue_convert_preview_for_stuck_office(
         row = cur.fetchone()
     if not row:
         return
-    ft, st, prev = row[0], row[1], row[2]
+    ft, st, prev, minio_path = row[0], row[1], row[2], row[3]
     if ft not in _OFFICE_FT_LOWER or st != "UPLOADED" or prev != "PENDING":
         return
+
+    preview_key = _preview_pdf_minio_key(minio_path)
+    try:
+        if _object_exists(preview_key):
+            logger.warning(
+                "parse_and_index: material {} preview object exists while status is office+PENDING; reconcile READY and enqueue parse",
+                material_id,
+            )
+            with conn.transaction():
+                update_material_preview_pdf_status(conn, material_id, "READY")
+            _enqueue_parse_and_index_task(
+                material_id,
+                text_only=text_only,
+                skip_kg=skip_kg,
+            )
+            return
+    except Exception:
+        logger.exception(
+            "parse_and_index: preview existence check failed for material {}",
+            material_id,
+        )
+
     logger.warning(
         "parse_and_index: material {} is office+PENDING; enqueue convert_preview (compat)",
         material_id,
@@ -325,8 +381,15 @@ def _upload_preview_pdf_with_verify(
 
 
 def _preview_pdf_minio_key(minio_path: str) -> str:
-    """Stable key for browser preview PDF (Office originals keep ``minio_path``)."""
-    return str(Path(minio_path).parent / "preview.pdf")
+    """Stable key for browser preview PDF (Office originals keep ``minio_path``).
+
+    Always use POSIX/forward-slash separators so keys match across platforms.
+    ``Path()`` on Windows would produce backslashes, creating a different MinIO key
+    than what Node.js expects (which always uses forward slashes).
+    """
+    import posixpath
+    normalised = minio_path.replace("\\", "/")
+    return posixpath.join(posixpath.dirname(normalised), "preview.pdf")
 
 
 def update_material_preview_pdf_status(
@@ -640,6 +703,7 @@ def _run_material_download_parse_and_ingest(
     original_filename: str | None,
     text_only: bool,
     skip_kg: bool,
+    r: "redis.Redis | None" = None,
 ) -> None:
     """MinIO → parse → LightRAG. Row must already be ``PARSING``."""
     work_parent = Path(tempfile.mkdtemp(prefix="edu_mat_"))
@@ -652,6 +716,10 @@ def _run_material_download_parse_and_ingest(
         ft = file_type.lower()
         if ft == "image":
             raise ValueError("Image indexing is not supported for course materials in this phase")
+
+        # Checkpoint 1: before any CPU-heavy work starts.
+        if r is not None:
+            _raise_if_cancelled(r, material_id, "pre-parse")
 
         preview_key = _preview_pdf_minio_key(minio_path)
         # Convert Office → PDF for MinerU and upload ``preview.pdf`` (or reuse existing preview).
@@ -690,6 +758,10 @@ def _run_material_download_parse_and_ingest(
 
         # Same parse stack as CLI `rag parse` (engine.parse_file), or worker persistent loop.
         _parse_file_dispatch(local_file)
+
+        # Checkpoint 2: after MinerU parse, before embedding starts (most expensive part).
+        if r is not None:
+            _raise_if_cancelled(r, material_id, "pre-ingest")
 
         # Upload extracted images to MinIO (always — regardless of text_only flag)
         try:
@@ -736,6 +808,10 @@ def _run_material_download_parse_and_ingest(
             shutil.rmtree(stem_dir, ignore_errors=True)
 
         logger.success("Indexed material {} ({} chunks via LightRAG)", material_id, n)
+    except MaterialCancelledError:
+        # Cancelled cleanly — material is already soft-deleted by the API.
+        logger.info("Material {} processing cancelled; skipping ingest", material_id)
+        shutil.rmtree(settings.output_dir / material_id, ignore_errors=True)
     except Exception as exc:
         logger.exception("Material processing failed")
         if not parsed_committed:
@@ -790,6 +866,27 @@ def process_convert_preview(
         return
 
     preview_key = _preview_pdf_minio_key(minio_path)
+
+    if status == "UPLOADED" and preview_st == "PENDING":
+        try:
+            if _object_exists(preview_key):
+                logger.warning(
+                    "convert_preview: material {} preview object already exists while DB is PENDING; reconcile READY and enqueue parse",
+                    material_id,
+                )
+                with conn.transaction():
+                    update_material_preview_pdf_status(conn, material_id, "READY")
+                _enqueue_parse_and_index_task(
+                    material_id,
+                    text_only=text_only,
+                    skip_kg=skip_kg,
+                )
+                return
+        except Exception:
+            logger.exception(
+                "convert_preview: preview existence check failed for material {}",
+                material_id,
+            )
 
     if status == "UPLOADED" and preview_st == "READY":
         if _object_exists(preview_key):
@@ -882,8 +979,14 @@ def process_parse_and_index(
     *,
     text_only: bool = True,
     skip_kg: bool = True,
+    r: "redis.Redis | None" = None,
 ) -> None:
     """DB is source of truth; parse via engine.parse_file; ingest via LightRAG insert only."""
+    # Checkpoint 0: before claiming the row — skip entirely if already cancelled.
+    if r is not None and _is_cancel_requested(r, material_id):
+        logger.info("process_parse_and_index: cancel signal detected before claim for material {}", material_id)
+        return
+
     claimed = _claim_material_for_parse(conn, material_id)
     if not claimed:
         _maybe_enqueue_convert_preview_for_stuck_office(
@@ -900,6 +1003,7 @@ def process_parse_and_index(
         claimed.get("original_filename"),
         text_only,
         skip_kg,
+        r=r,
     )
 
 

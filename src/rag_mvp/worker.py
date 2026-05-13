@@ -18,6 +18,7 @@ from rag_mvp.material_processor import (
     process_index_only,
     process_parse_and_index,
     process_repair_preview,
+    update_material_status,
 )
 from rag_mvp.worker_async_loop import start_worker_async_loop, stop_worker_async_loop
 
@@ -36,6 +37,46 @@ def _consumer_name() -> str:
 
 def _claim_idle_ms() -> int:
     return int(os.environ.get("RAG_STREAM_CLAIM_IDLE_MS", "300000"))
+
+
+def _material_stale_sec() -> int:
+    return int(os.environ.get("RAG_MATERIAL_STALE_SEC", "1800"))
+
+
+def _mark_stale_jobs_failed(conn: Any) -> None:
+    """On startup: mark any PARSING/PARSED/INDEXING materials whose ``updated_at`` has
+    not moved in more than ``RAG_MATERIAL_STALE_SEC`` seconds as FAILED.
+
+    This cleans up materials that were abandoned because a previous worker process was
+    killed (SIGKILL, OOM, crash) before it could finish processing and commit the final
+    READY or FAILED status.
+    """
+    stale_sec = _material_stale_sec()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE materials
+                SET status = 'FAILED',
+                    status_message = 'WORKER_ABANDONED: worker was interrupted or crashed',
+                    updated_at = NOW()
+                WHERE is_deleted = false
+                  AND status IN ('PARSING', 'PARSED', 'INDEXING')
+                  AND updated_at < NOW() - (%s * INTERVAL '1 second')
+                RETURNING id::text
+                """,
+                (stale_sec,),
+            )
+            rows = cur.fetchall()
+        if rows:
+            ids = [r[0] for r in rows]
+            logger.warning(
+                "Marked {} stale material(s) as FAILED on startup: {}",
+                len(ids),
+                ids,
+            )
+    except Exception:
+        logger.exception("Failed to clean up stale materials on startup")
 
 
 def _ensure_group(r: redis.Redis, stream: str, group: str) -> None:
@@ -87,7 +128,7 @@ def _parse_bool_field(raw: str | None, default: bool = True) -> bool:
     return s in ("1", "true", "yes", "on")
 
 
-def _process_one(conn: Any, fields: dict[str, str]) -> None:
+def _process_one(conn: Any, r: redis.Redis, fields: dict[str, str]) -> None:
     op = fields.get("operation")
     text_only = _parse_bool_field(fields.get("text_only"), default=True)
     skip_kg = _parse_bool_field(fields.get("skip_kg"), default=True)
@@ -107,7 +148,7 @@ def _process_one(conn: Any, fields: dict[str, str]) -> None:
     if not material_id:
         raise ValueError("missing material_id")
     if op == "parse_and_index":
-        process_parse_and_index(conn, material_id, text_only=text_only, skip_kg=skip_kg)
+        process_parse_and_index(conn, material_id, text_only=text_only, skip_kg=skip_kg, r=r)
     elif op == "index_only":
         process_index_only(conn, material_id, text_only=text_only, skip_kg=skip_kg)
     elif op == "delete_material":
@@ -130,7 +171,7 @@ def _handle_entries(
     for msg_id, raw_fields in entries:
         fields = {str(k): str(v) for k, v in raw_fields.items()}
         try:
-            _process_one(conn, fields)
+            _process_one(conn, r, fields)
             r.xack(stream, group, msg_id)
         except ValueError as exc:
             logger.error("Invalid or poison task stream_id={}: {}", msg_id, exc)
@@ -161,7 +202,7 @@ def main() -> None:
     consumer = _consumer_name()
     idle_ms = _claim_idle_ms()
     r = redis.from_url(redis_url, decode_responses=True)
-    conn = connect_sync(autocommit=False)
+    conn = connect_sync(autocommit=True)
     stop = False
 
     def _stop(*_args: object) -> None:
@@ -172,6 +213,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _stop)
 
     _ensure_group(r, stream, group)
+    _mark_stale_jobs_failed(conn)
     start_worker_async_loop()
     logger.info(
         "edu-rag-worker stream={} group={} consumer={} claim_idle_ms={} persistent_async_loop=on",

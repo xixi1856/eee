@@ -12,6 +12,7 @@ export type B3SseEvent =
       chunk_id?: string;
       material_id?: string;
       source_label?: string;
+      chunk_text?: string;
     }
   | {
       type: "tool_call";
@@ -29,6 +30,14 @@ export type B3SseEvent =
       tokens?: number | null;
       exec_time_ms?: number | null;
       error?: string;
+    }
+  | {
+      type: "trace";
+      trace_id?: string;
+      event?: string;
+      turn_id?: string;
+      ts?: string;
+      payload?: Record<string, unknown>;
     };
 
 const enc = new TextEncoder();
@@ -46,6 +55,7 @@ function parseSseDataPayload(block: string): string | null {
 
 function citationsFromB3(b3: Record<string, unknown>): B3SseEvent[] {
   const chunks = Array.isArray(b3.hit_chunks) ? (b3.hit_chunks as string[]) : [];
+  const chunkTexts = Array.isArray(b3.hit_chunk_texts) ? (b3.hit_chunk_texts as string[]) : [];
   const mats = Array.isArray(b3.hit_materials) ? (b3.hit_materials as string[]) : [];
   const srcs = Array.isArray(b3.hit_sources) ? (b3.hit_sources as string[]) : [];
   const n = Math.max(chunks.length, mats.length, srcs.length);
@@ -56,6 +66,7 @@ function citationsFromB3(b3: Record<string, unknown>): B3SseEvent[] {
       chunk_id: chunks[i] || undefined,
       material_id: mats[i] || undefined,
       source_label: srcs[i] || undefined,
+      chunk_text: chunkTexts[i] || undefined,
     });
   }
   return out;
@@ -92,6 +103,28 @@ function toolResultEventFromAgentFrame(
   const duration_ms =
     typeof ds === "number" && Number.isFinite(ds) ? Math.round(ds * 1000) : undefined;
   return { type: "tool_result", name, success, duration_ms };
+}
+
+function traceEventFromAgentFrame(
+  frame: Record<string, unknown>,
+): Extract<B3SseEvent, { type: "trace" }> | null {
+  const eduMeta = frame.edu_meta as Record<string, unknown> | undefined;
+  if (eduMeta?.content_type !== "meta") return null;
+  const meta = eduMeta.b3 as Record<string, unknown> | undefined;
+  if (!meta || typeof meta !== "object") return null;
+  const event = typeof meta.trace_event === "string" ? meta.trace_event : undefined;
+  if (!event) return null;
+  const trace_id = typeof meta.trace_id === "string" ? meta.trace_id : undefined;
+  const turn_id = typeof meta.turn_id === "string" ? meta.turn_id : undefined;
+  const ts = typeof meta.ts === "string" ? meta.ts : undefined;
+  return {
+    type: "trace",
+    trace_id,
+    event,
+    turn_id,
+    ts,
+    payload: meta,
+  };
 }
 
 export async function getOrCreateCourseChatSession(
@@ -231,12 +264,18 @@ export function createB3SseTransformFromAgent(
               : JSON.stringify(frame.error);
           continue;
         }
+        const eduMeta = frame.edu_meta as Record<string, unknown> | undefined;
         const choices = frame.choices as Record<string, unknown>[] | undefined;
         const ch0 = choices?.[0] as Record<string, unknown> | undefined;
         const delta = ch0?.delta as Record<string, unknown> | undefined;
         const content =
           delta && typeof delta.content === "string" ? delta.content : "";
-        if (content) {
+        // Skip the final summary frame (is_final=true, content_type="text"):
+        // agent.py emits a full-text summary frame after streaming all delta
+        // tokens, which would cause the response to appear twice.
+        const isFinalTextFrame =
+          eduMeta?.is_final === true && eduMeta?.content_type === "text";
+        if (content && eduMeta?.content_type === "text" && !isFinalTextFrame) {
           fullAnswer += content;
           controller.enqueue(sseDataLine({ type: "text", content }));
         }
@@ -244,7 +283,8 @@ export function createB3SseTransformFromAgent(
         if (tcEv) controller.enqueue(sseDataLine(tcEv));
         const trEv = toolResultEventFromAgentFrame(frame);
         if (trEv) controller.enqueue(sseDataLine(trEv));
-        const eduMeta = frame.edu_meta as Record<string, unknown> | undefined;
+        const traceEv = traceEventFromAgentFrame(frame);
+        if (traceEv) controller.enqueue(sseDataLine(traceEv));
         const b3 = eduMeta?.b3 as Record<string, unknown> | undefined;
         if (b3 && typeof b3 === "object") {
           lastB3 = { ...lastB3, ...b3 };
@@ -289,6 +329,8 @@ export type CourseChatParams = {
   message: string;
   lessonId?: string | null;
   attachments?: AttachmentParam[];
+  traceId?: string | null;
+  debugTrace?: boolean;
 };
 
 /**
@@ -317,6 +359,8 @@ export async function courseChatSseResponse(
     userMessage: p.message,
     stream: true,
     attachments: p.attachments,
+    traceId: p.traceId ?? null,
+    debugTrace: p.debugTrace ?? false,
   });
   if (!agentRes.ok) {
     const t = await agentRes.text();
@@ -346,6 +390,9 @@ export async function courseChatSseResponse(
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
+      ...(agentRes.headers.get("x-trace-id")
+        ? { "X-Trace-Id": agentRes.headers.get("x-trace-id") as string }
+        : {}),
     },
   });
 }
@@ -356,6 +403,8 @@ export type QaCenterChatParams = {
   message: string;
   sessionId?: string | null;
   attachments?: AttachmentParam[];
+  traceId?: string | null;
+  debugTrace?: boolean;
 };
 
 async function getOrCreateQaCenterAgentSession(
@@ -423,6 +472,8 @@ export async function qaCenterChatSseResponse(
     userMessage: p.message,
     stream: true,
     attachments: p.attachments,
+    traceId: p.traceId ?? null,
+    debugTrace: p.debugTrace ?? false,
   });
   if (!agentRes.ok) {
     const t = await agentRes.text();
@@ -453,6 +504,9 @@ export async function qaCenterChatSseResponse(
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
       "X-Qa-Center-Session-Id": sessionId,
+      ...(agentRes.headers.get("x-trace-id")
+        ? { "X-Trace-Id": agentRes.headers.get("x-trace-id") as string }
+        : {}),
     },
   });
 }

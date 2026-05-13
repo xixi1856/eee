@@ -33,8 +33,9 @@ import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { QuestionCard } from "@/components/assignment/QuestionCard";
+import { AddQuestionDialog } from "@/components/assignment/AddQuestionDialog";
 import { useNotify } from "@/hooks/useNotify";
-import type { AssignmentDetailDto, QuestionItem, RegenerateQuestionBody } from "@/lib/dto/assignment.dto";
+import type { AssignmentDetailDto, CompleteQuestionBody, QuestionItem, RegenerateQuestionBody } from "@/lib/dto/assignment.dto";
 import { AssignmentStatus } from "@prisma/client";
 
 const STATUS_LABELS: Record<string, string> = {
@@ -54,6 +55,7 @@ export default function AssignmentDetailPage() {
   const [saving, setSaving] = useState(false);
   const [publishing, setPublishing] = useState(false);
   const [regeneratingIds, setRegeneratingIds] = useState<Set<string>>(new Set());
+  const [addDialogOpen, setAddDialogOpen] = useState(false);
 
   const [assignment, setAssignment] = useState<AssignmentDetailDto | null>(null);
   const [title, setTitle] = useState("");
@@ -107,7 +109,7 @@ export default function AssignmentDetailPage() {
     setQuestions((prev) => prev.filter((q) => q.id !== id));
   }
 
-  async function handleRegenerateQuestion(qId: number) {
+  async function handleRegenerateQuestion(qId: number, extraRequirements: string) {
     const q = questions.find((q) => q.id === qId);
     if (!q) return;
 
@@ -118,6 +120,8 @@ export default function AssignmentDetailPage() {
         qType: q.type,
         objective: q.objective,
         entityName: q.entity ?? "",
+        extraRequirements: extraRequirements || undefined,
+        currentQuestion: q.question || undefined,
       };
       const res = await fetch(
         `/api/v1/courses/${courseId}/assignments/${assignmentId}/regenerate`,
@@ -145,6 +149,30 @@ export default function AssignmentDetailPage() {
         return next;
       });
     }
+  }
+
+  // ── Add custom question ────────────────────────────────────────────────────
+  async function handlePreviewQuestion(
+    body: Omit<CompleteQuestionBody, "score">,
+  ): Promise<QuestionItem> {
+    const res = await fetch(
+      `/api/v1/courses/${courseId}/assignments/${assignmentId}/preview-question`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify(body),
+      },
+    );
+    const d = await res.json() as { question?: QuestionItem; error?: { message: string } };
+    if (!res.ok) throw new Error(d.error?.message ?? "AI 补全失败，请重试");
+    return d.question!;
+  }
+
+  function handleAddQuestion(question: QuestionItem, score: number) {
+    setQuestions((prev) => [...prev, { ...question, score }]);
+    setAddDialogOpen(false);
+    notify("success", "题目已添加，点击「保存草稿」以保存");
   }
 
   // ── Save (PATCH) ───────────────────────────────────────────────────────────
@@ -334,6 +362,26 @@ export default function AssignmentDetailPage() {
                 </div>
               </SortableContext>
             </DndContext>
+          )}
+
+          {/* Add custom question (draft only) */}
+          {isDraft && (
+            <>
+              <button
+                type="button"
+                onClick={() => setAddDialogOpen(true)}
+                className="w-full flex items-center justify-center gap-2 rounded-lg border border-dashed border-border py-3 text-sm text-muted-foreground hover:border-primary hover:text-primary transition-colors"
+              >
+                <Plus size={15} />
+                添加自定义题目
+              </button>
+              <AddQuestionDialog
+                open={addDialogOpen}
+                onOpenChange={setAddDialogOpen}
+                onPreview={handlePreviewQuestion}
+                onAdd={handleAddQuestion}
+              />
+            </>
           )}
 
           {isDraft && (

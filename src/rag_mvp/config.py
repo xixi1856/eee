@@ -170,10 +170,6 @@ class Settings(BaseSettings):
         "只回答 USEFUL 或 USELESS，不要有其他任何内容。"
     )
 
-    # Graph storage backend: "NetworkXStorage" (no extra deps) or
-    # "PGGraphStorage" (requires Apache AGE PostgreSQL extension)
-    graph_storage: str = "NetworkXStorage"
-
     # Optional LightRAG rerank (see HKUDS/LightRAG docs / examples/rerank_example.py).
     # rerank_binding: cohere | jina | ali (DashScope text rerank)
     rerank_binding: str = ""

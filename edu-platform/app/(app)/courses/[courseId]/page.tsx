@@ -509,6 +509,18 @@ export default function CourseDetailPage() {
         {/* Materials */}
         {activeTab === "materials" && (
           <div className="space-y-6">
+            {isTeacher && courseId && (
+              <div className="flex items-center justify-between">
+                <p className="text-sm text-muted-foreground">
+                  {materials.length > 0 ? `共 ${materials.length} 份资料` : "暂无资料"}
+                </p>
+                <MaterialUpload
+                  courseId={courseId}
+                  lessons={lessons}
+                  onUploaded={() => void load(courseId)}
+                />
+              </div>
+            )}
             {lessons.length === 0 ? (
               /* No lessons yet — show a prompt and a fallback upload area */
               <div className="space-y-4">
@@ -530,12 +542,6 @@ export default function CourseDetailPage() {
                     )}
                   </div>
                 </div>
-                {isTeacher && courseId && (
-                  <div className="rounded-xl border border-dashed border-border bg-muted/30 p-4">
-                    <p className="text-xs text-muted-foreground mb-2">上传资料（未分配课时）</p>
-                    <MaterialUpload courseId={courseId} onUploaded={() => void load(courseId)} />
-                  </div>
-                )}
                 {materials.length > 0 && (
                   <div className="space-y-2">
                     {materials.map((m) => (
@@ -595,17 +601,6 @@ export default function CourseDetailPage() {
                           />
                         ))}
                       </div>
-
-                      {/* Teacher upload area for this lesson */}
-                      {isTeacher && courseId && (
-                        <div className="px-4 py-3 border-t border-dashed border-border bg-muted/10">
-                          <MaterialUpload
-                            courseId={courseId}
-                            lessonId={lesson.id}
-                            onUploaded={() => void load(courseId)}
-                          />
-                        </div>
-                      )}
                     </div>
                   );
                 })}
@@ -637,11 +632,6 @@ export default function CourseDetailPage() {
                               indent
                             />
                           ))}
-                        </div>
-                      )}
-                      {isTeacher && courseId && (
-                        <div className="px-4 py-3 border-t border-dashed border-border bg-muted/10">
-                          <MaterialUpload courseId={courseId} onUploaded={() => void load(courseId)} />
                         </div>
                       )}
                     </div>

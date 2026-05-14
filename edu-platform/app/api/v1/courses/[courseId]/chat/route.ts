@@ -6,8 +6,8 @@ import { requireAuthenticated } from "@/lib/admin";
 import { getAuthFromRequest } from "@/lib/request-auth";
 import { assertUuid, getCourseIfMember } from "@/lib/course-access";
 import { prisma } from "@/lib/db";
-import { agentNotBoundError } from "@/lib/agent-not-bound-error";
 import { courseChatSseResponse } from "@/lib/services/chatService";
+import { getAccessibleCourseIds } from "@/lib/course-access-injector";
 
 export const dynamic = "force-dynamic";
 
@@ -18,12 +18,11 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     const auth = requireAuthenticated(await getAuthFromRequest(req));
     const { courseId } = await ctx.params;
     await getCourseIfMember(auth.sub, auth.role as UserRole, courseId);
-    if (!auth.agent_user_id) {
-      throw agentNotBoundError();
-    }
+    const accessibleCourseIds = await getAccessibleCourseIds(auth.sub, auth.role as UserRole);
     const body = (await req.json()) as {
       message?: string;
       lesson_id?: string;
+      trim_history_to?: number;
       attachments?: { id: string; key: string; presigned_url: string; mime_type: string; name: string }[];
     };
     const message = typeof body.message === "string" ? body.message.trim() : "";
@@ -34,6 +33,12 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     const attachments = rawAttachments
       .filter((a) => a && typeof a.id === "string" && typeof a.presigned_url === "string")
       .map(({ id, key, presigned_url, mime_type, name }) => ({ id, key, presigned_url, mime_type, name }));
+    const trimHistoryTo =
+      typeof body.trim_history_to === "number" &&
+      Number.isInteger(body.trim_history_to) &&
+      body.trim_history_to >= 0
+        ? body.trim_history_to
+        : undefined;
     let lessonId: string | null = null;
     if (body.lesson_id) {
       assertUuid(body.lesson_id, "lesson_id");
@@ -51,12 +56,14 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     return await courseChatSseResponse({
       courseId,
       platformStudentId: auth.sub,
-      agentUserId: auth.agent_user_id,
+      userId: auth.sub,
+      accessibleCourseIds,
       message,
       lessonId,
       attachments,
       traceId,
       debugTrace,
+      trimHistoryTo,
     });
   } catch (e) {
     if (e instanceof ApiError) return jsonError(e);

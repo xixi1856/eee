@@ -38,6 +38,7 @@ export type Citation = {
   material_id?: string;
   source_label?: string;
   chunk_text?: string;
+  image_urls?: Array<{ page_idx: number; url: string }>;
 };
 export type DoneMeta = {
   type: "done";
@@ -53,6 +54,15 @@ export type ToolActivityItem = {
   status: "running" | "done";
   success?: boolean;
   durationMs?: number;
+};
+
+/** Pending tool-approval request emitted by the ReAct loop. */
+export type PendingApprovalState = {
+  toolCallId: string;
+  toolName: string;
+  argsPreview: Record<string, unknown>;
+  approvalKey: string;
+  reason: string;
 };
 
 export type AttachmentRef = {
@@ -97,19 +107,11 @@ const ALLOWED_MIME_TYPES = new Set([
 const MAX_FILE_SIZE = 20 * 1024 * 1024;
 
 type ApiErrJson = {
-  error?: { message?: string; code?: string };
+  error?: { message?: string };
 };
 
 function formatChatHttpError(status: number, body: ApiErrJson): string {
   const raw = (body.error?.message ?? "").trim();
-  const code = body.error?.code;
-  const vague = !raw || raw === "Internal server error";
-  if (vague && code === "AGENT_UNAVAILABLE") {
-    return "EduAgent 网关不可用：请确认已在仓库根启动 uv run edu-gateway，且 EDU_AGENT_BASE_URL 与网关地址一致。";
-  }
-  if (vague && code === "AGENT_NOT_BOUND") {
-    return "尚未绑定 Agent 身份：请完成 edu bind 后，在本平台「凭证」页（/credentials）完成关联。";
-  }
   return raw || `请求失败 (${status})`;
 }
 
@@ -189,6 +191,10 @@ export function useChatStream(config: UseChatStreamConfig) {
   const branchRecordsRef = useRef<BranchRecord[]>([]);
   branchRecordsRef.current = branchRecords;
 
+  const [pendingApproval, setPendingApproval] = useState<PendingApprovalState | null>(null);
+  const pendingApprovalRef = useRef<PendingApprovalState | null>(null);
+  pendingApprovalRef.current = pendingApproval;
+
   /** Update branch records atomically (keeps ref in sync). */
   const updateBranchRecords = useCallback(
     (updater: (prev: BranchRecord[]) => BranchRecord[]) => {
@@ -198,6 +204,25 @@ export function useChatStream(config: UseChatStreamConfig) {
     },
     [],
   );
+
+  /**
+   * Respond to a pending tool approval request.
+   * Sends the user's decision to the server, which signals the paused ReAct loop.
+   */
+  const respondToApproval = useCallback(async (approved: boolean) => {
+    const current = pendingApprovalRef.current;
+    if (!current) return;
+    try {
+      await fetch("/api/v1/chat/approval", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ approval_key: current.approvalKey, approved }),
+      });
+    } catch {
+      // The approval loop will time out on its own; nothing critical to handle here
+    }
+  }, []);
 
   const historyLoadKey =
     config.kind === "qa_center_global"
@@ -311,7 +336,7 @@ export function useChatStream(config: UseChatStreamConfig) {
   }, []);
 
   const runChatRequest = useCallback(
-    async (message: string, lessonId: string | undefined, attachmentRefs: AttachmentRef[]) => {
+    async (message: string, lessonId: string | undefined, attachmentRefs: AttachmentRef[], trimHistoryTo?: number) => {
       const config = cfgRef.current;
       setBusy(true);
       setStreaming("");
@@ -320,6 +345,8 @@ export function useChatStream(config: UseChatStreamConfig) {
       setCitations([]);
       setLastMeta(null);
       setErrorMsg(null);
+      setPendingApproval(null);
+      pendingApprovalRef.current = null;
 
       abortRef.current?.abort();
       abortRef.current = new AbortController();
@@ -337,6 +364,7 @@ export function useChatStream(config: UseChatStreamConfig) {
           message,
           ...(lessonId ? { lesson_id: lessonId } : {}),
           ...(attachmentsPayload.length ? { attachments: attachmentsPayload } : {}),
+          ...(trimHistoryTo !== undefined ? { trim_history_to: trimHistoryTo } : {}),
         };
         if (isQaGlobal && config.sessionId) {
           body.session_id = config.sessionId;
@@ -389,6 +417,7 @@ export function useChatStream(config: UseChatStreamConfig) {
                 material_id?: string;
                 source_label?: string;
                 chunk_text?: string;
+                image_urls?: Array<{ page_idx: number; url: string }>;
                 tokens?: number;
                 exec_time_ms?: number;
                 error?: string;
@@ -396,6 +425,12 @@ export function useChatStream(config: UseChatStreamConfig) {
                 tool_call_id?: string;
                 success?: boolean;
                 duration_ms?: number;
+                // approval fields
+                tool_name?: string;
+                args_preview?: Record<string, unknown>;
+                approval_key?: string;
+                reason?: string;
+                approved?: boolean;
               };
 
               if (event.type === "text" && event.content) {
@@ -436,6 +471,7 @@ export function useChatStream(config: UseChatStreamConfig) {
                   material_id: event.material_id,
                   source_label: event.source_label,
                   chunk_text: event.chunk_text,
+                  image_urls: event.image_urls,
                 });
                 setCitations([...newCitations]);
               } else if (event.type === "done") {
@@ -447,6 +483,19 @@ export function useChatStream(config: UseChatStreamConfig) {
                 };
                 setLastMeta(meta);
                 if (event.error) setErrorMsg(event.error);
+              } else if (event.type === "require_approval") {
+                const state: PendingApprovalState = {
+                  toolCallId: event.tool_call_id ?? "",
+                  toolName: event.tool_name ?? "",
+                  argsPreview: event.args_preview ?? {},
+                  approvalKey: event.approval_key ?? "",
+                  reason: event.reason ?? "此操作需要您的确认。",
+                };
+                pendingApprovalRef.current = state;
+                setPendingApproval(state);
+              } else if (event.type === "approval_resolved") {
+                pendingApprovalRef.current = null;
+                setPendingApproval(null);
               }
             } catch {
               // Skip malformed SSE events
@@ -558,7 +607,7 @@ export function useChatStream(config: UseChatStreamConfig) {
       msgsRef.current = newMsgs;
       setMsgs(newMsgs);
 
-      await runChatRequest(trimmed, lessonId, attachments);
+      await runChatRequest(trimmed, lessonId, attachments, replaceFromIndex);
 
       // After API response, capture new tail and add as the next branch entry.
       const newTailMsgs = msgsRef.current.slice(turnPosition);
@@ -617,6 +666,7 @@ export function useChatStream(config: UseChatStreamConfig) {
         userRow.text,
         lessonId,
         userRow.attachments ?? [],
+        assistantIndex - 1,
       );
 
       // After API response, capture new assistant tail and add as next branch entry.
@@ -681,5 +731,7 @@ export function useChatStream(config: UseChatStreamConfig) {
     attachmentUploading,
     addAttachment,
     removeAttachment,
+    pendingApproval,
+    respondToApproval,
   };
 }

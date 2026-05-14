@@ -12,11 +12,76 @@ import {
   Loader2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Slider } from "@/components/ui/slider";
 import { cn } from "@/lib/utils";
 import type { StructuredGenerationParams } from "@/lib/dto/assignment.dto";
 
 type Mode = "nlp" | "structured";
-type Difficulty = "easy" | "medium" | "hard";
+
+const MIN_SEG_PCT = 10;
+const DIFFICULTY_STEP = 5;
+
+function clampDifficultySplits(s1: number, s2: number): [number, number] {
+  let a = Math.round(s1 / DIFFICULTY_STEP) * DIFFICULTY_STEP;
+  let b = Math.round(s2 / DIFFICULTY_STEP) * DIFFICULTY_STEP;
+  a = Math.max(MIN_SEG_PCT, Math.min(a, 100 - 2 * MIN_SEG_PCT));
+  b = Math.max(a + MIN_SEG_PCT, Math.min(b, 100 - MIN_SEG_PCT));
+  return [a, b];
+}
+
+function DifficultyRangeSlider({
+  value,
+  onChange,
+}: {
+  value: { easy: number; medium: number; hard: number };
+  onChange: (v: { easy: number; medium: number; hard: number }) => void;
+}) {
+  const rawS1 = Math.round(value.easy * 100);
+  const rawS2 = Math.round((value.easy + value.medium) * 100);
+  const [split1, split2] = clampDifficultySplits(rawS1, rawS2);
+  const easyPct = split1;
+  const mediumPct = split2 - split1;
+  const hardPct = 100 - split2;
+
+  const trackGradient = `linear-gradient(to right, rgb(34 197 94) 0%, rgb(34 197 94) ${split1}%, rgb(234 179 8) ${split1}%, rgb(234 179 8) ${split2}%, rgb(239 68 68) ${split2}%, rgb(239 68 68) 100%)`;
+
+  return (
+    <div className="space-y-3">
+      <div className="flex justify-between text-xs font-medium">
+        <span className="text-green-600 dark:text-green-400">简单 {easyPct}%</span>
+        <span className="text-yellow-600 dark:text-yellow-400">中等 {mediumPct}%</span>
+        <span className="text-red-500 dark:text-red-400">困难 {hardPct}%</span>
+      </div>
+      <div className="relative py-1">
+        <div
+          className="pointer-events-none absolute left-0 right-0 top-1/2 h-2 -translate-y-1/2 rounded-full"
+          style={{ background: trackGradient }}
+          aria-hidden
+        />
+        <Slider
+          min={0}
+          max={100}
+          step={DIFFICULTY_STEP}
+          minStepsBetweenThumbs={MIN_SEG_PCT / DIFFICULTY_STEP}
+          value={[split1, split2]}
+          onValueChange={(vals) => {
+            const [s1, s2] = vals;
+            const [a, b] = clampDifficultySplits(s1, s2);
+            onChange({
+              easy: a / 100,
+              medium: (b - a) / 100,
+              hard: (100 - b) / 100,
+            });
+          }}
+          trackClassName="bg-transparent"
+          rangeClassName="opacity-0"
+          className="relative z-10"
+          aria-label="难度分布：调整简单、中等、困难占比"
+        />
+      </div>
+    </div>
+  );
+}
 
 const QUESTION_TYPES = [
   { key: "single_choice", label: "单选题" },
@@ -54,8 +119,9 @@ export default function NewAssignmentPage() {
   const [selectedLessons, setSelectedLessons] = useState<string[]>([]);
   const [knowledgeTags, setKnowledgeTags] = useState<string[]>([]);
   const [tagInput, setTagInput] = useState("");
-  const [difficulty, setDifficulty] = useState<Difficulty>("medium");
+  const [difficultyWeights, setDifficultyWeights] = useState({ easy: 0.2, medium: 0.6, hard: 0.2 });
   const [count, setCount] = useState(20);
+  const [countInput, setCountInput] = useState("20");
   const [selectedTypes, setSelectedTypes] = useState<string[]>(["single_choice", "fill_blank", "short_answer"]);
   const [selectedObjectives, setSelectedObjectives] = useState<string[]>(["knowledge", "comprehension", "application"]);
 
@@ -93,6 +159,15 @@ export default function NewAssignmentPage() {
     setTagInput("");
   }
 
+  function clampQuestionCount(n: number) {
+    return Math.min(50, Math.max(5, Math.round(n)));
+  }
+  function commitQuestionCount(next: number) {
+    const c = clampQuestionCount(next);
+    setCount(c);
+    setCountInput(String(c));
+  }
+
   // ── Submit ────────────────────────────────────────────────────────────────
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -127,7 +202,7 @@ export default function NewAssignmentPage() {
         lessonIds: selectedLessons,
         lessonNames,
         knowledgePoints: knowledgeTags,
-        difficulty,
+        difficultyWeights,
         count,
         typeWeights,
         objectiveWeights,
@@ -135,11 +210,13 @@ export default function NewAssignmentPage() {
 
       // Auto-generate a request string if not provided
       if (!finalRequest) {
-        const diffMap: Record<Difficulty, string> = { easy: "简单", medium: "中等", hard: "困难" };
         const parts: string[] = [];
         if (lessonNames.length) parts.push(`课时：${lessonNames.join("、")}`);
         if (knowledgeTags.length) parts.push(`知识点：${knowledgeTags.join("、")}`);
-        parts.push(`难度：${diffMap[difficulty]}`);
+        const ep = Math.round(difficultyWeights.easy * 100);
+        const mp = Math.round(difficultyWeights.medium * 100);
+        const hp = Math.round(difficultyWeights.hard * 100);
+        parts.push(`难度分布：简单${ep}%/中等${mp}%/困难${hp}%`);
         parts.push(`共 ${count} 道题`);
         finalRequest = parts.join("；");
       }
@@ -328,43 +405,56 @@ export default function NewAssignmentPage() {
             {/* Count + difficulty */}
             <div className="grid grid-cols-2 gap-4">
               <div className="rounded-xl border border-border bg-card p-5 space-y-3">
-                <h2 className="text-sm font-semibold text-foreground">
-                  题目数量
-                  <span className="ml-2 text-primary font-bold">{count}</span>
-                </h2>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h2 className="text-sm font-semibold text-foreground">题目数量</h2>
+                  <div className="flex items-center gap-1.5">
+                    <label htmlFor="structured-count" className="text-xs text-muted-foreground whitespace-nowrap">
+                      精确值
+                    </label>
+                    <input
+                      id="structured-count"
+                      type="text"
+                      inputMode="numeric"
+                      autoComplete="off"
+                      value={countInput}
+                      onChange={(e) => setCountInput(e.target.value.replace(/[^\d]/g, ""))}
+                      onBlur={() => {
+                        const v = parseInt(countInput, 10);
+                        if (Number.isNaN(v) || countInput === "") {
+                          setCountInput(String(count));
+                          return;
+                        }
+                        commitQuestionCount(v);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          (e.target as HTMLInputElement).blur();
+                        }
+                      }}
+                      className="w-14 rounded-md border border-border bg-background px-2 py-1 text-center text-sm font-semibold text-primary tabular-nums focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                    />
+                    <span className="text-xs text-muted-foreground">题（5–50）</span>
+                  </div>
+                </div>
                 <input
                   type="range"
                   min={5}
                   max={50}
-                  step={5}
+                  step={1}
                   value={count}
-                  onChange={(e) => setCount(Number(e.target.value))}
+                  onChange={(e) => commitQuestionCount(Number(e.target.value))}
                   className="w-full accent-primary"
                 />
                 <div className="flex justify-between text-xs text-muted-foreground">
-                  <span>5</span><span>50</span>
+                  <span>5</span>
+                  <span>50</span>
                 </div>
               </div>
 
               <div className="rounded-xl border border-border bg-card p-5 space-y-3">
-                <h2 className="text-sm font-semibold text-foreground">难度</h2>
-                <div className="flex flex-col gap-2">
-                  {(["easy", "medium", "hard"] as Difficulty[]).map((d) => (
-                    <label key={d} className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="radio"
-                        name="difficulty"
-                        value={d}
-                        checked={difficulty === d}
-                        onChange={() => setDifficulty(d)}
-                        className="accent-primary"
-                      />
-                      <span className="text-sm">
-                        {{ easy: "简单", medium: "中等", hard: "困难" }[d]}
-                      </span>
-                    </label>
-                  ))}
-                </div>
+                <h2 className="text-sm font-semibold text-foreground">难度分布</h2>
+                <DifficultyRangeSlider value={difficultyWeights} onChange={setDifficultyWeights} />
               </div>
             </div>
 

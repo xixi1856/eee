@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState, useRef } from "react";
-import Link from "next/link";
+import Image from "next/image";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
@@ -35,7 +35,6 @@ import { EDU_CHAT_ADD_ATTACHMENT_EVENT } from "@/lib/captureElementToPngFile";
 type UserMe = {
   qa_collection_enabled?: boolean;
   qa_collection_notice_accepted_at?: string | null;
-  agent_identity_bound?: boolean;
 };
 
 export type ChatComponentProps =
@@ -78,13 +77,22 @@ async function copyToClipboard(text: string): Promise<void> {
   await navigator.clipboard.writeText(text);
 }
 
+function useCopyFeedback() {
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const trigger = (id: string) => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    setCopiedId(id);
+    timerRef.current = setTimeout(() => setCopiedId(null), 2000);
+  };
+  return { copiedId, trigger };
+}
+
 export default function ChatComponent(props: ChatComponentProps) {
   const [input, setInput] = useState("");
-  const [agentIdentityBound, setAgentIdentityBound] = useState<boolean | null>(null);
   const [editingClientId, setEditingClientId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
-  const [copiedClientId, setCopiedClientId] = useState<string | null>(null);
-  const copyFeedbackTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const { copiedId: copiedClientId, trigger: triggerCopyFeedback } = useCopyFeedback();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const {
     msgs,
@@ -103,6 +111,8 @@ export default function ChatComponent(props: ChatComponentProps) {
     attachmentUploading,
     addAttachment,
     removeAttachment,
+    pendingApproval,
+    respondToApproval,
   } = useChatStream(buildStreamConfig(props));
   const scrollRef = useRef<HTMLDivElement>(null);
   const emptyHint = props.emptyHint ?? defaultEmptyHint(props);
@@ -121,9 +131,6 @@ export default function ChatComponent(props: ChatComponentProps) {
     const res = await fetch("/api/v1/user", { credentials: "include" });
     if (!res.ok) return;
     const u = (await res.json()) as UserMe;
-    if (typeof u.agent_identity_bound === "boolean") {
-      setAgentIdentityBound(u.agent_identity_bound);
-    }
     if (!u.qa_collection_notice_accepted_at) {
       if (window.confirm("为改进教学，我们会记录提问数据。此行为可随时在个人资料关闭。确认知悉？")) {
         await fetch("/api/v1/user", {
@@ -208,23 +215,6 @@ export default function ChatComponent(props: ChatComponentProps) {
 
   return (
     <div className="flex flex-col h-full bg-background relative">
-      {agentIdentityBound === false && (
-        <div className="shrink-0 border-b border-amber-500/25 bg-amber-500/10 px-4 py-2.5 text-sm text-amber-950 dark:text-amber-100">
-          <div className="w-full max-w-none flex flex-wrap items-center gap-2">
-            <AlertCircle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" aria-hidden />
-            <span>
-              当前账号尚未绑定 Edu Agent。请先在 Agent 侧执行绑定（edu bind），再到本平台的
-            </span>
-            <Link
-              href="/credentials"
-              className="font-medium text-amber-900 underline underline-offset-2 hover:text-amber-800 dark:text-amber-200 dark:hover:text-amber-50"
-            >
-              凭证
-            </Link>
-            <span>页完成关联后再使用 AI 聊天。</span>
-          </div>
-        </div>
-      )}
       <ScrollArea ref={scrollRef} className="flex-1 w-full px-4 md:px-8 pt-6 pb-32">
         <div className="w-full max-w-none space-y-8 flex flex-col">
           {msgs.length === 0 && !streaming && !busy && (
@@ -265,6 +255,28 @@ export default function ChatComponent(props: ChatComponentProps) {
                         <AttachmentBubble key={att.id} att={att} />
                       ))}
                     </div>
+                  )}
+
+                  {msg.role === "assistant" && (msg.toolActivity?.length ?? 0) > 0 && (
+                    <ul className="m-0 mb-1.5 flex list-none flex-col gap-1.5 p-0 text-sm text-muted-foreground">
+                      {msg.toolActivity!.map((row, ri) => (
+                        <li
+                          key={row.clientKey ?? `${msg.clientId}-tc-${ri}`}
+                          className="flex flex-wrap items-center gap-2 rounded-md border border-border/60 bg-muted/40 px-2.5 py-1.5"
+                        >
+                          <span className="tabular-nums" aria-hidden>{toolEmoji(row.name)}</span>
+                          <span className="font-mono text-xs text-foreground/90">{row.name}</span>
+                          <span className="text-xs">
+                            <span className={row.success === false ? "text-destructive" : "text-emerald-600 dark:text-emerald-400"}>
+                              {row.success === false ? "✗" : "✓"}
+                            </span>
+                            {typeof row.durationMs === "number" && (
+                              <span className="ml-1.5 opacity-80">{(row.durationMs / 1000).toFixed(1)}s</span>
+                            )}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
                   )}
 
                   <div
@@ -363,9 +375,17 @@ export default function ChatComponent(props: ChatComponentProps) {
                       className="h-7 w-7 text-muted-foreground hover:text-foreground"
                       disabled={busy}
                       aria-label="复制消息"
-                      onClick={() => void copyToClipboard(msg.text).catch(() => {})}
+                      onClick={() => {
+                        void copyToClipboard(msg.text)
+                          .then(() => triggerCopyFeedback(msg.clientId))
+                          .catch(() => {});
+                      }}
                     >
-                      <Copy size={14} strokeWidth={2} />
+                      {copiedClientId === msg.clientId ? (
+                        <Check size={14} strokeWidth={2} className="text-emerald-500" />
+                      ) : (
+                        <Copy size={14} strokeWidth={2} />
+                      )}
                     </Button>
                     {msg.role === "user" && !isEditing && (
                       <Button
@@ -394,56 +414,33 @@ export default function ChatComponent(props: ChatComponentProps) {
                       </Button>
                     )}
                   </div>
-                  {/* Historical tool activity & citations (loaded from DB) */}
-                  {msg.role === "assistant" && (msg.toolActivity?.length ?? 0) + (msg.citations?.length ?? 0) > 0 && (
-                    <div className="flex flex-col gap-1.5 mt-1.5">
-                      {(msg.toolActivity?.length ?? 0) > 0 && (
-                        <ul className="m-0 flex list-none flex-col gap-1.5 p-0 text-sm text-muted-foreground">
-                          {msg.toolActivity!.map((row, ri) => (
-                            <li
-                              key={row.clientKey ?? `${msg.clientId}-tc-${ri}`}
-                              className="flex flex-wrap items-center gap-2 rounded-md border border-border/60 bg-muted/40 px-2.5 py-1.5"
-                            >
-                              <span className="tabular-nums" aria-hidden>{toolEmoji(row.name)}</span>
-                              <span className="font-mono text-xs text-foreground/90">{row.name}</span>
-                              <span className="text-xs">
-                                <span className={row.success === false ? "text-destructive" : "text-emerald-600 dark:text-emerald-400"}>
-                                  {row.success === false ? "✗" : "✓"}
-                                </span>
-                                {typeof row.durationMs === "number" && (
-                                  <span className="ml-1.5 opacity-80">{(row.durationMs / 1000).toFixed(1)}s</span>
-                                )}
-                              </span>
-                            </li>
-                          ))}
-                        </ul>
-                      )}
-                      {(msg.citations?.length ?? 0) > 0 && (
-                        <div className="flex flex-wrap gap-1.5">
-                          {msg.citations!.map((c, ci) => (
-                            <button
-                              key={ci}
-                              type="button"
-                              onClick={() => {
-                                window.dispatchEvent(
-                                  new CustomEvent("edu:open-material-preview", {
-                                    detail: {
-                                      materialId: c.material_id,
-                                      chunkId: c.chunk_id,
-                                      sourceLabel: c.source_label ?? `引用 ${ci + 1}`,
-                                      chunkText: c.chunk_text,
-                                    },
-                                  }),
-                                );
-                              }}
-                              className="inline-flex items-center gap-1 rounded-full border border-primary/25 bg-primary/8 px-2.5 py-0.5 text-[11px] font-medium text-primary hover:bg-primary/15 transition-colors"
-                            >
-                              <span className="font-mono font-bold opacity-60">[{ci + 1}]</span>
-                              <span className="max-w-[140px] truncate">{c.source_label ?? `引用 ${ci + 1}`}</span>
-                            </button>
-                          ))}
-                        </div>
-                      )}
+                  {/* Historical citations (loaded from DB) — after reply text */}
+                  {msg.role === "assistant" && (msg.citations?.length ?? 0) > 0 && (
+                    <div className="mt-1.5 flex flex-col gap-2">
+                      <div className="flex flex-wrap gap-1.5">
+                        {msg.citations!.map((c, ci) => (
+                          <button
+                            key={ci}
+                            type="button"
+                            onClick={() => {
+                              window.dispatchEvent(
+                                new CustomEvent("edu:open-material-preview", {
+                                  detail: {
+                                    materialId: c.material_id,
+                                    chunkId: c.chunk_id,
+                                    sourceLabel: c.source_label ?? `引用 ${ci + 1}`,
+                                    chunkText: c.chunk_text,
+                                  },
+                                }),
+                              );
+                            }}
+                            className="inline-flex items-center gap-1 rounded-full border border-primary/25 bg-primary/8 px-2.5 py-0.5 text-[11px] font-medium text-primary hover:bg-primary/15 transition-colors"
+                          >
+                            <span className="font-mono font-bold opacity-60">[{ci + 1}]</span>
+                            <span className="max-w-[140px] truncate">{c.source_label ?? `引用 ${ci + 1}`}</span>
+                          </button>
+                        ))}
+                      </div>
                     </div>
                   )}
                 </div>
@@ -452,18 +449,8 @@ export default function ChatComponent(props: ChatComponentProps) {
             );
           })}
 
-          {busy && (!streaming || toolActivity.length > 0) && (
-            <div className="flex w-full flex-col gap-2 pl-4">
-              {!streaming && (
-                <div
-                  className="flex items-center gap-2 text-sm text-muted-foreground"
-                  aria-live="polite"
-                  aria-busy="true"
-                >
-                  <Loader2 className="h-4 w-4 shrink-0 animate-spin" aria-hidden />
-                  <span>思考中…</span>
-                </div>
-              )}
+          {busy && (
+            <div className="group flex w-full flex-col gap-2 pl-4">
               {toolActivity.length > 0 && (
                 <ul className="m-0 flex list-none flex-col gap-1.5 p-0 text-sm text-muted-foreground">
                   {toolActivity.map((row) => (
@@ -503,32 +490,47 @@ export default function ChatComponent(props: ChatComponentProps) {
                   ))}
                 </ul>
               )}
-            </div>
-          )}
-
-          {streaming && (
-            <div className="group flex w-full flex-col">
-              <div className="flex w-full justify-start">
-                <div className="flex min-w-0 w-full flex-col items-start">
-                  <div className="rounded-none px-4 py-3 bg-transparent text-foreground prose prose-sm dark:prose-invert max-w-none [&_pre]:border-0">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{streaming}</ReactMarkdown>
-                    <span className="inline-block w-2 h-4 bg-primary animate-pulse ml-1 align-middle" />
-                  </div>
-                  <div className="mt-1 flex opacity-100 sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100">
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      className="h-7 w-7 text-muted-foreground hover:text-foreground"
-                      disabled={streaming.length === 0}
-                      aria-label="复制正在生成的内容"
-                      onClick={() => void copyToClipboard(streaming).catch(() => {})}
-                    >
-                      <Copy size={14} strokeWidth={2} />
-                    </Button>
+              {!streaming && (
+                <div
+                  className="flex items-center gap-2 text-sm text-muted-foreground"
+                  aria-live="polite"
+                  aria-busy="true"
+                >
+                  <Loader2 className="h-4 w-4 shrink-0 animate-spin" aria-hidden />
+                  <span>思考中…</span>
+                </div>
+              )}
+              {streaming && (
+                <div className="flex w-full justify-start">
+                  <div className="flex min-w-0 w-full flex-col items-start">
+                    <div className="rounded-none px-4 py-3 bg-transparent text-foreground prose prose-sm dark:prose-invert max-w-none [&_pre]:border-0">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{streaming}</ReactMarkdown>
+                      <span className="inline-block w-2 h-4 bg-primary animate-pulse ml-1 align-middle" />
+                    </div>
+                    <div className="mt-1 flex opacity-100 sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                        disabled={streaming.length === 0}
+                        aria-label="复制正在生成的内容"
+                        onClick={() => {
+                          void copyToClipboard(streaming)
+                            .then(() => triggerCopyFeedback("streaming"))
+                            .catch(() => {});
+                        }}
+                      >
+                        {copiedClientId === "streaming" ? (
+                          <Check size={14} strokeWidth={2} className="text-emerald-500" />
+                        ) : (
+                          <Copy size={14} strokeWidth={2} />
+                        )}
+                      </Button>
+                    </div>
                   </div>
                 </div>
-              </div>
+              )}
             </div>
           )}
 
@@ -536,31 +538,33 @@ export default function ChatComponent(props: ChatComponentProps) {
             <div className="flex w-full justify-start pl-0">
               <div className="space-y-1.5">
                 {citations.length > 0 && (
-                  <div className="flex flex-wrap gap-1.5">
-                    {citations.map((c, ci) => (
-                      <button
-                        key={ci}
-                        type="button"
-                        onClick={() => {
-                          window.dispatchEvent(
-                            new CustomEvent("edu:open-material-preview", {
-                              detail: {
-                                materialId: c.material_id,
-                                chunkId: c.chunk_id,
-                                sourceLabel: c.source_label ?? `引用 ${ci + 1}`,
-                                chunkText: c.chunk_text,
-                              },
-                            }),
-                          );
-                        }}
-                        className="inline-flex items-center gap-1 rounded-full border border-primary/25 bg-primary/8 px-2.5 py-0.5 text-[11px] font-medium text-primary hover:bg-primary/15 transition-colors"
-                      >
-                        <span className="font-mono font-bold opacity-60">[{ci + 1}]</span>
-                        <span className="max-w-[140px] truncate">
-                          {c.source_label ?? `引用 ${ci + 1}`}
-                        </span>
-                      </button>
-                    ))}
+                  <div className="flex flex-col gap-2">
+                    <div className="flex flex-wrap gap-1.5">
+                      {citations.map((c, ci) => (
+                        <button
+                          key={ci}
+                          type="button"
+                          onClick={() => {
+                            window.dispatchEvent(
+                              new CustomEvent("edu:open-material-preview", {
+                                detail: {
+                                  materialId: c.material_id,
+                                  chunkId: c.chunk_id,
+                                  sourceLabel: c.source_label ?? `引用 ${ci + 1}`,
+                                  chunkText: c.chunk_text,
+                                },
+                              }),
+                            );
+                          }}
+                          className="inline-flex items-center gap-1 rounded-full border border-primary/25 bg-primary/8 px-2.5 py-0.5 text-[11px] font-medium text-primary hover:bg-primary/15 transition-colors"
+                        >
+                          <span className="font-mono font-bold opacity-60">[{ci + 1}]</span>
+                          <span className="max-w-[140px] truncate">
+                            {c.source_label ?? `引用 ${ci + 1}`}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 )}
                 {lastMeta?.type === "done" && !lastMeta.error && lastMeta.exec_time_ms && (
@@ -582,15 +586,68 @@ export default function ChatComponent(props: ChatComponentProps) {
       </ScrollArea>
 
       <div className="absolute bottom-4 left-0 right-0 w-full px-4 md:px-8 bg-gradient-to-t from-background via-background to-transparent pt-6">
+        {/* ---- Tool Approval Card ---- */}
+        {pendingApproval && (
+          <div className="mb-3 rounded-xl border border-amber-300/70 bg-amber-50/80 dark:border-amber-700/60 dark:bg-amber-950/40 px-4 py-3 shadow-sm">
+            <div className="flex items-start gap-3">
+              <span className="mt-0.5 text-lg" aria-hidden>
+                {toolEmoji(pendingApproval.toolName)}
+              </span>
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">
+                  AI 请求执行操作：
+                  <code className="ml-1.5 rounded bg-amber-200/60 dark:bg-amber-800/60 px-1.5 py-0.5 font-mono text-xs">
+                    {pendingApproval.toolName}
+                  </code>
+                </p>
+                <p className="mt-1 text-xs text-amber-800/80 dark:text-amber-300/80">
+                  {pendingApproval.reason}
+                </p>
+                {Object.keys(pendingApproval.argsPreview).length > 0 && (
+                  <details className="mt-2">
+                    <summary className="cursor-pointer text-xs text-amber-700/70 dark:text-amber-400/70 select-none hover:text-amber-900 dark:hover:text-amber-200">
+                      查看参数
+                    </summary>
+                    <pre className="mt-1.5 overflow-auto rounded bg-amber-100/60 dark:bg-amber-900/40 p-2 text-[11px] leading-relaxed text-foreground/80">
+                      {JSON.stringify(pendingApproval.argsPreview, null, 2)}
+                    </pre>
+                  </details>
+                )}
+              </div>
+            </div>
+            <div className="mt-3 flex justify-end gap-2">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="border-amber-400/60 text-amber-800 hover:bg-amber-100 dark:border-amber-700 dark:text-amber-300 dark:hover:bg-amber-900/60"
+                onClick={() => void respondToApproval(false)}
+              >
+                拒绝
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                className="bg-amber-500 text-white hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-500"
+                onClick={() => void respondToApproval(true)}
+              >
+                允许
+              </Button>
+            </div>
+          </div>
+        )}
         <div className="w-full max-w-none relative rounded-2xl bg-muted/40 border border-border shadow-sm focus-within:ring-1 focus-within:ring-ring focus-within:bg-background transition-colors overflow-hidden">
           {pendingAttachments.length > 0 && (
             <div className="flex flex-wrap gap-2 px-4 pt-3 pb-1">
               {pendingAttachments.map((att) => (
                 <div key={att.id} className="relative group flex-shrink-0">
                   {att.mime_type.startsWith("image/") && att.localPreviewUrl ? (
-                    <img
+                    <Image
                       src={att.localPreviewUrl}
                       alt={att.name}
+                      width={64}
+                      height={64}
+                      unoptimized
                       className="w-16 h-16 object-cover rounded-lg border border-border"
                     />
                   ) : (
@@ -679,9 +736,12 @@ function AttachmentBubble({ att }: { att: AttachmentRef }) {
 
   if (imgSrc) {
     return (
-      <img
+      <Image
         src={imgSrc}
         alt={att.name}
+        width={200}
+        height={200}
+        unoptimized
         className="max-w-[200px] max-h-[200px] rounded-xl object-cover border border-border"
       />
     );

@@ -9,8 +9,11 @@ export interface QuestionItem {
   id: number;
   type: QuestionType;
   objective: ObjectiveType;
-  entity: string;
+  /** All knowledge entities this question draws on (primary first). application/synthesis/innovation may have multiple. */
+  entities: string[];
   importance_score: number;
+  /** Number of reasoning steps the LLM self-reported for this question. Used for difficulty_match evaluation. */
+  reasoning_steps: number;
   question: string;
   options: string[];
   answer: string;
@@ -18,16 +21,23 @@ export interface QuestionItem {
   source_chunk_ids: string[];
   /** Teacher-assigned point value (default 5) */
   score: number;
+  /** Difficulty level inherited from the blueprint slot */
+  difficulty?: "easy" | "medium" | "hard";
+}
+
+export interface BlueprintQuestion {
+  id: number;
+  type: QuestionType;
+  objective: ObjectiveType;
+  difficulty: "easy" | "medium" | "hard";
+  entity_names: string[];
+  focus: string;
 }
 
 export interface Blueprint {
   title: string;
-  topic_hint: string;
-  difficulty: "easy" | "medium" | "hard";
-  count: number;
-  type_weights: Record<string, number>;
-  objective_weights: Record<string, number>;
-  estimated_minutes: number;
+  difficulty_weights: { easy: number; medium: number; hard: number };
+  questions: BlueprintQuestion[];
 }
 
 export interface QuestionReview {
@@ -44,6 +54,7 @@ export interface QualityReport {
   threshold: number;
   question_reviews: QuestionReview[];
   failed_ids: number[];
+  difficulty_distribution_score: number;
   summary: string;
 }
 
@@ -53,7 +64,7 @@ export interface StructuredGenerationParams {
   lessonIds: string[];
   lessonNames: string[];
   knowledgePoints: string[];
-  difficulty: "easy" | "medium" | "hard";
+  difficultyWeights: { easy: number; medium: number; hard: number };
   count: number;
   typeWeights: Record<string, number>;
   objectiveWeights: Record<string, number>;
@@ -74,7 +85,7 @@ export interface PatchAssignmentBody {
 }
 
 export interface RegenerateQuestionBody {
-  entityName: string;
+  entityNames: string[];
   qType: QuestionType;
   objective: ObjectiveType;
   qId: number;
@@ -84,7 +95,7 @@ export interface RegenerateQuestionBody {
 }
 
 export interface CompleteQuestionBody {
-  entityName: string;
+  entityNames: string[];
   qType: QuestionType;
   objective: ObjectiveType;
   /** Teacher-written stem (HTML or plain text). AI will not modify this. */

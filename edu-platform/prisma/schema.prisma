@@ -13,17 +13,6 @@ enum UserRole {
   ADMIN
 }
 
-enum CredentialStatus {
-  ACTIVE
-  USED
-  EXPIRED
-  REVOKED
-}
-
-enum BindAttemptKeyType {
-  IP
-}
-
 enum CourseStatus {
   DRAFT
   PUBLISHED
@@ -70,9 +59,7 @@ model User {
   qaCollectionEnabled            Boolean   @default(true) @map("qa_collection_enabled")
   qaCollectionNoticeAcceptedAt   DateTime? @map("qa_collection_notice_accepted_at")
 
-  credentials         Credential[]
   refreshTokens       RefreshToken[]
-  agentMapping        AgentIdentityMapping?
   teacherCourses      Course[]             @relation("TeacherCourses")
   courseCollaborations CourseCollaborator[] @relation("CourseCollaborators")
   courseEnrollments   CourseEnrollment[]   @relation("StudentEnrollments")
@@ -81,6 +68,10 @@ model User {
   qaCenterSessions          QaCenterSession[]
   chatThreadTitleOverrides  ChatThreadTitleOverride[]
   assignments               Assignment[]
+  learningProfile           UserLearningProfile?
+  memoryFacts               UserMemoryFact[]
+  memoryConcepts            UserMemoryConcept[]
+  cronJobs                  CronJob[]
 
   @@map("users")
 }
@@ -174,7 +165,8 @@ model Material {
 
   course Course  @relation(fields: [courseId], references: [id], onDelete: Cascade)
   lesson Lesson? @relation(fields: [lessonId], references: [id], onDelete: SetNull)
-  images MaterialImage[]
+  images             MaterialImage[]
+  chunkPageMappings  ChunkPageMapping[]
 
   @@index([courseId, status])
   @@map("materials")
@@ -193,37 +185,19 @@ model MaterialImage {
   @@map("material_images")
 }
 
-model Credential {
-  id               String            @id @default(uuid()) @db.Uuid
-  userId           String            @map("user_id") @db.Uuid
-  codeHash         String            @unique @map("code_hash")
-  status           CredentialStatus  @map("status")
-  createdAt        DateTime          @default(now()) @map("created_at")
-  expiresAt        DateTime?         @map("expires_at")
-  usedAt           DateTime?         @map("used_at")
-  boundAgentUserId String?           @map("bound_agent_user_id")
-  boundAt          DateTime?         @map("bound_at")
-  metadata         Json?             @map("metadata")
+/// Maps LightRAG chunk IDs to the source page they were extracted from.
+/// Populated during material indexing so citation panels can show only the relevant page image.
+model ChunkPageMapping {
+  id         String @id @default(uuid()) @db.Uuid
+  materialId String @map("material_id") @db.Uuid
+  chunkId    String @map("chunk_id") @db.VarChar(255)
+  pageIdx    Int    @map("page_idx")
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  material Material @relation(fields: [materialId], references: [id], onDelete: Cascade)
 
-  @@index([codeHash, status])
-  @@index([userId, status])
-  @@map("credentials")
-}
-
-model AgentIdentityMapping {
-  id             String    @id @default(uuid()) @db.Uuid
-  platformUserId String    @unique @map("platform_user_id") @db.Uuid
-  agentUserId    String    @unique @map("agent_user_id")
-  channel        String    @map("channel")
-  boundAt        DateTime  @default(now()) @map("bound_at")
-  lastActiveAt   DateTime? @map("last_active_at")
-  metadata       Json?     @map("metadata")
-
-  user User @relation(fields: [platformUserId], references: [id], onDelete: Cascade)
-
-  @@map("agent_identity_mappings")
+  @@unique([materialId, chunkId])
+  @@index([materialId])
+  @@map("chunk_page_mappings")
 }
 
 model RefreshToken {
@@ -239,16 +213,6 @@ model RefreshToken {
   @@index([userId])
   @@index([tokenHash])
   @@map("refresh_tokens")
-}
-
-model CredentialBindAttempt {
-  id        String             @id @default(uuid()) @db.Uuid
-  keyType   BindAttemptKeyType @map("key_type")
-  keyValue  String             @map("key_value")
-  createdAt DateTime           @default(now()) @map("created_at")
-
-  @@index([keyType, keyValue, createdAt])
-  @@map("credential_bind_attempts")
 }
 
 /// One Agent HTTP session per platform user per course (B3 isolation).
@@ -365,4 +329,90 @@ model Assignment {
   @@index([courseId, status])
   @@index([courseId, createdAt(sort: Desc)])
   @@map("assignments")
+}
+
+model UserLearningProfile {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @unique @map("user_id") @db.Uuid
+  user      User     @relation(fields: [userId], references: [id])
+  profile   Json
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("user_learning_profiles")
+}
+
+model UserMemoryFact {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  sessionId  String   @map("session_id")
+  timestamp  DateTime @default(now())
+  category   String
+  content    String
+  confidence Float
+  sourceJson Json     @map("source_json")
+  metadata   Json     @default("{}")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, timestamp])
+  @@index([userId, sessionId])
+  @@map("user_memory_facts")
+}
+
+model UserMemoryConcept {
+  id                String   @id @default(uuid()) @db.Uuid
+  userId            String   @map("user_id") @db.Uuid
+  name              String
+  description       String   @default("")
+  masteryLevel      Float    @default(0) @map("mastery_level")
+  lastUpdated       DateTime @updatedAt @map("last_updated")
+  supportingFactIds String[] @map("supporting_fact_ids")
+  relatedConcepts   String[] @map("related_concepts")
+  metadata          Json     @default("{}")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([userId, name])
+  @@index([userId])
+  @@map("user_memory_concepts")
+}
+
+/// Scheduled agent tasks (cron / interval). Triggered via Redis Stream.
+model CronJob {
+  id          String    @id @db.VarChar(64)
+  userId      String?   @map("user_id") @db.Uuid
+  prompt      String
+  /// 5-field cron expression (e.g. "0 8 * * *") or "every Xm/Xh/Xd"
+  schedule    String
+  /// "active" | "paused"
+  status      String    @default("active")
+  lastRunAt   DateTime? @map("last_run_at")
+  nextRunAt   DateTime? @map("next_run_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  user User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+  runs CronJobRun[]
+
+  @@index([status, nextRunAt])
+  @@index([userId])
+  @@map("cron_jobs")
+}
+
+/// Individual execution records for a CronJob.
+model CronJobRun {
+  id           String    @id @default(uuid()) @db.Uuid
+  jobId        String    @map("job_id") @db.VarChar(64)
+  /// "running" | "success" | "failed"
+  status       String    @default("running")
+  output       String?
+  toolCalls    Json?     @default("[]") @map("tool_calls")
+  startedAt    DateTime  @default(now()) @map("started_at")
+  finishedAt   DateTime? @map("finished_at")
+  errorMessage String?   @map("error_message")
+
+  job CronJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId, startedAt(sort: Desc)])
+  @@map("cron_job_runs")
 }

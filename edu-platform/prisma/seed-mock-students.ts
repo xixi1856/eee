@@ -43,7 +43,6 @@ async function main(): Promise<void> {
     const idx = String(i).padStart(2, "0");
     const username = `mock_student_${idx}`;
     const email = `mock_student_${idx}@localhost.test`;
-    const agentUserId = `mock-agent-student-${idx}`;
 
     // Upsert user (skip if username already exists)
     let user = await prisma.user.findUnique({ where: { username } });
@@ -64,20 +63,6 @@ async function main(): Promise<void> {
       skipped++;
       console.info(`  [~] Skipped existing user: ${username} (${user.id})`);
     }
-
-    // Upsert AgentIdentityMapping so bind-dependent APIs work
-    await prisma.agentIdentityMapping.upsert({
-      where: { platformUserId: user.id },
-      create: {
-        platformUserId: user.id,
-        agentUserId,
-        channel: "http",
-      },
-      update: {
-        agentUserId,
-        channel: "http",
-      },
-    });
 
     // Upsert course enrollment
     await prisma.courseEnrollment.upsert({

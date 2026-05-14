@@ -15,6 +15,16 @@ const Q_TYPE_LABELS: Record<string, string> = {
   TRUE_FALSE: "判断题",
   SHORT_ANSWER: "简答题",
   ESSAY: "论述题",
+  single_choice: "单选题",
+  multi_choice: "多选题",
+  fill_blank: "填空题",
+  short_answer: "简答题",
+};
+
+const DIFFICULTY_LABELS: Record<string, { label: string; className: string }> = {
+  easy: { label: "简单", className: "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400" },
+  medium: { label: "中等", className: "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-400" },
+  hard: { label: "困难", className: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400" },
 };
 
 interface QuestionCardProps {
@@ -82,6 +92,15 @@ export function QuestionCard({
         <span className="rounded-full bg-primary/10 text-primary px-2 py-0.5 text-xs font-medium">
           {Q_TYPE_LABELS[question.type] ?? question.type}
         </span>
+
+        {question.difficulty && (() => {
+          const d = DIFFICULTY_LABELS[question.difficulty];
+          return d ? (
+            <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${d.className}`}>
+              {d.label}
+            </span>
+          ) : null;
+        })()}
 
         {question.score !== undefined && (
           <span className="flex items-center gap-1 text-xs text-muted-foreground ml-1">
@@ -175,12 +194,14 @@ export function QuestionCard({
       {expanded && (
         <div className="p-4 space-y-3">
           {/* Knowledge point tag */}
-          {question.entity && (
+          {question.entities && question.entities.length > 0 && (
             <div className="flex items-center gap-2">
               <span className="text-xs font-medium text-muted-foreground">相关知识点</span>
-              <span className="rounded-full bg-secondary text-secondary-foreground px-2.5 py-0.5 text-xs font-medium">
-                {question.entity}
-              </span>
+              {question.entities.map((e) => (
+                <span key={e} className="rounded-full bg-secondary text-secondary-foreground px-2.5 py-0.5 text-xs font-medium">
+                  {e}
+                </span>
+              ))}
             </div>
           )}
 

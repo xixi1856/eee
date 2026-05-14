@@ -8,7 +8,6 @@ import {
   BookOpen,
   GraduationCap,
   MessageSquare,
-  Key,
   LogOut,
   Moon,
   Sun,
@@ -49,7 +48,6 @@ const navItems = [
     icon: MessageSquare,
     roles: ["STUDENT", "TEACHER", "ADMIN"],
   },
-  { label: "我的凭证", href: "/credentials", icon: Key, roles: ["STUDENT", "TEACHER", "ADMIN"] },
   { label: "个人中心", href: "/user", icon: User },
   { label: "学习进度", href: "/me/progress", icon: TrendingUp, roles: ["STUDENT"] },
   { label: "隐私与数据", href: "/me/privacy", icon: Shield },
@@ -97,7 +95,7 @@ export function AppSidebar() {
   return (
     <Sidebar collapsible="icon" className="border-r border-sidebar-border">
       {/* Header */}
-      <SidebarHeader className="py-4 px-3">
+      <SidebarHeader className={cn("py-4", isCollapsed ? "px-2" : "px-3")}>
         {isCollapsed ? (
           <div className="flex justify-center">
             <div className="group/brand relative flex size-8 shrink-0 items-center justify-center">
@@ -138,7 +136,7 @@ export function AppSidebar() {
       </SidebarHeader>
 
       {/* Navigation */}
-      <SidebarContent className="px-2">
+      <SidebarContent className={cn("px-2", isCollapsed && "px-0")}>
         <SidebarGroup>
           {!isCollapsed && (
             <SidebarGroupLabel className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/70 px-2 mb-1">
@@ -160,6 +158,7 @@ export function AppSidebar() {
                       tooltip={isCollapsed ? item.label : undefined}
                       className={cn(
                         "h-9 gap-2.5 rounded-lg px-2.5 text-[13px] font-medium transition-all",
+                        isCollapsed && "justify-center",
                         isActive
                           ? "bg-accent text-accent-foreground font-semibold"
                           : "text-sidebar-foreground hover:bg-accent/60 hover:text-accent-foreground"
@@ -188,7 +187,12 @@ export function AppSidebar() {
       </SidebarContent>
 
       {/* Footer */}
-      <SidebarFooter className="border-t border-sidebar-border px-3 py-3">
+      <SidebarFooter
+        className={cn(
+          "border-t border-sidebar-border py-3",
+          isCollapsed ? "px-2" : "px-3"
+        )}
+      >
         <div className="flex flex-col gap-2">
           {/* User info */}
           {user && (

@@ -1,6 +1,7 @@
 """RAGAnything engine - initialisation and high-level ingest/query helpers."""
 
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -156,10 +157,30 @@ async def _ensure_lightrag_storages(rag: RAGAnything) -> None:
     await lr.initialize_storages()
 
 
-def _invalidate_personal_rag_cache() -> None:
-    """Drop cached personal RAG so the next ``asyncio.run`` gets a fresh LightRAG + embedding workers."""
+def personal_user_to_workspace(user_id: str) -> str:
+    """Return a stable LightRAG workspace id for one user's personal KB."""
+    uid = str(user_id).strip().lower()
+    if not uid:
+        raise ValueError("user_id must be non-empty")
+    safe = re.sub(r"[^a-z0-9_]+", "_", uid).strip("_")
+    if not safe:
+        safe = "user"
+    digest = hashlib.md5(uid.encode("utf-8")).hexdigest()[:10]
+    return f"personal_{safe[:40]}_{digest}"
+
+
+def _invalidate_personal_rag_cache(user_id: str | None = None) -> None:
+    """Drop cached personal RAG(s) so next ``asyncio.run`` uses fresh loop-bound workers."""
     global _rag_instance
     _rag_instance = None
+    if user_id is None:
+        _personal_cache.clear()
+        return
+    try:
+        ws = personal_user_to_workspace(user_id)
+    except ValueError:
+        return
+    _personal_cache.pop(ws, None)
 
 
 def _invalidate_course_rag_cache_for(course_id: str) -> None:
@@ -170,6 +191,8 @@ def _invalidate_course_rag_cache_for(course_id: str) -> None:
 
 _course_cache: dict[str, RAGAnything] = {}
 _course_init_lock = asyncio.Lock()
+_personal_cache: dict[str, RAGAnything] = {}
+_personal_init_lock = asyncio.Lock()
 
 
 _VISION_QUERY_SYSTEM = (
@@ -185,7 +208,7 @@ _TEXT_IMAGE_FALLBACK_SYSTEM = (
 )
 
 
-def _build_rag() -> RAGAnything:
+def _build_rag(*, workspace: str = "personal") -> RAGAnything:
     """Instantiate and return a configured RAGAnything instance.
 
     LightRAG storages are **not** initialised here; callers must
@@ -199,6 +222,8 @@ def _build_rag() -> RAGAnything:
     emb = build_embedding_func()
     lightrag = LightRAG(
         working_dir=str(settings.working_dir),
+        workspace=workspace,
+        graph_storage="Neo4JStorage",
         llm_model_func=llm_model_func,
         embedding_func=emb,
         llm_model_max_async=settings.llm_max_async,
@@ -235,8 +260,22 @@ _rag_instance: RAGAnything | None = None
 def get_rag() -> RAGAnything:
     global _rag_instance
     if _rag_instance is None:
-        _rag_instance = _build_rag()
+        _rag_instance = _build_rag(workspace="personal")
     return _rag_instance
+
+
+async def get_personal_rag_anything(user_id: str) -> RAGAnything:
+    """Return per-user personal RAGAnything (isolated by user workspace)."""
+    workspace = personal_user_to_workspace(user_id)
+    async with _personal_init_lock:
+        if workspace in _personal_cache:
+            return _personal_cache[workspace]
+
+        rag = _build_rag(workspace=workspace)
+        await _ensure_lightrag_storages(rag)
+        _personal_cache[workspace] = rag
+        logger.info("Personal RAGAnything ready workspace={}", workspace)
+        return rag
 
 
 # MinerU extra kwargs forwarded to process_document_complete()
@@ -509,7 +548,7 @@ def query(
             When set, retrieval uses ``aquery_data`` then a vision LLM step
             (with MinerU parse + text LLM fallback if vision fails).
     """
-    from typing import Literal, cast
+    from typing import cast
     from lightrag import QueryParam
 
     _mode = cast(
@@ -607,6 +646,8 @@ def _filter_text_only_content(content_list: list) -> tuple[list, dict[str, int]]
 def _custom_kg_chunks_from_text(lightrag: LightRAG, text: str, file_path: str) -> list[dict[str, Any]]:
     """Split *text* with LightRAG token chunking for ``ainsert_custom_kg`` (no entity extraction)."""
     from lightrag.operate import chunking_by_token_size
+    if lightrag.tokenizer is None:
+        raise RuntimeError("Tokenizer not initialized")
 
     pieces = chunking_by_token_size(
         lightrag.tokenizer,
@@ -831,13 +872,8 @@ async def get_course_rag_anything(course_id: str) -> RAGAnything:
 
         ensure_postgres_env_from_database_url()
 
-        # NetworkXStorage stores graph files locally, so each course needs its own
-        # working directory to prevent graph data from being mixed across courses.
-        # PGGraphStorage shares state via workspace= so a shared dir is fine.
-        if settings.graph_storage == "NetworkXStorage":
-            work = str(settings.working_dir / "course_graphs" / workspace)
-        else:
-            work = str(settings.working_dir / "course_pg_layout")
+        # Neo4JStorage shares state via workspace label; a single shared working dir is fine.
+        work = str(settings.working_dir / "course_neo4j_layout")
         Path(work).mkdir(parents=True, exist_ok=True)
         settings.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -852,7 +888,7 @@ async def get_course_rag_anything(course_id: str) -> RAGAnything:
             max_parallel_insert=settings.max_parallel_insert,
             kv_storage="PGKVStorage",
             vector_storage="PGVectorStorage",
-            graph_storage=settings.graph_storage,
+            graph_storage="Neo4JStorage",
             doc_status_storage="PGDocStatusStorage",
             **_lightrag_insertion_tuning_kwargs(),
             **_lightrag_constructor_extras(),
@@ -981,13 +1017,13 @@ async def course_aquery_data(
 
 
 async def personal_aquery_data(
+    user_id: str,
     question: str,
     *,
     mode: str,
     top_k: int,
 ) -> dict[str, Any]:
-    rag = get_rag()
-    await _ensure_lightrag_storages(rag)
+    rag = await get_personal_rag_anything(user_id)
     m = cast(
         "Literal['local', 'global', 'hybrid', 'naive', 'mix', 'bypass']",
         mode if mode in ("local", "global", "hybrid", "naive", "mix", "bypass") else "hybrid",
@@ -1024,13 +1060,14 @@ def course_retrieval_hits_sync(
 
 
 def personal_retrieval_hits_sync(
+    user_id: str,
     question: str,
     *,
     mode: str,
     top_k: int,
 ) -> list[dict[str, Any]]:
     async def _run() -> list[dict[str, Any]]:
-        raw = await personal_aquery_data(question, mode=mode, top_k=top_k)
+        raw = await personal_aquery_data(user_id, question, mode=mode, top_k=top_k)
         data = raw.get("data") or {}
         chunks = data.get("chunks") or []
         return _hits_from_aquery_chunks(chunks, origin="personal")
@@ -1038,7 +1075,7 @@ def personal_retrieval_hits_sync(
     try:
         return asyncio.run(_run())
     finally:
-        _invalidate_personal_rag_cache()
+        _invalidate_personal_rag_cache(user_id)
 
 
 async def ingest_parsed_material_into_course_async(

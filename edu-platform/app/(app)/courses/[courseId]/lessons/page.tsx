@@ -1,9 +1,26 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { ChevronLeft, Plus, Pencil, Trash2, X, CheckCircle2, AlertCircle } from "lucide-react";
+import { ChevronLeft, Plus, Pencil, Trash2, X, CheckCircle2, AlertCircle, GripVertical } from "lucide-react";
+import {
+  DndContext,
+  closestCenter,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+  arrayMove,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -49,6 +66,66 @@ function Modal({
   );
 }
 
+function SortableLessonRow({
+  lesson: l,
+  isTeacher,
+  onEdit,
+  onDelete,
+}: {
+  lesson: Lesson;
+  isTeacher: boolean;
+  onEdit: (l: Lesson) => void;
+  onDelete: (id: string) => void;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: l.id });
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    zIndex: isDragging ? 10 : undefined,
+  };
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      className={cn(
+        "flex items-start justify-between gap-3 rounded-xl border border-border bg-card px-4 py-3 transition-colors",
+        isDragging ? "shadow-lg border-primary/40 opacity-90" : "hover:border-border/60",
+      )}
+    >
+      <div className="flex items-start gap-3 min-w-0">
+        {isTeacher && (
+          <button
+            {...listeners}
+            {...attributes}
+            className="shrink-0 flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:text-foreground cursor-grab active:cursor-grabbing mt-0.5 touch-none"
+            aria-label="拖拽排序"
+          >
+            <GripVertical size={15} />
+          </button>
+        )}
+        <span className="shrink-0 flex h-6 w-6 items-center justify-center rounded-full bg-primary/10 text-primary text-xs font-bold mt-0.5">
+          {l.order_index}
+        </span>
+        <div className="min-w-0">
+          <p className="text-sm font-medium text-foreground truncate">{l.title}</p>
+          {l.description && <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2">{l.description}</p>}
+        </div>
+      </div>
+      {isTeacher && (
+        <div className="flex items-center gap-1 shrink-0">
+          <button onClick={() => onEdit(l)} className="flex h-7 w-7 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground transition-colors">
+            <Pencil size={13} />
+          </button>
+          <button onClick={() => onDelete(l.id)} className="flex h-7 w-7 items-center justify-center rounded-lg text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors">
+            <Trash2 size={13} />
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function CourseLessonsPage() {
   const params = useParams();
   const courseId = typeof params?.courseId === "string" ? params.courseId : null;
@@ -58,10 +135,17 @@ export default function CourseLessonsPage() {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Lesson | null>(null);
   const [saving, setSaving] = useState(false);
+  const [reordering, setReordering] = useState(false);
   const [formTitle, setFormTitle] = useState("");
   const [formDesc, setFormDesc] = useState("");
   const [formOrder, setFormOrder] = useState(1);
   const { notification, notify } = useNotify();
+  const prevRowsRef = useRef<Lesson[]>([]);
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
 
   const load = useCallback(async () => {
     if (!courseId) return;
@@ -102,6 +186,40 @@ export default function CourseLessonsPage() {
     setEditing(row);
     setFormTitle(row.title); setFormDesc(row.description ?? ""); setFormOrder(row.order_index);
     setOpen(true);
+  }
+
+  async function handleDragEnd(event: DragEndEvent) {
+    const { active, over } = event;
+    if (!over || active.id === over.id || !courseId) return;
+    const oldIndex = rows.findIndex((r) => r.id === active.id);
+    const newIndex = rows.findIndex((r) => r.id === over.id);
+    if (oldIndex === -1 || newIndex === -1) return;
+    const reordered = arrayMove(rows, oldIndex, newIndex).map((r, i) => ({
+      ...r,
+      order_index: i + 1,
+    }));
+    prevRowsRef.current = rows;
+    setRows(reordered);
+    setReordering(true);
+    try {
+      const res = await fetch(`/api/v1/courses/${courseId}/lessons`, {
+        method: "PUT",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ orders: reordered.map((r) => ({ id: r.id, order_index: r.order_index })) }),
+      });
+      if (!res.ok) {
+        setRows(prevRowsRef.current);
+        notify("error", "排序保存失败，已恢复原顺序");
+      } else {
+        notify("success", "课时顺序已保存");
+      }
+    } catch {
+      setRows(prevRowsRef.current);
+      notify("error", "排序保存失败，已恢复原顺序");
+    } finally {
+      setReordering(false);
+    }
   }
 
   async function submitForm() {
@@ -175,31 +293,21 @@ export default function CourseLessonsPage() {
             {isTeacher && <p className="text-xs text-muted-foreground">点击「新建课时」开始添加</p>}
           </div>
         ) : (
-          <div className="space-y-2">
-            {rows.map((l) => (
-              <div key={l.id} className="flex items-start justify-between gap-3 rounded-xl border border-border bg-card px-4 py-3 hover:border-border/60 transition-colors">
-                <div className="flex items-start gap-3 min-w-0">
-                  <span className="shrink-0 flex h-6 w-6 items-center justify-center rounded-full bg-primary/10 text-primary text-xs font-bold mt-0.5">
-                    {l.order_index}
-                  </span>
-                  <div className="min-w-0">
-                    <p className="text-sm font-medium text-foreground truncate">{l.title}</p>
-                    {l.description && <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2">{l.description}</p>}
-                  </div>
-                </div>
-                {isTeacher && (
-                  <div className="flex items-center gap-1 shrink-0">
-                    <button onClick={() => openEdit(l)} className="flex h-7 w-7 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground transition-colors">
-                      <Pencil size={13} />
-                    </button>
-                    <button onClick={() => void removeLesson(l.id)} className="flex h-7 w-7 items-center justify-center rounded-lg text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors">
-                      <Trash2 size={13} />
-                    </button>
-                  </div>
-                )}
+          <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(e) => void handleDragEnd(e)}>
+            <SortableContext items={rows.map((r) => r.id)} strategy={verticalListSortingStrategy}>
+              <div className={cn("space-y-2", reordering && "opacity-60 pointer-events-none")}>
+                {rows.map((l) => (
+                  <SortableLessonRow
+                    key={l.id}
+                    lesson={l}
+                    isTeacher={isTeacher}
+                    onEdit={openEdit}
+                    onDelete={(id) => void removeLesson(id)}
+                  />
+                ))}
               </div>
-            ))}
-          </div>
+            </SortableContext>
+          </DndContext>
         )}
       </div>
 

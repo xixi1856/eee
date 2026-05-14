@@ -1,420 +1,332 @@
-# Phase 2：A2 上下文管理与会话存储详细方案
+# Phase 2 — RAG 迁移到 PostgreSQL + Neo4j
 
-## 目标与背景
+## 目标
+将 LightRAG 的文件系统存储（`vdb_*.json`、`kv_store_*.json`、`.graphml`）
+切换到 PostgreSQL + pgvector（KV / 向量）+ Neo4j（图），
+个人 KB 和课程 KB 统一用 `workspace` 值隔离。同时将学习者画像迁移到 PostgreSQL 表。
 
-A1 完成后，EduAgent 已经拥有独立的配置体系与 provider 运行时。A2 的核心目标是建立面向生产的**会话存储与上下文管理**系统，以支持：
+**依赖**：Phase 1 已完成（user_id 是稳定主键）
 
-1. **会话生命周期管理**：创建、恢复、归档、搜索。
-2. **Token 预算与上下文裁剪**：当单个会话内消息累积超过 LLM token 上限时，自动裁剪历史而不破坏核心信息。
-3. **消息持久化**：用 SQLite 替代当前 append-only JSONL，支持结构化查询与工具调用记录。
-4. **简单会话检索**：按关键词、时间范围、工具调用类型查询历史。
+## 存储分工
+| 数据类型 | 存储 | 隔离方式 |
+|---|---|---|
+| KV（全文、chunks、实体、关系缓存）| PostgreSQL + pgvector | `WHERE workspace = $1`（所有表带 workspace 列，PK 为 `(workspace, id)`）|
+| 向量索引（chunks / entities / relations）| PostgreSQL + pgvector | 同上 |
+| doc_status | PostgreSQL | 同上 |
+| 知识图谱（节点 + 边）| Neo4j | 节点 Label = workspace 值，所有 Cypher 查询带 `` MATCH (n:`{workspace}`) ``|
 
-A2 完成后，EduAgent 应该具备以下特征：
+## workspace 命名规范
+| KB 类型 | workspace 值 |
+|---|---|
+| 课程 KB | `course_{course_id_下划线替换连字符}` |
+| 个人 KB | `personal_{user_id_下划线替换连字符}` |
 
-- 任何 session 在任何时间重启后都可精确恢复（消息顺序、工具调用状态、当前上下文）。
-- 单会话超长对话时自动进行智能压缩，而非简单截断。
-- 会话、消息、工具调用三层数据模型清晰分离，可独立查询。
-- 支持从 CLI 、API、第三方 channel 等不同入口加载同一 session，内部状态一致。
+## 前置条件
+- `docker compose up -d` 启动 postgres（pgvector/pgvector:pg16）和 neo4j（neo4j:5-community）
+- `postgres/init.sql` 已包含 `CREATE EXTENSION IF NOT EXISTS vector`
+- 现有文件系统 RAG 数据**不做迁移**（新系统从零开始）
 
-## 架构决策
+## 执行契约
 
-### 决策 1：SQLite 作为本地会话数据库
+### 1. 基础设施确认
 
-当前使用 append-only JSONL，存在以下问题：
-
-- 无法更新已写入的消息（例如工具调用的最终结果补写、会话元数据变更）。
-- 无结构化索引，全量文件扫描才能搜索。
-- 多进程并发写时容易出现 race condition。
-
-采用 **SQLite** 原因：
-
-- 单文件部署，无外部依赖。
-- 支持 ACID 事务，并发写安全。
-- 支持索引与 SQL 查询。
-- 文件大小适中（单会话通常 < 10 MB）。
-- Python 标准库原生支持。
-
-**否决 PostgreSQL 作为本地存储**：当前项目阶段，Agent 还是本地工具，无必要引入服务级 DB。
-
-### 决策 2：会话存储模型为三层结构
-
-```
-Session
-  ├─ metadata（创建时间、状态、user_id 等；**不含**业务 channel 专有字段）
-  └─ messages[]*
-       ├─ metadata (role、timestamp、usage token...)
-       └─ content
-            ├─ text
-            └─ tool_calls[]*
-                 ├─ function_name
-                 ├─ arguments
-                 └─ result
+#### 1.1 pgvector 扩展
+`postgres/init.sql` 已包含（Phase 2 前确认）：
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
-**不采用简单的"消息列表"模型**的原因：
+#### 1.2 Neo4j 容器
+`edu-platform/docker-compose.yml` 已新增 neo4j 服务，
+`NEO4J_AUTH=neo4j/edu_neo4j_password`，Bolt 端口 7687。
 
-- 工具调用跨多轮交互：user → assistant(tool_call) → tool result → assistant(response)。简单线性模型无法表达"哪个 tool_call 的结果"。
-- Token 计数需要细粒度，压缩时需要逐条选择哪些消息/工具结果保留。
+### 2. Python 侧修改
 
-### 决策 3：Token 预算与压缩策略
-
-定义 `context_token_limit`（默认 60% × model_max_tokens）。
-
-当 `sum(all_messages_tokens) > context_token_limit` 时触发压缩，按以下优先级裁剪：
-
-1. **保留**：最后 3 轮 user + assistant 对话（确保当前意图明确）。
-2. **保留**：所有涉及 tool_call 的消息（工具交互历史重要）。
-3. **压缩**：中间旧消息进行摘要，替换为 system message 形式的"之前讨论过..."。
-4. **如仍超出**：逐条删除最早的非工具消息。
-
-**不采用"滑动窗口"的原因**：
-
-- 简单截断会丢失上下文，导致 Agent 健忘。
-- 摘要虽然有信息损失，但保留关键信息更符合教育场景。
-
-### 决策 4：会话状态机
-
+#### 2.1 新增环境变量（`.env` + `docker-compose.yml` agent 服务）
 ```
-ACTIVE ──► IDLE (> max_idle_time)
-  ├─ PAUSED (用户主动暂停)
-  └─ ARCHIVED (用户归档)
+LIGHTRAG_PG_DSN=postgresql://edu:edu@localhost:5432/edu_platform
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=edu_neo4j_password
 ```
 
-- **ACTIVE**：当前会话可读写。
-- **IDLE**：自动转换，可恢复为 ACTIVE。
-- **PAUSED**：用户主动暂停，不会自动恢复。
-- **ARCHIVED**：会话归档，只读不写。
+#### 2.2 修改 `src/rag_mvp/engine.py` 中的 `LightRAG()` 构造调用
 
-### 决策 5：会话查询接口与索引
+> **详注**：`kv_storage`、`vector_storage`、`doc_status_storage`、`graph_storage` 是 `LightRAG()` 的
+> 构造函数参数，不是 `Settings` 类的字段。**不要修改 `config.py`**，
+> 直接修改 `engine.py` 中的构造调用（即下方 §2.3）。
 
-支持的查询维度：
-
-- `search_by_session_id(session_id) -> Session`
-- `search_by_keyword(keyword, date_range, status) -> list[Session]`
-- `search_by_user(user_id, limit) -> list[Session]` （最近 N 个）
-- `search_by_tool_call(tool_name, date_range) -> list[Session]`
-
-教育平台、LMS、网关等均为 **channel**：只映射到统一的 `user_id` / `session_id` / 消息体，**不在** EduAgent 核心类型或会话元数据里承载课程、班级等业务字段。
-
-建立以下索引避免全表扫描：
-
-- `(session_id)` PRIMARY KEY
-- `(user_id, created_at DESC)`
-- `(status, updated_at DESC)`
-
-补充：为后续 A5/B3 的历史检索体验，建议在 SQLite 侧预留 FTS5 虚拟表（message_content），用于关键词检索与标题生成。A2 可以先完成基础索引，FTS5 作为同阶段可选增强，不阻塞主路径。
-
-### 决策 6：不在 A2 做多用户权限隔离
-
-A2 的会话只负责单用户场景（CLI 或单 channel 单用户）。多用户隔离（授权、租户级别的 RAG namespace）留到 A4/A5 与 B1。
-
-### 决策 7：消息编码格式统一为 OpenAI schema
-
+如果 `config.py` 中已存在 `graph_storage: str` 字段，可保留作可选配置，但实际传入 `LightRAG()` 的值必须固定为以下：
 ```python
-Message = {
-    "role": "user" | "assistant" | "system",
-    "content": str | list[content_block],  # 支持 text + tool_calls
-    "tool_calls": [ToolCall],  # 仅 assistant message 有
-    "tool_call_id": str,  # 仅 tool result 有
-}
+graph_storage   = "Neo4JStorage"
+kv_storage      = "PGKVStorage"
+vector_storage  = "PGVectorStorage"
+doc_status_storage = "PGDocStatusStorage"
+```
 
-ToolCall = {
-    "id": str,
-    "type": "function",
-    "function": {
-        "name": str,
-        "arguments": str,  # JSON string
-    }
-}
+#### 2.3 修改 `src/rag_mvp/engine.py` — `get_course_rag_anything()`
+```python
+# workspace 命名（- 替换为 _ 保证合法标识符）
+workspace = f"course_{course_id.strip().lower().replace('-', '_')}"
 
-ToolResult = {
-    "role": "user",
-    "tool_call_id": str,
-    "content": str,  # 工具返回的结果
+rag = LightRAG(
+    working_dir=str(settings.working_dir / "pg_layout"),  # 仅用于临时文件，不存图
+    workspace=workspace,
+    llm_model_func=llm_model_func,
+    embedding_func=emb,
+    kv_storage="PGKVStorage",
+    vector_storage="PGVectorStorage",
+    graph_storage="Neo4JStorage",
+    doc_status_storage="PGDocStatusStorage",
+    **_lightrag_insertion_tuning_kwargs(),
+    **_lightrag_constructor_extras(),
+)
+```
+
+> **LightRAG PG 表自动创建**：首次初始化 `LightRAG()` 时，PGKVStorage、
+> PGVectorStorage、PGDocStatusStorage 会自动在 PostgreSQL 中创建所需的 8 张表
+> `LIGHTRAG_*`，前提是 `LIGHTRAG_PG_DSN` 指向的数据库已存在且 pgvector 扩展已开启。
+> **无需手动执行任何 SQL**，初始化一次后青就数据入库。
+
+#### 2.4 修改个人 KB 初始化（`src/edu_agent/tools/rag.py` 或对应初始化函数）
+```python
+# user_id 来源：平台 JWT 的 sub（即 Prisma User.id UUID）
+# 由 HTTP channel 从 X-Platform-User-Id header 解析后嵌入 TurnRuntimeContext
+
+workspace = f"personal_{user_id.replace('-', '_')}"
+personal_working_dir = settings.working_dir / "personal" / user_id.replace('-', '_')
+
+rag = LightRAG(
+    working_dir=str(personal_working_dir),  # 仅用于临时文件
+    workspace=workspace,
+    kv_storage="PGKVStorage",
+    vector_storage="PGVectorStorage",
+    graph_storage="Neo4JStorage",
+    doc_status_storage="PGDocStatusStorage",
+    ...
+)
+```
+
+> `workspace = personal_{user_id_连字符替换下划线}`，与课程 KB 的隔离方式完全一致。
+
+#### 2.5 删除 `rag_storage/course_graphs/` 目录的写入代码
+切换 backend 后确认不再有代码向 `course_graphs/` 或 `personal_*/` 文件目录写入。
+旧文件保留（归档），不删除。
+
+### 3. 学习者画像迁移
+
+#### 3.1 新增 Prisma Model
+在 `prisma/schema.prisma` 新增：
+```prisma
+model UserLearningProfile {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id])
+  profile   Json     // 存放原 learner_profile.json 的内容结构
+  updatedAt DateTime @updatedAt
+
+  @@map("user_learning_profiles")
 }
 ```
+执行 `npx prisma migrate dev --name add_user_learning_profile`
 
-**不采用自定义消息格式**：OpenAI schema 已成事实标准，减少适配代码。
+#### 3.2 修改 `src/edu_agent/learner_profile.py`
+将读写从本地 JSON 文件改为 PostgreSQL：
+- 读：`GET /api/v1/internal/learning-profile?user_id=`（新增平台内部端点）
+- 写：`PATCH /api/v1/internal/learning-profile`（新增）
+- 或：直接用 psycopg 连接同一 PostgreSQL（agent 有 DATABASE_URL 环境变量）
 
-## 文件清单
+### 4. 记忆模块迁移（A3 Memory Stack）
 
-### 新建文件
+记忆系统由三层组成，全部从文件系统迁移到 PostgreSQL：
 
-- [src/edu_agent/sessions/__init__.py](e:/appProjects/eee/src/edu_agent/sessions/__init__.py)
-  职责：sessions 子包导出入口。
-
-- [src/edu_agent/sessions/models.py](e:/appProjects/eee/src/edu_agent/sessions/models.py)
-  职责：定义 `Session`、`Message`、`ToolCall`、`ToolResult`、`SessionMetadata`、`MessageMetadata` 等数据模型（Pydantic）。
-
-- [src/edu_agent/sessions/schema.py](e:/appProjects/eee/src/edu_agent/sessions/schema.py)
-  职责：SQLite 建表 SQL、索引定义、schema 初始化逻辑。
-
-- [src/edu_agent/sessions/store.py](e:/appProjects/eee/src/edu_agent/sessions/store.py)
-  职责：`SessionStore` 类，提供：
-  - `create_session(user_id) -> Session`
-  - `get_session(session_id) -> Session`
-  - `append_message(session_id, message) -> None`
-  - `update_message(session_id, message_id, updates) -> None`
-  - `list_messages(session_id, limit, offset) -> list[Message]`
-  - `update_session_status(session_id, status) -> None`
-  - `search_sessions(user_id, keyword, status, date_range) -> list[Session]`
-  - `archive_session(session_id) -> None`
-
-- [src/edu_agent/context/models.py](e:/appProjects/eee/src/edu_agent/context/models.py)
-  职责：定义 `ContextConfig`（token_limit、compression_ratio、idle_timeout_sec）、`CompressionStrategy`。
-
-- [src/edu_agent/context/calculator.py](e:/appProjects/eee/src/edu_agent/context/calculator.py)
-  职责：提供：
-  - `estimate_tokens(message, model_name) -> int`（基于 tiktoken 或模型-specific 方案）
-  - `estimate_messages_tokens(messages, model_name) -> int`
-  - `get_context_limit(model_name, config) -> int`
-
-- [src/edu_agent/context/compressor.py](e:/appProjects/eee/src/edu_agent/context/compressor.py)
-  职责：提供：
-  - `compress_messages(messages, token_limit, current_model) -> list[Message]`
-  - 实现优先级裁剪算法（保留最后 3 轮、保留工具调用）
-  - 调用 LLM 生成摘要信息
-
-- [src/edu_agent/context/manager.py](e:/appProjects/eee/src/edu_agent/context/manager.py)
-  职责：`ContextManager` 类，聚合 SessionStore、token 计算、压缩；提供：
-  - `load_context(session_id) -> list[Message]`（返回已压缩的消息列表）
-  - `add_message(session_id, message) -> None`
-  - `check_and_compress(session_id) -> None`（主动检查并压缩）
-
-- [tests/edu_agent/test_session_store.py](e:/appProjects/eee/tests/edu_agent/test_session_store.py)
-  职责：验证 CRUD、并发写、索引查询、状态转换。
-
-- [tests/edu_agent/test_context_manager.py](e:/appProjects/eee/tests/edu_agent/test_context_manager.py)
-  职责：验证 token 计算、压缩算法、摘要生成、边界情况。
-
-### 修改文件
-
-- [src/edu_agent/types.py](e:/appProjects/eee/src/edu_agent/types.py)
-  变更：`AgentConfig` **不**增加任何 channel 专有字段（如课程、班级、租户）。教育类产品入口与 CLI 一样，只使用通用身份与会话标识；业务上下文若需要，放在 channel 适配层或消息正文/RAG，不进入核心配置模型。
-
-- [src/edu_agent/agent.py](e:/appProjects/eee/src/edu_agent/agent.py)
-  变更：
-  - 构造函数新增 `session_store: SessionStore | None` 注入
-  - `run_turn()` 改为先从 session store 加载历史，再构建 messages for LLM
-  - 每轮回复后，将 user/assistant/tool_result 消息追加到 session store
-  - 集成 `ContextManager` 的压缩逻辑，每轮结束前检查是否需要压缩
-  - 支持从既有 session_id 恢复会话
-
-- [src/edu_agent/learner_profile.py](e:/appProjects/eee/src/edu_agent/learner_profile.py)
-  变更：
-  - 无变更或轻微变更（profile 仍由 A3 专门维护）
-  - 注：如果当前 learner_profile 在 agent.py 中被初始化，确保也通过 paths 注入。
-
-- [src/edu_agent/cli.py](e:/appProjects/eee/src/edu_agent/cli.py)
-  变更：
-  - 新增 `--session-id` 参数，允许用户恢复某个会话
-  - 新增 `list-sessions` 子命令，展示最近会话列表
-  - 每次启动时检查 workspace 中是否存在 sessions.db，若无则初始化
-  - 退出时主动调用 `session_store.close()`
-
-- [README.md](e:/appProjects/eee/README.md)
-  变更：补充会话恢复、会话列表查询的使用说明。
-
-## 接口契约
-
-### 1. SessionStore 核心接口
-
-```python
-class SessionStore:
-    def __init__(self, db_path: Path) -> None: ...
-    
-    def create_session(self, user_id: str) -> Session: ...
-    
-    def get_session(self, session_id: str) -> Session | None: ...
-    
-    def append_message(self, session_id: str, message: Message) -> Message: ...
-    
-    def update_message(self, session_id: str, message_id: str, updates: dict) -> None: ...
-    
-    def list_messages(
-        self,
-        session_id: str,
-        limit: int = 100,
-        offset: int = 0,
-    ) -> list[Message]: ...
-    
-    def update_session_status(self, session_id: str, status: SessionStatus) -> None: ...
-    
-    def search_sessions(
-        self,
-        user_id: str,
-        keyword: str | None = None,
-        status: SessionStatus | None = None,
-        date_range: tuple[datetime, datetime] | None = None,
-        limit: int = 20,
-    ) -> list[Session]: ...
-    
-    def archive_session(self, session_id: str) -> None: ...
-    
-    def close(self) -> None: ...
+```
+Fact（原子事实，append-only）
+  → Concept（知识点掌握度聚合）
+    → LearnerProfile（用户画像快照）
 ```
 
-### 2. ContextManager 核心接口
+#### 4.1 新增 Prisma Model — `UserMemoryFact`
+```prisma
+model UserMemoryFact {
+  id         String   @id @default(uuid())
+  userId     String
+  sessionId  String
+  timestamp  DateTime @default(now())
+  category   String   // concept_mastery | concept_confusion | preference | difficulty | question | achievement
+  content    String
+  confidence Float
+  sourceJson Json     // FactSource { session_id, message_id, tool_call_id?, tool_name? }
+  metadata   Json     @default("{}")
 
-```python
-class ContextManager:
-    def __init__(
-        self,
-        store: SessionStore,
-        config: ContextConfig,
-        settings: EduSettings,
-    ) -> None: ...
-    
-    def load_context(self, session_id: str) -> list[Message]: ...
-    
-    def add_message(self, session_id: str, message: Message) -> None: ...
-    
-    def check_and_compress(self, session_id: str) -> None: ...
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, timestamp])
+  @@index([userId, sessionId])
+  @@map("user_memory_facts")
+}
 ```
 
-### 3. 数据模型
+设计原则：**append-only**，不做 UPDATE，与 Python 侧保持一致。
 
-```python
-class SessionMetadata(BaseModel):
-    id: str
-    user_id: str
-    status: SessionStatus
-    created_at: datetime
-    updated_at: datetime
-    archived_at: datetime | None
-    title: str | None
+#### 4.2 新增 Prisma Model — `UserMemoryConcept`
+```prisma
+model UserMemoryConcept {
+  id                 String   @id @default(uuid())
+  userId             String
+  name               String
+  description        String   @default("")
+  masteryLevel       Float    @default(0)
+  lastUpdated        DateTime @updatedAt
+  supportingFactIds  String[] // fact id 数组
+  relatedConcepts    String[] // concept name 数组
+  metadata           Json     @default("{}")
 
-class Session(BaseModel):
-    metadata: SessionMetadata
-    messages: list[Message]
+  user User @relation(fields: [userId], references: [id])
 
-class MessageMetadata(BaseModel):
-    id: str
-    role: Literal["user", "assistant", "system"]
-    timestamp: datetime
-    token_count: int
-
-class Message(BaseModel):
-    metadata: MessageMetadata
-    content: str
-    tool_calls: list[ToolCall] | None = None
-    tool_call_id: str | None = None
-
-class ToolCall(BaseModel):
-    id: str
-    function_name: str
-    arguments: str  # JSON string
-
-class ContextConfig(BaseModel):
-    token_limit_percent: float = 0.6  # 相对 model_max_tokens
-    compression_ratio: float = 0.5  # 摘要后消息数不超过原来的 50%
-    idle_timeout_sec: int = 3600
+  @@unique([userId, name])
+  @@index([userId])
+  @@map("user_memory_concepts")
+}
 ```
 
-## 实施顺序
+upsert 语义：`userId + name` 联合唯一，每次 consolidation 后更新 `masteryLevel`。
 
-1. 定义 models、schema，创建 SessionStore 基础。
-2. 实现 SessionStore 的 CRUD 与查询。
-3. 实现 token 计算与压缩算法。
-4. 集成到 Agent.run_turn()，确保消息读写正确。
-5. 改造 CLI，支持会话恢复与列表查询。
-6. 补充测试。
+#### 4.3 `UserLearningProfile`（已在 §3 定义）
+覆盖第三层，无需额外新增。
 
-## 注意事项
+#### 4.4 修改 `src/edu_agent/memory/storage.py`
+将 `MemoryStore`（文件系统）替换为 PostgreSQL 实现：
 
-### 1. SQLite 并发写
+- `add_fact(fact)` → `INSERT INTO user_memory_facts`
+- `list_facts(user_id, since?)` → `SELECT ... WHERE user_id = $1 ORDER BY timestamp`
+- `save_concept(concept)` → `INSERT ... ON CONFLICT (user_id, name) DO UPDATE`
+- `list_concepts(user_id)` → `SELECT ... WHERE user_id = $1`
+- `save_profile(profile)` → upsert `user_learning_profiles`
 
-若同一进程下 Agent 运行多个并发 session（A5+ 才可能），需要使用 connection pool 或 queue 来序列化写操作。A2 暂不支持同进程多并发会话，留到 A5。
+连接方式：直接使用 `DATABASE_URL` 环境变量（psycopg3 异步连接，复用已有 PG 实例）。
 
-#### 1b. ARCHIVED 与写锁（避免 TOCTOU）
+执行 migration：
+```bash
+cd edu-platform
+npx prisma migrate dev --name add_memory_stack
+```
 
-- `SessionStore` 对 `append_message`、`update_message`、`replace_session_messages` 在 **同一把 `_write_lock` 内** 再次读取 `sessions.status`，确保「检查非 ARCHIVED」与「写入 messages」之间不会被其他线程插入 `archive_session`。
-- 读路径（`list_messages`、`get_session`）无写锁，依赖 SQLite WAL 下读已提交快照；调用方不应对读结果做跨线程长期缓存后不经刷新再写。
-- `update_session_status`：若 `session_id` 不存在则抛出 `SessionNotFoundError`（在写锁内先 `SELECT` 校验）。
-- `replace_session_messages`：任一步失败时 `rollback`，避免连接长时间停留在未提交变更状态。
+### 5. 会话存储迁移到 Redis
 
-#### 1c. 压缩摘要与失败标记的边界语义（Hermes 风格）
+现有 `sessions/store.py` 用 JSONL 文件存储会话历史。  
+此阶段明确迁移到 Redis，为 Phase 3 TS 重写做对齐（Phase 3B 的 `SessionStore` 使用同一 Redis key 规范）。
 
-- 写入会话的 compaction 摘要 / 静态 fallback / compaction 管线失败说明，均包装为 **REFERENCE ONLY** 说明 + 正文 + **END OF CONTEXT SUMMARY** 结束行，降低模型把历史摘要当作新用户指令的概率。
-- 连续 compaction 失败时，**更新**同一条失败 system 标记（按尾部扫描匹配 `Automatic context compaction failed`），避免失败重试导致 system 噪声无限增长。
+#### 5.1 Key 规范
+```
+agent:session:{session_id}   → JSON 序列化的 Message[] 列表
+TTL：24h（可配置）
+```
 
-#### 1d. 高密度 tool 会话与 `max_tool_chains_pulled_into_tail`
+#### 5.2 修改 `src/edu_agent/sessions/store.py`
+将文件读写替换为 Redis `GET` / `SET`（JSON 序列化），复用已有 `REDIS_URL` 环境变量。
 
-- `ContextConfig.max_tool_chains_pulled_into_tail`（可选，`None` 表示不限制）：从**靠近尾部**一侧计数，最多将多少条 `assistant(tool_calls)+tool` 链纳入「左扩 tail」保护；更早的链可留在 middle 参与摘要，避免 middle 被工具链完全挤没而导致压缩无法收敛。与 Phase1 tool 占位、`sanitize_tool_pairs` 共同构成可压缩性与 API 合法性之间的折中。
+### 6. 环境变量汇总
+```
+# Python agent / rag_mvp 侧新增
+LIGHTRAG_PG_DSN=postgresql://edu:edu@localhost:5432/edu_platform
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=edu_neo4j_password
+```
 
-### 2. Token 计算的准确性（分层，对齐 Hermes-agent 思路）
+### 7. 旧文件系统数据过渡说明
 
-参考 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) 的《Context Compression and Caching》与 `ContextEngine` / `ContextCompressor` 设计：**不把「整窗长度」绑死在单一 tiktoken 调用上**，而是分层维护「预算信号」与「真实用量」：
+A3 记忆三层切换到 PG 后，旧文件处理方式：
 
-1. **粗估层（gateway / 预检类比）**：在进入本轮主循环或加载会话时，可用 **字符启发式**（如 `estimate_messages_tokens_rough`）做低成本压力判断；阈值可配置得**高于**主压缩阈值（Hermes 中文档为网关卫生 ~85% vs 主压缩器默认 ~50%，EduAgent A2 无独立 Gateway 时可将「预检」放在 `ContextManager.load_context` 或每轮 `run_turn` 开头，仅作告警或提前触发压缩，不替代下面第 2 层）。
-2. **主预算层（agent 内环）**：`context_token_limit`（如 model_max_tokens 的 60%）上的决策以 **tiktoken（适用模型）+ 启发式兜底** 为主；**每当 LLM 返回带 `usage.prompt_tokens`（或等价字段）时，用其校准/覆盖粗估**（与 Hermes 中 compressor 使用 API 上报 token 的思路一致）。
+| 目录 | 处置 |
+|---|---|
+| `memory/facts/{user_id}/*.jsonl` | 保留不删除（归档），Phase 3 TS 重写后直接从 PG 读 |
+| `memory/concepts/{user_id}.json` | 同上 |
+| `memory/profiles/{user_id}.json` | 同上 |
+| `rag_storage/course_graphs/` | 归档，不再写入 |
+| `rag_storage/personal_*/` | 归档，不再写入 |
 
-对非 OpenAI 模型（DeepSeek、Ollama），tiktoken 无可靠 encoding 时仍用字符启发式；后续可按模型插件化。
+**不进行历史数据过够**：Phase 2 切换后必须持续使用的应用从平台 PG 全量构建暖机，
+旧 JSONL / JSON 内容属于当前展开星期的训练数据，暂不迁移。
 
-### 3. 压缩时调用 LLM
+## 执行后验证方法
 
-生成摘要时需要调用 LLM（通常用当前对话的 provider），这会产生额外 API 成本。建议：
+### 验证 1：pgvector 扩展存在
+```sql
+-- psql 连接后执行
+SELECT extname FROM pg_extension WHERE extname = 'vector';
+-- 应返回一行
+```
 
-- 仅在 token 严重超出（> 1.2 × limit）时才触发摘要。
-- 摘要可缓存（hash(messages_content) 作为 key），避免重复调用。
-- 提供配置项 `compression_enabled: bool`，允许用户关闭。
+### 验证 2：LightRAG PG 表自动创建
+```sql
+\dt "LIGHTRAG_*"
+-- 应列出 LIGHTRAG_VDB_CHUNKS、LIGHTRAG_DOC_CHUNKS 等 8 张表
+-- 每张表有 workspace 列，确认：
+SELECT DISTINCT workspace FROM "LIGHTRAG_VDB_CHUNKS" LIMIT 10;
+```
 
-错误处理约束（与 Hermes-agent `ContextCompressor` 对齐，**已修订**）：
+### 验证 3：Neo4j 节点 Label 隔离
+```cypher
+-- Neo4j Browser（http://localhost:7474）执行
+CALL db.labels()
+-- 应列出 course_xxx 和 personal_xxx 格式的 Label
 
-- 摘要 LLM 调用失败（网络、限流、无辅助模型、上下文长度报错等）时：**不终止整轮对话**；在已裁剪/合并消息边界的前提下，**插入一条固定的「摘要不可用」说明消息**（类似 Hermes 在 `summary` 为空时写入的 static fallback context marker），并 **打日志**（含 `last_summary_error` 语义的可查询字段可选写入 session 元数据），使模型与用户可知「中间轮次被删除但未成功摘要」而非静默丢失。
-- **禁止**用本地启发式「编造」被删内容的摘要（仍不设本地 LLM fallback 生成真实摘要）；允许的是 **显式降级标记**，与 Hermes 文档中「无摘要则插入说明、仍继续会话」一致。
-- 可选：对连续摘要失败实现 **冷却时间**（cooldown），避免在 provider 故障时每轮狂重试（实现细节见代码，配置项可放入 `ContextConfig`）。
+-- 确认跨 workspace 不互串（某课程的节点不出现在另一个查询里）
+MATCH (n:`course_abc`) RETURN count(n)
+```
 
-### 4. 会话 ID 生成
+### 验证 4：课程 KB ingest
+```bash
+# 上传一个测试 PDF 到某课程，等待 INDEXING → READY
+# 查询 LIGHTRAG_VDB_CHUNKS 表：
+# SELECT count(*) FROM "LIGHTRAG_VDB_CHUNKS" WHERE workspace = 'course_{id}';
+```
 
-使用 `uuid.uuid4()` 或 `shortuuid`，确保全局唯一。不使用时间戳或序列号（易重复）。
+### 验证 5：knowledge_query 检索
+```python
+result = await knowledge_query(sources="course", question="测试问题", course_id="...")
+assert len(result["hits"]) > 0
+```
 
-### 5. 向后兼容性
+### 验证 6：个人 KB
+```bash
+# 通过 agent 工具调用 ingest_document 上传文件
+# SELECT count(*) FROM "LIGHTRAG_VDB_CHUNKS" WHERE workspace = 'personal_{user_id}';
+# 再调用 knowledge_query(sources="personal") 验证检索
+```
 
-A2 会替换 JSONL，但为了平滑过渡，可选实现"迁移工具"将旧 JSONL 导入到 SQLite。建议先标记 JSONL 目录为 `_legacy_sessions`，不再向其中写入。
+### 验证 7：学习者画像读写
+```bash
+# 触发一次会话，agent 更新学习画像
+# SELECT profile FROM user_learning_profiles WHERE user_id = '...';
+```
 
-## 验收标准
+### 验证 8：记忆三层写入
+```sql
+-- 触发一次含实质对话的会话后：
+SELECT count(*) FROM user_memory_facts WHERE user_id = '...';
+-- 应 > 0（Fact 已写入）
 
-### 会话管理
+SELECT name, mastery_level FROM user_memory_concepts WHERE user_id = '...';
+-- 应列出被提取的知识点
 
-- 使用 `edu chat --session-id <id>` 可以恢复已有会话，消息顺序、工具调用状态精确一致。
-- 使用 `edu list-sessions` 可看到按时间倒序的最近 20 个会话，展示标题/状态。
-- 会话可被标记为归档，归档后只读。
+SELECT profile FROM user_learning_profiles WHERE user_id = '...';
+-- 应有更新的画像快照
+```
 
-### 上下文管理
+### 验证 9：会话历史在 Redis
+```bash
+redis-cli get "agent:session:{session_id}"
+# 应返回 JSON 序列化的消息数组，而非读取 JSONL 文件
+```
 
-- 单会话消息总 token 数超过限制时，自动触发压缩；若摘要 LLM 失败，须 **可见降级**（静态说明消息 + 日志），**不得**在无提示的情况下假装全量历史仍在；不得用本地启发式伪造被删内容的摘要。
-- 压缩后最新 3 轮对话保留完整，中间对话替换为一条摘要消息。
-- 摘要消息包含关键信息，Agent 可在后续对话中参考。
+### 验证 10：文件系统残留清理
+确认 `rag_storage/course_graphs/`、`rag_storage/personal_*/`、
+`memory/facts/`、`memory/concepts/`、`memory/profiles/` 目录
+不再被新代码写入（旧文件保留归档，不删除）
 
-### 存储与查询
-
-- SQLite 中的数据通过 SQL 可查询，支持 where 子句按用户、状态、时间范围等过滤。
-- 并发 append_message 调用（同一 session）不会产生数据混乱或错误。
-- Session 创建、消息追加、状态转换都有时间戳记录。
-
-### 数据完整性
-
-- 测试环境中删除 sessions.db 后重新启动，新会话创建成功。
-- 工具调用的所有中间步骤（request + result）都被记录。
-
-## 本阶段不做
-
-- 不做分布式 session store（多进程 / 多机器共享），那是 A5。
-- 不做 session 同步到云端备份。
-- 不做 session 权限隔离（用户之间的会话查询约束），那是 B1。
-- 不做消息加密存储。
-
-## 确认的开放点
-
-### 1. 压缩算法是否需要本地 LLM fallback？
-
-当前方案是：调用当前 session 的 provider 生成摘要。如果无 API key 或 provider 离线，摘要调用会失败。
-
-> **已修订**：仍 **不**引入单独本地模型去「生成真实摘要」；摘要失败时采用 **Hermes-agent 式降级**——保留头/尾与工具链边界策略的结果，插入 **静态 fallback 说明消息** 并记录日志（可选 cooldown），**会话继续**，与「失败即整轮抛错」的旧约定不同。
-
-### 2. 会话过期策略
-
-当前方案：会话 IDLE 后仍可恢复。若要自动删除过期会话（30 天未操作），是否需要？
-
-> A2 先不做自动删除。提供手工 CLI 命令 `edu cleanup-sessions --before <date>` 供用户选择清理。
+## 回滚方案
+- `config.py` 中 `graph_storage` / `kv_storage` / `vector_storage` 改回原值即可回退到文件存储
+- 建议保留旧的 `NetworkXStorage` 代码路径不删除，Phase 3 完成后统一清理

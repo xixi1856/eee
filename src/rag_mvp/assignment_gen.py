@@ -1,12 +1,13 @@
 """Agent-driven assignment generation pipeline.
 
 Pipeline:
-    1. PlannerAgent._run_planner(teacher_request) → Blueprint dict
+    1. Extract params (count, type/obj/difficulty weights, topic_hint) from structured_params or NLP defaults
     2. _retrieve_candidates(course_id, topic_hint, count) → entity candidates with contexts
-    3. assign_objective_format_pairs() → [(objective, format), ...]
-    4. generate_one() per question pair (from question_gen, with semaphore)
-    5. ReviewerAgent._run_reviewer(questions, blueprint) → QualityReport dict
-    6. DB updated at each stage via psycopg3 sync connection
+    3. assign_objective_format_pairs() + _distribute_difficulty() + _make_slots() → pre-computed slots
+    4. _run_planner(teacher_request, candidates, slots, dw) → Blueprint dict (entity + focus per slot)
+    5. generate_one() per blueprint question via _match_entity() lookup
+    6. ReviewerAgent._run_reviewer(questions, blueprint) → QualityReport dict
+    7. DB updated at each stage via psycopg3 sync connection
 
 Course RAG is PostgreSQL-backed (PGKVStorage / PGVectorStorage / PGGraphStorage).
 Entity retrieval uses existing course_aquery_data() — no direct table queries needed.
@@ -20,7 +21,6 @@ import json
 import re
 from typing import Any
 
-import psycopg
 from loguru import logger
 
 from .config import settings
@@ -38,7 +38,7 @@ from .question_gen import (
 )
 
 # ---------------------------------------------------------------------------
-# Entity filters (Tier-0 only; semantic filtering via _gate_entities_with_llm)
+# Entity filters (Tier-0 sanity check only; semantic filtering handled by Planner prompt)
 # ---------------------------------------------------------------------------
 
 
@@ -82,54 +82,77 @@ def _load_course_image_map(conn: Any, course_id: str) -> dict[str, list[dict]]:
 # ---------------------------------------------------------------------------
 
 _PLANNER_SYSTEM = """\
-你是一位专业的教学设计专家。根据教师的作业需求描述，生成一个结构化的作业命题蓝图。
+你是一位专业的教学设计专家。你会收到：
+1. 教师的作业需求描述
+2. 预分配好的题目槽位列表（每道题的类型、认知目标、难度已确定）
+3. 从课程知识图谱检索到的候选知识点实体
+
+你的任务：
+1. 为每个槽位从候选实体中选出最合适的实体（1-2个）
+2. 为每道题写一句简洁的命题关注点（focus）
+3. 输出作业标题
 
 规则：
-1. 根据需求描述判断合适的题目数量（默认 10，最多 20）
-2. 根据教学目标自动调整题型和认知层次比例，各权重之和必须等于 1.0
-3. 输出必须是严格的 JSON，不含任何其他文字或 markdown 代码块
-4. topic_hint 应为课程核心主题关键词，用于 RAG 检索，应简洁（5-20字）
-5. difficulty 只能为 easy / medium / hard 之一
+1. 输出必须是严格的 JSON，不含任何其他文字或 markdown 代码块
+2. questions 数组的长度必须与输入槽位数完全一致
+3. entity_names 只能选自下方候选实体列表中的名称，不得编造实体名
+4. focus 应简短（10-30字），说明该题考查什么方面，供后续 LLM 生成时参考
+5. 尽量让不同槽位覆盖不同知识点，避免过度重复
+6. 对于 synthesis 或 application 目标的题目，可以选 1-2 个相关实体
+7. 忽略名称疑似文档结构/元信息的实体（如"学习目标"、"课程大纲"等）
 """
 
 _PLANNER_PROMPT_TMPL = """\
-教师需求描述：
-{teacher_request}
+教师需求：{teacher_request}
 
-请生成作业命题蓝图，严格按以下 JSON 格式输出（不要添加任何注释）：
+预分配题目槽位（共 {count} 个，你的 questions 长度必须为 {count}）：
+{slots_text}
+
+候选知识点实体（entity_names 只能从以下名称中选择）：
+{candidates_text}
+
+请输出命题蓝图，严格按以下 JSON 格式（不要添加任何注释或 markdown）：
 {{
   "title": "作业标题",
-  "topic_hint": "RAG检索用的核心主题关键词",
-  "difficulty": "medium",
-  "count": 10,
-  "type_weights": {{
-    "single_choice": 0.4,
-    "multi_choice": 0.1,
-    "fill_blank": 0.3,
-    "short_answer": 0.2
-  }},
-  "objective_weights": {{
-    "knowledge": 0.3,
-    "comprehension": 0.2,
-    "application": 0.3,
-    "synthesis": 0.1,
-    "innovation": 0.1
-  }},
-  "estimated_minutes": 30
+  "difficulty_weights": {difficulty_weights_json},
+  "questions": [
+    {{"id": 1, "entity_names": ["实体名"], "focus": "命题关注点（10-30字）"}},
+    ...（共 {count} 条）
+  ]
 }}
 """
 
 
-async def _run_planner(teacher_request: str) -> dict[str, Any]:
-    prompt = _PLANNER_PROMPT_TMPL.format(teacher_request=teacher_request.strip())
+async def _run_planner(
+    teacher_request: str,
+    candidates: list[dict[str, Any]],
+    slots: list[dict[str, Any]],
+    difficulty_weights: dict[str, float],
+) -> dict[str, Any]:
+    count = len(slots)
+    slots_text = "\n".join(
+        f"  id={s['id']}: type={s['type']}, objective={s['objective']}, difficulty={s['difficulty']}"
+        for s in slots
+    )
+    candidates_text = "\n".join(
+        f"  {i}. {c['name']}：{(c.get('context') or '').strip().replace(chr(10), ' ')[:80]}"
+        for i, c in enumerate(candidates, 1)
+    )
+    dw_json = json.dumps(difficulty_weights, ensure_ascii=False)
+    prompt = _PLANNER_PROMPT_TMPL.format(
+        teacher_request=teacher_request.strip(),
+        count=count,
+        slots_text=slots_text,
+        candidates_text=candidates_text,
+        difficulty_weights_json=dw_json,
+    )
     raw = await llm_model_func(prompt, system_prompt=_PLANNER_SYSTEM)
     raw = re.sub(r"```(?:json)?", "", raw).strip()
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if not m:
         raise ValueError(f"PlannerAgent returned no JSON: {raw[:300]}")
     blueprint = json.loads(m.group())
-    # Clamp count
-    blueprint["count"] = max(1, min(20, int(blueprint.get("count", 10))))
+    blueprint.setdefault("difficulty_weights", difficulty_weights)
     return blueprint
 
 
@@ -224,136 +247,43 @@ async def _retrieve_candidates(
     return candidates[: count * 2]
 
 
-_ENTITY_GATE_SYSTEM = """\
-你是课程考试命题前的「实体候选」审核员。下面每个「实体」来自知识图谱/RAG，并附带一段上下文摘要。
+# ---------------------------------------------------------------------------
+# Entity helpers
+# ---------------------------------------------------------------------------
 
-任务：判断该实体是否适合作为**学科/技术知识点**用于出题（与作业蓝图的 topic_hint、难度、题量意图一致）。
-
-keep=false 的典型情况（示例，不限于）：
-- 文档元信息：目录、大纲、章节列表、学习目标列表、考核方式、教学计划等教务表述
-- 纯结构标签、无实质考查价值的名称
-
-keep=true：概念、方法、协议、算法、定理、技能点等可独立考查的内容。
-
-输出要求：
-1. 只输出严格 JSON，不要 markdown 代码块或其它文字
-2. JSON 格式：{"decisions":[{"name":"实体名","keep":true或false,"reason":"一句中文理由"}]}
-3. 对输入列表中的**每一个**实体必须给出一条 decision，name 必须与输入完全一致
-"""
+def _match_entity(name: str, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Match an entity by normalised name; fallback to the highest-score candidate."""
+    target = name.lower().replace(" ", "")
+    for c in candidates:
+        if c["name"].lower().replace(" ", "") == target:
+            return c
+    if candidates:
+        return max(candidates, key=lambda c: float(c.get("score") or 0))
+    return None
 
 
-async def _gate_entities_with_llm(
-    blueprint: dict[str, Any],
-    candidates: list[dict[str, Any]],
+def _distribute_difficulty(count: int, difficulty_weights: dict[str, float]) -> list[str]:
+    """Return a list of difficulty labels of length *count* proportional to *difficulty_weights*."""
+    total = sum(difficulty_weights.values()) or 1.0
+    normalized = {k: v / total for k, v in difficulty_weights.items()}
+    slots: list[str] = []
+    for level, weight in normalized.items():
+        slots.extend([level] * round(count * weight))
+    fallback = max(normalized, key=lambda k: normalized[k])
+    while len(slots) < count:
+        slots.append(fallback)
+    return slots[:count]
+
+
+def _make_slots(
+    obj_fmt_pairs: list[tuple[str, str]],
+    difficulty_slots: list[str],
 ) -> list[dict[str, Any]]:
-    """Filter entity candidates using a single- or multi-batch LLM JSON gate.
-
-    If the LLM call fails or returns unusable JSON, returns *candidates* unchanged
-    (sorted by score descending for stable generation order).
-    """
-
-    def _coerce_keep(val: Any) -> bool:
-        if isinstance(val, bool):
-            return val
-        if isinstance(val, str):
-            return val.strip().lower() in ("true", "1", "yes", "是")
-        return bool(val)
-
-    if not candidates:
-        return candidates
-
-    sorted_c = sorted(
-        candidates,
-        key=lambda c: -float(c.get("score") or 0.0),
-    )
-    count = max(1, int(blueprint.get("count", 10)))
-    # Judge the highest-ranked slice; cap token budget
-    m_cap = min(len(sorted_c), max(8, min(count * 2, 40)))
-    head = sorted_c[:m_cap]
-    tail = sorted_c[m_cap:]
-
-    def _excerpt(ctx: str, limit: int = 360) -> str:
-        s = (ctx or "").strip().replace("\n", " ")
-        return s[:limit] + ("…" if len(s) > limit else "")
-
-    batch_size = 16
-    all_decisions: list[dict[str, Any]] = []
-
-    for batch_start in range(0, len(head), batch_size):
-        batch = head[batch_start : batch_start + batch_size]
-        lines = []
-        for i, c in enumerate(batch, 1):
-            lines.append(
-                f"{i}. 实体名：{c['name']}\n   上下文摘要：{_excerpt(c.get('context', ''))}"
-            )
-        user_msg = (
-            f"作业蓝图摘要：\n"
-            f"- 标题：{blueprint.get('title', '')}\n"
-            f"- topic_hint：{blueprint.get('topic_hint', '')}\n"
-            f"- 难度：{blueprint.get('difficulty', 'medium')}\n"
-            f"- 题目数量：{count}\n\n"
-            f"请对以下 {len(batch)} 个实体逐一给出 keep 判断：\n\n"
-            + "\n\n".join(lines)
-        )
-        try:
-            raw = await llm_model_func(
-                user_msg,
-                system_prompt=_ENTITY_GATE_SYSTEM,
-                temperature=0.0,
-            )
-        except Exception as exc:
-            logger.warning("Entity gate LLM failed: {}; using ungated candidates", exc)
-            return sorted_c
-
-        raw = re.sub(r"```(?:json)?", "", raw).strip()
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not m:
-            logger.warning("Entity gate: no JSON in response; using ungated candidates")
-            return sorted_c
-        try:
-            payload = json.loads(m.group())
-        except json.JSONDecodeError as exc:
-            logger.warning("Entity gate JSON parse error: {}; using ungated candidates", exc)
-            return sorted_c
-
-        decs = payload.get("decisions")
-        if not isinstance(decs, list):
-            logger.warning("Entity gate: missing decisions[]; using ungated candidates")
-            return sorted_c
-        all_decisions.extend([d for d in decs if isinstance(d, dict)])
-
-    expected = {c["name"] for c in head}
-    kept_map: dict[str, bool] = {name: True for name in expected}
-    for d in all_decisions:
-        name = str(d.get("name", "")).strip()
-        if name in expected:
-            kept_map[name] = _coerce_keep(d.get("keep"))
-
-    head_filtered = [c for c in head if kept_map.get(c["name"], True)]
-
-    if not head_filtered:
-        logger.warning(
-            "Entity gate: zero kept from {} head candidates; falling back to full head",
-            len(head),
-        )
-        head_filtered = head[: max(1, min(len(head), count))]
-
-    dropped = [c["name"] for c in head if not kept_map.get(c["name"], True)]
-    if dropped:
-        logger.info("Entity gate dropped {} names: {}", len(dropped), dropped[:20])
-
-    seen_out: set[str] = {c["name"] for c in head_filtered}
-    out: list[dict[str, Any]] = list(head_filtered)
-    # Ensure enough pool for modulo indexing: extend with unjudged tail if short
-    min_pool = max(count * 2, 10)
-    for c in tail:
-        if len(out) >= min_pool:
-            break
-        if c["name"] not in seen_out:
-            out.append(c)
-            seen_out.add(c["name"])
-    # Any remaining head not in out (shouldn't happen) — skip
-    return out
+    """Combine (objective, format) pairs with difficulty labels into slot dicts."""
+    return [
+        {"id": i + 1, "type": fmt, "objective": obj, "difficulty": diff}
+        for i, ((obj, fmt), diff) in enumerate(zip(obj_fmt_pairs, difficulty_slots))
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -369,13 +299,19 @@ _REVIEWER_SYSTEM = """\
 3. 每道题的 clarity、difficulty_match 也是 0-1 浮点数
 4. issues 为发现的具体问题列表（字符串数组），无问题时为空数组 []
 5. suggestion 为改进建议字符串，无建议时为 null
+6. difficulty_match 评分基于题目的 reasoning_steps 字段与该题蓝图难度的匹配度：
+   - 蓝图 easy 期望 reasoning_steps = 1，实际 1 步得满分
+   - 蓝图 medium 期望 reasoning_steps = 2，实际 2 步得满分
+   - 蓝图 hard 期望 reasoning_steps ≥ 3，实际 ≥ 3 步得满分
+   - 偏差 1 步扣 0.3，偏差 2 步及以上扣 0.6
+7. difficulty_distribution_score 评估整批题目的实际难度分布（基于 reasoning_steps）与蓝图
+   difficulty_weights 的吻合度（0-1）：分布完全符合得 1.0，偏差越大分越低
 """
 
 _REVIEWER_PROMPT_TMPL = """\
 作业蓝图：
   标题：{title}
-  难度：{difficulty}
-  认知目标分布：{objective_weights}
+  难度分布目标：easy {easy_pct}% / medium {medium_pct}% / hard {hard_pct}%
 
 题目列表（共 {total} 道）：
 {questions_text}
@@ -395,6 +331,7 @@ _REVIEWER_PROMPT_TMPL = """\
     }}
   ],
   "failed_ids": [],
+  "difficulty_distribution_score": 0.9,
   "summary": "总体评价文字"
 }}
 """
@@ -403,19 +340,24 @@ _REVIEWER_PROMPT_TMPL = """\
 async def _run_reviewer(questions: list[dict], blueprint: dict) -> dict[str, Any]:
     parts: list[str] = []
     for q in questions:
-        line = f"[{q['id']}] ({q['type']}/{q['objective']}) {q['question']}"
+        entities_str = ", ".join(q.get("entities") or [q.get("entity", "")])
+        line = f"[{q['id']}] ({q['type']}/{q['objective']}, entities: {entities_str}, reasoning_steps: {q.get('reasoning_steps', '?')}) {q['question']}"
         if q.get("options"):
             line += f"\n  选项: {'; '.join(q['options'])}"
         line += f"\n  答案: {q['answer']}"
         parts.append(line)
     questions_text = "\n\n".join(parts)
 
+    dw = blueprint.get("difficulty_weights") or {"easy": 0.2, "medium": 0.6, "hard": 0.2}
+    easy_pct = round(dw.get("easy", 0.2) * 100)
+    medium_pct = round(dw.get("medium", 0.6) * 100)
+    hard_pct = round(dw.get("hard", 0.2) * 100)
+
     prompt = _REVIEWER_PROMPT_TMPL.format(
         title=blueprint.get("title", ""),
-        difficulty=blueprint.get("difficulty", "medium"),
-        objective_weights=json.dumps(
-            blueprint.get("objective_weights", {}), ensure_ascii=False
-        ),
+        easy_pct=easy_pct,
+        medium_pct=medium_pct,
+        hard_pct=hard_pct,
         total=len(questions),
         questions_text=questions_text[:4000],
     )
@@ -425,7 +367,9 @@ async def _run_reviewer(questions: list[dict], blueprint: dict) -> dict[str, Any
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if not m:
         raise ValueError(f"ReviewerAgent returned no JSON: {raw[:300]}")
-    return json.loads(m.group())
+    result = json.loads(m.group())
+    result.setdefault("difficulty_distribution_score", 0.5)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +388,8 @@ _FIXER_SYSTEM = """\
 """
 
 _FIXER_PROMPT_TMPL = """\
-以下是评审未通过的题目及对应问题，请逐题修复或标记删除：
+以下是评审未通过的题目及对应问题，请逐题修复或标记删除。
+蓝图难度分布目标：{difficulty_weights}
 
 {failed_items}
 
@@ -489,8 +434,9 @@ async def _run_fixer(
         review = reviews_by_id.get(q["id"], {})
         issues_text = "; ".join(review.get("issues") or []) or "无具体问题"
         suggestion = review.get("suggestion") or "无"
+        entities_str = ", ".join(q.get("entities") or [q.get("entity", "")])
         item = (
-            f"题目ID={q['id']} (entity: {q.get('entity', '')}, type: {q['type']}/{q['objective']})\n"
+            f"题目ID={q['id']} (entities: {entities_str}, type: {q['type']}/{q['objective']})\n"
             f"题目: {q['question']}\n"
             f"答案: {q['answer']}\n"
             f"评审问题: {issues_text}\n"
@@ -498,7 +444,12 @@ async def _run_fixer(
         )
         failed_items_parts.append(item)
 
-    prompt = _FIXER_PROMPT_TMPL.format(failed_items="\n\n".join(failed_items_parts))
+    prompt = _FIXER_PROMPT_TMPL.format(
+        difficulty_weights=(
+            lambda dw: f"easy {round(dw.get('easy', 0.2)*100)}% / medium {round(dw.get('medium', 0.6)*100)}% / hard {round(dw.get('hard', 0.2)*100)}%"
+        )(blueprint.get("difficulty_weights") or {}),
+        failed_items="\n\n".join(failed_items_parts),
+    )
     try:
         raw = await llm_model_func(prompt, system_prompt=_FIXER_SYSTEM)
     except Exception as exc:
@@ -518,7 +469,9 @@ async def _run_fixer(
         return questions
 
     # Build used entity set for replenishment
-    used_entities: set[str] = {q.get("entity", "") for q in questions}
+    used_entities: set[str] = set()
+    for q in questions:
+        used_entities.update(q.get("entities") or [q.get("entity", "")])
     delete_ids: set[int] = set()
 
     # Apply rewrites
@@ -544,9 +497,17 @@ async def _run_fixer(
     # Replenish deleted slots using unused candidates
     deleted_count = len(delete_ids)
     if deleted_count > 0:
+        # Build difficulty map from blueprint questions for replenishment
+        bp_q_map: dict[int, dict] = {
+            bq["id"]: bq for bq in (blueprint.get("questions") or [])
+        }
+        deleted_difficulties: list[str] = [
+            bp_q_map.get(qid, {}).get("difficulty", "medium") for qid in sorted(delete_ids)
+        ]
         spare_candidates = [c for c in candidates if c["name"] not in used_entities]
         next_id = max((q["id"] for q in questions), default=0) + 1
         for i, cand in enumerate(spare_candidates[:deleted_count]):
+            slot_diff = deleted_difficulties[i] if i < len(deleted_difficulties) else "medium"
             new_q = await generate_one(
                 entity_name=cand["name"],
                 context=cand["context"],
@@ -555,6 +516,8 @@ async def _run_fixer(
                 score=cand["score"],
                 chunk_ids=cand["chunk_ids"],
                 objective="knowledge",
+                entity_names=[cand["name"]],
+                difficulty=slot_diff,
             )
             if new_q:
                 questions.append(new_q)
@@ -595,20 +558,22 @@ def _db_update(conn: Any, assignment_id: str, **fields: Any) -> None:
 
 async def regenerate_one_question(
     course_id: str,
-    entity_name: str,
+    entity_names: list[str],
     q_type: str,
     objective: str,
     q_id: int,
     extra_requirements: str = "",
     current_question: str = "",
+    difficulty: str = "medium",
 ) -> dict[str, Any] | None:
     """Regenerate a single question using course RAG context.
 
     Returns a question dict (same schema as generate_one output) or None on failure.
     Called from the edu-agent FastAPI server (async context).
     """
-    # Build query: prefer entity_name, fall back to current_question excerpt or extra_requirements
-    query_parts = [p for p in [entity_name, extra_requirements] if p.strip()]
+    primary_entity = entity_names[0] if entity_names else ""
+    # Build query: prefer entity_names, fall back to current_question excerpt or extra_requirements
+    query_parts = [p for p in [primary_entity, extra_requirements] if p.strip()]
     if not query_parts and current_question:
         # Strip HTML tags simply and take first 80 chars as query seed
         import re as _re
@@ -629,15 +594,15 @@ async def regenerate_one_question(
 
     entity_chunk_ids = [
         cid for cid, content in chunk_map.items()
-        if entity_name and entity_name.lower() in content.lower()
+        if primary_entity and primary_entity.lower() in content.lower()
     ][:3] or list(chunk_map.keys())[:3]
 
     context = "\n\n".join(chunk_map[cid] for cid in entity_chunk_ids if cid in chunk_map)[:2500]
 
     if not context:
         logger.warning(
-            "regenerate_one_question: no context found for entity={} course={}",
-            entity_name, course_id,
+            "regenerate_one_question: no context found for entities={} course={}",
+            entity_names, course_id,
         )
         return None
 
@@ -650,13 +615,15 @@ async def regenerate_one_question(
         context = f"{context}\n\n【教师要求】\n{extra_requirements}"
 
     return await generate_one(
-        entity_name=entity_name,
+        entity_name=primary_entity,
         context=context,
         q_type=q_type,
         q_id=q_id,
         score=1.0,
         chunk_ids=entity_chunk_ids,
         objective=objective,
+        entity_names=entity_names,
+        difficulty=difficulty,
     )
 
 
@@ -737,20 +704,22 @@ def _build_complete_prompt(
 
 async def complete_teacher_question(
     course_id: str,
-    entity_name: str,
+    entity_names: list[str],
     question_stem: str,
     answer_hint: str,
     q_type: str,
     objective: str,
     q_id: int,
+    difficulty: str = "medium",
 ) -> dict[str, Any] | None:
     """Complete a teacher-written question stem with AI-generated options/answer/explanation.
 
     The question_stem is ALWAYS preserved exactly as written by the teacher.
     AI only generates: options (for MCQ), canonical answer, explanation.
     """
+    primary_entity = entity_names[0] if entity_names else ""
     plain_stem = re.sub(r"<[^>]+>", "", question_stem).strip()
-    query = f"{entity_name} {plain_stem[:60]}".strip() or entity_name or "知识点"
+    query = f"{' '.join(entity_names[:2])} {plain_stem[:60]}".strip() or primary_entity or "知识点"
 
     raw = await course_aquery_data(course_id, query, mode="local", top_k=6)
     data = raw.get("data") or {}
@@ -765,7 +734,7 @@ async def complete_teacher_question(
     context = "\n\n".join(chunk_map[cid] for cid in chunk_ids if cid in chunk_map)[:2000]
 
     prompt = _build_complete_prompt(plain_stem, answer_hint, q_type, context)
-    parsed = await _call_question_llm(entity_name or "自定义", q_type, prompt, _COMPLETE_SYSTEM_PROMPT)
+    parsed = await _call_question_llm(primary_entity or "自定义", q_type, prompt, _COMPLETE_SYSTEM_PROMPT)
 
     if parsed is None:
         logger.warning(
@@ -778,9 +747,10 @@ async def complete_teacher_question(
         "id":               q_id,
         "type":             q_type,
         "objective":        objective,
-        "entity":           entity_name,
-        "tags":             [entity_name] if entity_name else [],
+        "entities":         entity_names,
+        "tags":             entity_names,
         "importance_score": 1.0,
+        "reasoning_steps":  int(parsed.get("reasoning_steps") or {"easy": 1, "medium": 2, "hard": 3}.get(difficulty, 2)),
         # Always use teacher's original stem — never the LLM's rewrite
         "question":         plain_stem,
         "options":          parsed.get("options", []),
@@ -803,13 +773,13 @@ def generate_assignment(
     conn: Any,
     structured_params: dict | None = None,
 ) -> None:
-    """Full pipeline: plan → retrieve → generate → review → update DB.
+    """Full pipeline: retrieve → slot → plan → generate → review → update DB.
 
     Runs the async pipeline in a dedicated event loop so it can be called
     from the synchronous Redis Stream worker.
     conn is a psycopg3 sync connection (autocommit=False).
-    When structured_params is provided, the Planner LLM step is skipped and
-    a Blueprint is constructed directly from the params.
+    When structured_params is provided, lesson/weight params are extracted from it;
+    both paths use the LLM Planner to assign entities per slot.
     """
     use_worker_loop = is_worker_async_loop_started()
 
@@ -828,51 +798,33 @@ def generate_assignment(
                     assignment_id, course_id,
                 )
 
-                # ── Step 1: Planner (or structured bypass) ───────────────────────
+                # ── Step 1: Extract generation params (structured or NLP defaults) ─
                 if structured_params is not None:
-                    # Build Blueprint directly from structured params — skip LLM Planner
                     sp = structured_params
-                    difficulty = sp.get("difficulty", "medium")
                     count = max(1, min(50, int(sp.get("count", 10))))
                     type_weights_raw: dict = sp.get("typeWeights") or DEFAULT_TYPE_WEIGHTS
                     obj_weights_raw: dict = sp.get("objectiveWeights") or DEFAULT_OBJECTIVE_WEIGHTS
-                    # Normalise weights to sum to 1
-                    tw_total = sum(type_weights_raw.values()) or 1
-                    ow_total = sum(obj_weights_raw.values()) or 1
+                    dw_raw: dict = sp.get("difficultyWeights") or {"easy": 0.2, "medium": 0.6, "hard": 0.2}
+                    tw_total = sum(type_weights_raw.values()) or 1.0
+                    ow_total = sum(obj_weights_raw.values()) or 1.0
+                    dw_total = sum(dw_raw.values()) or 1.0
                     tw = {k: v / tw_total for k, v in type_weights_raw.items()}
                     ow = {k: v / ow_total for k, v in obj_weights_raw.items()}
-
+                    dw = {k: v / dw_total for k, v in dw_raw.items()}
                     lesson_names: list[str] = sp.get("lessonNames") or []
                     kp: list[str] = sp.get("knowledgePoints") or []
                     topic_parts = lesson_names + kp
                     topic_hint = "、".join(topic_parts[:4]) if topic_parts else ""
-
-                    blueprint: dict[str, Any] = {
-                        "title": teacher_request.strip() or "结构化作业",
-                        "topic_hint": topic_hint,
-                        "difficulty": difficulty,
-                        "count": count,
-                        "type_weights": tw,
-                        "objective_weights": ow,
-                        "estimated_minutes": count * 2,
-                    }
-                    logger.info(
-                        "Blueprint built from structured_params (bypass planner): title={}",
-                        blueprint["title"],
-                    )
                 else:
-                    blueprint = await _run_planner(teacher_request)
-                    logger.info("Blueprint ready: title={}", blueprint.get("title"))
-
-                logger.info(
-                    "Blueprint JSON:\n{}",
-                    json.dumps(blueprint, ensure_ascii=False, indent=2),
-                )
-                _db_update(pipe_conn, assignment_id, blueprint=blueprint)
+                    # NLP path: extract count from request text; use defaults for weights
+                    _cm = re.search(r"(\d+)\s*[道题条]", teacher_request)
+                    count = max(1, min(50, int(_cm.group(1)))) if _cm else 10
+                    tw = DEFAULT_TYPE_WEIGHTS
+                    ow = DEFAULT_OBJECTIVE_WEIGHTS
+                    dw = {"easy": 0.2, "medium": 0.6, "hard": 0.2}
+                    topic_hint = ""
 
                 # ── Step 2: Retrieve entity candidates from course RAG ─────────
-                count = int(blueprint.get("count", 10))
-                topic_hint = str(blueprint.get("topic_hint", ""))
                 candidates = await _retrieve_candidates(course_id, topic_hint, count)
 
                 if not candidates:
@@ -881,53 +833,85 @@ def generate_assignment(
                         "Ensure course materials are indexed (status=READY)."
                     )
 
-                candidates = await _gate_entities_with_llm(blueprint, candidates)
-                if not candidates:
-                    raise RuntimeError(
-                        "Entity gate removed all candidates; broaden topic_hint or check RAG."
+                # ── Step 3: Pre-compute slots (type + objective + difficulty) ──
+                obj_fmt_pairs = assign_objective_format_pairs(
+                    count, ow, tw, OBJECTIVE_FORMAT_COMPATIBILITY
+                )
+                difficulty_slots = _distribute_difficulty(count, dw)
+                slots = _make_slots(obj_fmt_pairs, difficulty_slots)
+
+                # ── Step 4: Planner — assign entities + focus per slot ─────────
+                planner_candidates = candidates[:min(len(candidates), max(count * 2, 10), 40)]
+                blueprint = await _run_planner(teacher_request, planner_candidates, slots, dw)
+                logger.info("Blueprint ready: title={}", blueprint.get("title"))
+
+                # ── Step 5: Merge slots into blueprint.questions + fallback/pad ─
+                bp_qs: list[dict] = list(blueprint.get("questions") or [])
+                if len(bp_qs) > count:
+                    bp_qs = bp_qs[:count]
+                used_bp_names: set[str] = {
+                    n for q in bp_qs for n in (q.get("entity_names") or [])
+                }
+                for slot in slots[len(bp_qs):]:
+                    fallback_cand = next(
+                        (c for c in candidates if c["name"] not in used_bp_names),
+                        candidates[0],
                     )
+                    bp_qs.append({"entity_names": [fallback_cand["name"]], "focus": ""})
+                    used_bp_names.add(fallback_cand["name"])
+                # Stamp each slot's type/objective/difficulty onto blueprint questions
+                for bq, slot in zip(bp_qs, slots):
+                    bq["id"] = slot["id"]
+                    bq["type"] = slot["type"]
+                    bq["objective"] = slot["objective"]
+                    bq["difficulty"] = slot["difficulty"]
+                blueprint["questions"] = bp_qs
+
+                logger.info(
+                    "Blueprint JSON:\n{}",
+                    json.dumps(blueprint, ensure_ascii=False, indent=2),
+                )
+                _db_update(pipe_conn, assignment_id, blueprint=blueprint)
 
                 # Load course image map for source_images traceability
                 course_image_map = _load_course_image_map(pipe_conn, course_id)
-                # Flatten to list sorted by page_idx for fast lookup
                 _all_images: list[dict] = sorted(
                     [img for imgs in course_image_map.values() for img in imgs],
                     key=lambda x: x["page_idx"],
                 )
 
-                # ── Step 3: Generate questions ─────────────────────────────────
-                type_weights: dict = blueprint.get("type_weights") or DEFAULT_TYPE_WEIGHTS
-                obj_weights: dict = blueprint.get("objective_weights") or DEFAULT_OBJECTIVE_WEIGHTS
-
-                pairs = assign_objective_format_pairs(
-                    count, obj_weights, type_weights, OBJECTIVE_FORMAT_COMPATIBILITY
-                )
-
+                # ── Step 6: Generate questions per blueprint slot ──────────────
                 sem = asyncio.Semaphore(settings.llm_max_async)
 
-                async def _guarded(idx: int, entity: dict, obj: str, fmt: str) -> dict | None:
+                async def _guarded(bq: dict) -> dict | None:
+                    entity = _match_entity(
+                        (bq.get("entity_names") or [""])[0],
+                        candidates,
+                    )
+                    if entity is None or not entity.get("context"):
+                        return None
                     async with sem:
                         return await generate_one(
                             entity_name=entity["name"],
                             context=entity["context"],
-                            q_type=fmt,
-                            q_id=idx + 1,
+                            q_type=bq["type"],
+                            q_id=bq["id"],
                             score=entity["score"],
                             chunk_ids=entity["chunk_ids"],
-                            objective=obj,
+                            objective=bq["objective"],
+                            entity_names=bq.get("entity_names") or [entity["name"]],
+                            difficulty=bq["difficulty"],
                         )
 
-                tasks = [
-                    _guarded(idx, candidates[idx % len(candidates)], obj, fmt)
-                    for idx, (obj, fmt) in enumerate(pairs)
-                    if candidates[idx % len(candidates)]["context"]
-                ]
+                tasks = [_guarded(bq) for bq in blueprint["questions"]]
 
                 raw_results = await asyncio.gather(*tasks, return_exceptions=True)
                 questions: list[dict] = []
                 for r in raw_results:
                     if isinstance(r, dict):
                         r.setdefault("score", 5)  # default point value per question
+                        # propagate difficulty from the blueprint slot
+                        r.setdefault("difficulty", bq["difficulty"])
                         questions.append(r)
                     elif isinstance(r, Exception):
                         logger.warning("Question generation task failed: {}", r)
@@ -940,7 +924,6 @@ def generate_assignment(
                     q["id"] = seq
 
                 # Attach source_images: for each question, find images on adjacent pages
-                # (pages within ±1 of any chunk's page reference — best-effort heuristic)
                 if _all_images:
                     for q in questions:
                         q.setdefault("source_images", [])

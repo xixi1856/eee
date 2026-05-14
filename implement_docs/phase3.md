@@ -1,438 +1,377 @@
-# Phase 3：A3 长期记忆与学习者画像自动更新详细方案
+# Phase 3 — TypeScript Agent 核心
 
-## 目标与背景
+## 目标
+用 TypeScript 重新实现 ReAct Agent 核心，包含：
+session 管理、ReAct 循环、工具注册、skills 加载、SubAgent 隔离执行。
+Python 缩减为纯 RAG 微服务，暴露 HTTP API。
 
-A2 完成后，EduAgent 已经拥有完整的会话存储与上下文管理。A3 的核心目标是建立**学习者记忆系统**，使 Agent 能够：
+**依赖**：Phase 2 完成（TS Agent 直接读 PostgreSQL RAG 数据）
 
-1. **跨会话持久化学习者的知识、偏好、薄弱点**：单靠会话历史只能记住当前对话，跨会话遗忘。
-2. **自动化学习者画像更新**：每次会话结束时，自动提取事实、偏好、进度，更新画像，无需用户手动操作。
-3. **记忆检索与引用**：Agent 在新会话中可主动回忆并引用记忆，增强对话的连贯性和个性化。
-4. **记忆协整与冲突解决**：当新事实与旧记忆冲突时（如"学过二次方程"vs"不会解二次方程"），能自动协整。
-
-A3 完成后，EduAgent 应该具备以下特征：
-
-- 学习者画像不只是静态 JSON，而是**动态、可自动演进的知识库**。
-- Agent 与学习者的对话越多，Agent 对学习者的理解越深。
-- Agent 可以利用记忆主动提供个性化建议（"你上次在分数化简这块有困难，今天想继续?"）。
-
-**A3 当前实现范围（与后续能力区分）**：记忆按 **user_id** 维度落盘与检索；**课程 / 跨课程过滤、课程级物理隔离** 不在本阶段实现（与「决策 8」中检索过滤的完整形态相比延后至 B2+ 或专项迭代）。产品文案中若提到「课程内优先」等，以本节为准：**当前版本为全局（每用户）记忆池**。
-
-## 架构决策
-
-### 决策 1：记忆分层存储模型
-
-记忆分为三层，按粒度从细到粗：
+## 架构变化
 
 ```
-Fact Layer (事实层) — 原始观察
-  Example: "用户在 2026-05-08 09:30 解决了问题 'solve_quadratic'"
-           "用户在提问时说'我不喜欢背公式'"
-
-Concept Layer (概念层) — 聚合后的理解
-  Example: "用户掌握了一元二次方程求解 (confidence: 0.8)"
-           "用户偏好推导式学习而非死记"
-
-Profile Layer (画像层) — 结构化学习者画像
-  Example: strength: [concept_id_1, concept_id_2, ...]
-           weakness: [concept_id_3, concept_id_4, ...]
-           preferences: {learning_style: "推导式", pace: "快"}
+旧：Next.js → (HTTP SSE) → Python EduAgent → (HTTP) → Python rag_mvp
+新：Next.js API Routes (含 TS EduAgent) → (HTTP) → Python RAG Service
+                                         → (直接) → PostgreSQL
 ```
 
-**不采用单层扁平记忆**的原因：
+## 执行契约（分 3 子阶段）
 
-- 单层无法体现信息从具体到抽象的演进。
-- 无法追溯某个结论的来源（为什么认为这个学生掌握了某个概念？）。
-- 冲突检测与协整困难。
+---
 
-### 决策 2：记忆存储采用本地 JSON + 图式演化
+### Sub-Phase 3A：Python RAG 微服务 API 化
 
-初期（A3）存储方案：
-
-- **Fact**：写入 `{workspace}/memory/facts/{user_id}/{date}.jsonl`，append-only，每行一条事实。
-- **Concept**：写入 `{workspace}/memory/concepts/{user_id}.json`，按概念组织，支持覆盖。
-- **Profile**：写入 `{workspace}/memory/profiles/{user_id}.json`，定期覆盖更新。
-
-**不采用 Graph DB 的原因**：
-
-- 项目当前还是单机 Agent，图谱查询需求不迫切。
-- JSON 足够支撑三层结构。
-
-**升级路径**（预留给 A4+）：
-
-- Fact 可升级为 PostgreSQL table，便于全文搜索与时间范围查询。
-- Concept graph 可升级为 Neo4j，支持路径查询与知识融合。
-
-### 决策 3：记忆提取策略 — 会话级 Consolidator
-
-在以下时机触发 **memory consolidator**（由 CLI / 编排层调用，**不在每一轮 `run_turn()` 末尾无条件执行**，以避免 LLM 成本与重复提取）：
-
-1. **交互会话结束**：CLI `chat` 在用户 `/quit`、`/exit` 或 EOF 退出时，在 `finally` 中调用一次（加载当前 `session_id` 的完整消息列表后执行）。
-2. **Token 阈值**：当本会话累计消息粗估 token ≥ 配置阈值（如 `MemoryConfig.extraction_min_session_tokens`）时，可在 `run_turn()` 末尾做**轻量判断**，满足条件则触发一次提取与下游聚合（具体「每会话最多触发几次」由实现约定，建议至少保证会话结束仍会再跑一遍以覆盖尾部消息）。
-
+#### 3A.1 新建 `src/rag_service/main.py`
+基于 FastAPI，暴露以下端点：
 ```
-触发（结束 | 阈值 ）
-  ↓
-1. 从 SessionStore 读取 session 中 messages（user + assistant + tool 等）
-2. 调用 LLM：从对话中提取事实与观察（structured extraction）
-3. 写入 Fact layer（append-only）
-4. 周期性或每次 consolidator 末尾：聚合最近 Facts 生成 Concepts
-5. 聚合 Concepts 更新 Profile
+POST /rag/ingest
+  body: { user_id?, course_id?, source_type: "personal"|"course", content, filename }
+  → { task_id }（异步）或 { ok: true }（同步）
+
+POST /rag/query
+  body: { source: "personal"|"course"|"enrolled_courses",
+          user_id, accessible_course_ids?: string[],
+          question, mode?: "hybrid"|"naive" }
+  → { hits: [{content, source, score}], answer?: string }
+
+POST /rag/build-mindmap
+  body: { source, user_id, course_id?, topic }
+  → { markdown: string, html: string }
+
+POST /rag/generate-quiz
+  body: { course_id, topic, count }
+  → { questions: [...] }
+
+POST /rag/eval
+  body: { question: string, answer: string, reference?: string }
+  → { score: number, feedback: string }
 ```
 
-### 决策 4：记忆与 Fact 的数据模型
+鉴权：`X-Internal-Key: {RAG_SERVICE_API_KEY}`（新增环境变量，仅内网调用）
 
-Fact（事实）定义为：
+#### 3A.2 删除 `src/edu_agent/` 中对 rag_mvp 的直接 Python import
+工具层通过 HTTP 调用 RAG Service，不再 `import rag_mvp.*`
 
-```python
-class Fact(BaseModel):
-    id: str  # uuid
-    user_id: str
-    session_id: str
-    timestamp: datetime
-    category: Literal[
-        "concept_mastery",      # 掌握了某概念
-        "concept_confusion",    # 混淆了某概念
-        "preference",           # 偏好表达
-        "difficulty",           # 困难点记录
-        "question",             # 提过的问题
-        "achievement",          # 成就记录
-    ]
-    content: str  # 自然语言描述或结构化 JSON
-    confidence: float  # 0.0 - 1.0，该事实的可信度
-    source: dict  # 来源信息：{message_id, tool_call, ...}
-    metadata: dict  # 拓展字段
+#### 3A.3 Docker Compose 更新
+`edu-platform/docker-compose.yml` 新增 `rag-service` 服务：
+```yaml
+rag-service:
+  build: ../  # Dockerfile 指向 Python monorepo
+  command: uv run rag-service
+  ports:
+    - "8001:8001"  # 仅内网
+  environment:
+    - DATABASE_URL
+    - LIGHTRAG_PG_DSN
+    - RAG_SERVICE_API_KEY
 ```
 
-Concept（概念）定义为：
+---
 
-```python
-class Concept(BaseModel):
-    id: str  # 概念唯一 ID（如 "math.quadratic_eq.solving"）
-    name: str
-    description: str
-    mastery_level: float  # 0.0 - 1.0
-    last_updated: datetime
-    facts: list[str]  # 支撑这个概念判断的 fact IDs
-    related_concepts: list[str]  # 关联概念 ID
-    metadata: dict
+### Sub-Phase 3B：TypeScript Agent Core
+
+新建目录 `edu-platform/lib/agent/`，包含：
+
+#### 3B.1 `lib/agent/types.ts`
+定义核心类型：
+```typescript
+type Message = { role: "user"|"assistant"|"tool", content: string, ... }
+type Tool = { name: string, description: string, parameters: JSONSchema, execute: fn }
+type AgentConfig = { model, systemPrompt, tools, maxIterations, userId, courseIds }
+type TurnContext = { userId, accessibleCourseIds, courseId, lessonId }
 ```
 
-### 决策 5：自动冲突检测与协整规则
-
-当新 Fact 与现有 Profile 冲突时，采用以下规则：
-
-1. **Recency 优先**：新事实比旧事实权重更高。
-2. **Confidence 权重**：高 confidence 的事实覆盖低 confidence 的。
-3. **多源认证**：同一结论从多个独立 session/工具得出时，confidence 提升。
-4. **显式否定**：如果新事实是"用户纠正了之前的错误认知"，则旧事实标记为 `deprecated`。
-
-### 决策 6：记忆检索与过滤
-
-Agent 在新会话中可通过以下接口查询记忆：
-
-```python
-# 精确查询
-remember_concept(user_id, concept_id) -> Concept | None
-
-# 模糊检索
-search_concepts(user_id, keyword) -> list[Concept]
-
-# 当前会话相关的记忆（实现类名为 MemoryRetriever.get_relevant_concepts）
-get_relevant_concepts(user_id, session_context) -> list[Concept]
+#### 3B.2 `lib/agent/tool-registry.ts`
+```typescript
+class ToolRegistry {
+  register(tool: Tool): void
+  get(name: string): Tool | undefined
+  getSchemas(): OpenAITool[]
+}
 ```
 
-其中 `session_context` 为 dict（如 `topic`、`keywords` 等），用于与概念库文本做 **关键词匹配 + TF-IDF 打分** 的相关性排序。**不**在 A3 使用 embedding / ANN；文档中若出现「语义检索」字样，在本阶段指 **非向量的统计相关性**（与下文「本阶段不做」一致）。向量检索接口可预留至 A4。
+#### 3B.3 `lib/agent/react-loop.ts`
+ReAct 主循环（仿 Python `agent.py` 逻辑）：
+- 最大 N 轮（可配置）
+- 每轮：LLM call → parse tool_calls → execute → append tool result → repeat
+- 支持 SSE 流式输出（`ReadableStream`）
+- 异常处理：tool 执行失败 → 追加 error message 继续循环
 
-### 决策 7：学习者画像 Profile 的结构
+**B3 SSE 输出协议**：
 
-```python
-class LearnerProfile(BaseModel):
-    user_id: str
-    created_at: datetime
-    updated_at: datetime
-    
-    # 基础信息
-    name: str
-    learning_goal: str | None
-    
-    # 学习进度（按课程 / 全局）
-    concepts_mastered: list[Concept]  # 掌握的概念
-    concepts_struggling: list[Concept]  # 困难概念
-    recent_topics: list[str]  # 最近讨论的主题
-    
-    # 学习风格与偏好
-    learning_style: Literal["推导式", "应用式", "混合"] | None
-    pace_preference: Literal["快", "中", "慢"] | None
-    interaction_frequency: dict  # 学习频率统计
-    
-    # 总体评分
-    overall_engagement: float  # 0.0 - 1.0
-    progress_trend: Literal["上升", "平稳", "下降"]
-    
-    # 历史快照（用于趋势分析）
-    snapshots: list[{timestamp, concepts_mastered_count, ...}]
+`ReadableStream` 输出的每个 `data:` 节点应符合 `B3SseEvent` 类型（已在 `lib/services/chatService.ts` 定义）：
+```typescript
+// 文本输出（可多次）
+{ type: "text", content: "...一段输出..." }
+
+// 工具调用（开始时发送）
+{ type: "tool_call", name: "knowledge_query", tool_call_id: "..." }
+
+// 工具结果（完成时发送）
+{ type: "tool_result", name: "knowledge_query", success: true, duration_ms: 230 }
+
+// 引用（knowledge_query 类工具在 tool_result 之前展开）
+{ type: "citation", chunk_id: "...", source_label: "...", chunk_text: "..." }
+
+// 结束（每个会话最后发送一次）
+{ type: "done", tokens: 1200, exec_time_ms: 3400 }
+
+// 追踪（可选，调试用）
+{ type: "trace", trace_id: "...", event: "turn_start", turn_id: "...", ts: "..." }
 ```
 
-### 决策 8：不在 A3 实现多租户记忆隔离
+`chatService.ts` 的 `createB3SseTransformFromAgent` 依赖此格式解析各字段。**TS ReAct 循环必须抚发同样的事件序列，不得將工具结果内嵌入 `text` 事件。**
 
-已确认的作用域策略：
+#### 3B.4 `lib/agent/prompt-builder.ts`
 
-- 存储层在 A3 按 **user_id** 维度落盘（便于实现与迁移）。
-- **课程维度、跨课程检索过滤**（见上文「目标与背景」曾描述的理想行为）**不在 A3 实现**；检索在单用户概念池内进行。多租户权限、课程级物理隔离留到 B2+ 或专项迭代。
-
-## 文件清单
-
-### 新建文件
-
-- [src/edu_agent/memory/__init__.py](e:/appProjects/eee/src/edu_agent/memory/__init__.py)
-  职责：memory 子包导出入口。
-
-- [src/edu_agent/memory/models.py](e:/appProjects/eee/src/edu_agent/memory/models.py)
-  职责：定义 `Fact`、`Concept`、`LearnerProfile`、`MemoryConfig` 等数据模型。
-
-- [src/edu_agent/memory/storage.py](e:/appProjects/eee/src/edu_agent/memory/storage.py)
-  职责：`MemoryStore` 类，提供：
-  - `add_fact(fact: Fact) -> None`
-  - `get_facts(user_id, date_range, category) -> list[Fact]`
-  - `search_facts(user_id, keyword) -> list[Fact]`
-  - `save_concept(user_id, concept: Concept) -> None`
-  - `get_concept(user_id, concept_id) -> Concept | None`
-  - `search_concepts(user_id, keyword) -> list[Concept]`
-  - `load_profile(user_id) -> LearnerProfile | None`
-  - `save_profile(profile: LearnerProfile) -> None`
-
-- [src/edu_agent/memory/extractor.py](e:/appProjects/eee/src/edu_agent/memory/extractor.py)
-  职责：`MemoryExtractor` 类，提供：
-  - `extract_facts_from_session(session_id, messages) -> list[Fact]`
-    调用 LLM 的 structured extraction 模式，返回从对话中提取的事实列表。
-  - 实现具体的 extraction prompt 与响应解析。
-
-- [src/edu_agent/memory/consolidator.py](e:/appProjects/eee/src/edu_agent/memory/consolidator.py)
-  职责：`MemoryConsolidator` 类，提供：
-  - `consolidate_session(user_id, session_id, messages) -> None`
-    主入口：由编排层传入已从 SessionStore 加载的 `messages`，触发 extraction → storage → aggregation（编排层负责「何时调用」，见决策 3）。
-  - `aggregate_facts_to_concepts(user_id) -> list[Concept]`
-    周期性聚合最近的 facts 生成 concepts。
-  - `aggregate_concepts_to_profile(user_id) -> LearnerProfile`
-    周期性从 concepts 更新 profile。
-  - `detect_and_resolve_conflicts(user_id, new_fact) -> None`
-    检测新事实与现有 profile 的冲突，应用协整规则。
-
-- [src/edu_agent/memory/retriever.py](e:/appProjects/eee/src/edu_agent/memory/retriever.py)
-  职责：`MemoryRetriever` 类，提供：
-  - `get_relevant_concepts(user_id, session_context) -> list[Concept]`
-    根据 `session_context`（`topic`、`keywords` 等）在概念库上做 **关键词匹配 + TF-IDF** 相关排序（A3 不向量化）。
-  - `search_concepts(user_id, keyword) -> list[Concept]`
-  - 预留接口供 A4+ 接入向量数据库；A3 不实现 ANN。
-
-- [src/edu_agent/tools/memory.py](e:/appProjects/eee/src/edu_agent/tools/memory.py)
-  职责：定义 Agent 可调用的记忆相关工具：
-  - `remember_fact(fact_content: str) -> str`：Agent 可主动记录某个事实。
-  - `search_memory(keyword: str) -> list[str]`：Agent 查询相关记忆。
-  - `update_profile_note(note: str) -> str`：Agent 可主动补充画像信息；实现上写入 `LearnerProfile` 中约定的结构化字段（如带时间戳的 `assistant_notes` 列表），由 `MemoryStore.save_profile` 持久化，与 Fact/Consolidator 协整路径并存（便于审计与展示）。
-
-- [tests/edu_agent/test_memory_store.py](e:/appProjects/eee/tests/edu_agent/test_memory_store.py)
-  职责：验证 facts/concepts/profile 的 CRUD、搜索、持久化。
-
-- [tests/edu_agent/test_memory_extractor.py](e:/appProjects/eee/tests/edu_agent/test_memory_extractor.py)
-  职责：验证从 session 消息提取事实的准确性，mocking LLM 调用。
-
-- [tests/edu_agent/test_memory_consolidator.py](e:/appProjects/eee/tests/edu_agent/test_memory_consolidator.py)
-  职责：验证会话级和周期级的记忆聚合与冲突协整。
-
-### 修改文件
-
-- [src/edu_agent/agent.py](e:/appProjects/eee/src/edu_agent/agent.py)
-  变更：
-  - 构造函数可选注入 `memory_consolidator: MemoryConsolidator | None`（或由 Agent 内部在 `memory_enabled` 时构造默认实例）。
-  - **`run_turn()` 不在每轮末尾无条件调用** `consolidate_session`；仅在满足 **Token 阈值** 时可选触发（见决策 3）；**会话结束**编排调用 consolidator。
-  - 提供记忆检索供工具使用；可选在 `build_system_prompt` 中通过显式参数注入「相关记忆」文本块（需配置开启，避免隐藏注入）。
-
-- [src/edu_agent/types.py](e:/appProjects/eee/src/edu_agent/types.py)
-  变更：`AgentConfig` 新增 `memory_enabled: bool` 字段（允许关闭记忆以节省成本或测试）。
-
-- [src/edu_agent/learner_profile.py](e:/appProjects/eee/src/edu_agent/learner_profile.py)
-  变更：
-  - 重新定义为"从 memory module 加载 profile"而非独立模块。
-  - 提供读接口 `load_learner_profile(user_id)` 和写接口通过 MemoryConsolidator 完成。
-  - 或改为 wrapper，调用 MemoryStore 的 profile 接口。
-
-- [src/edu_agent/cli.py](e:/appProjects/eee/src/edu_agent/cli.py)
-  变更：
-  - 新增 `show-profile` 子命令，展示当前用户（或指定用户）的学习画像。
-  - 新增 `--disable-memory` 标志，启动时关闭记忆系统。
-  - 在退出 `finally` 中调用 consolidator。
-
-- [README.md](e:/appProjects/eee/README.md)
-  变更：补充记忆系统的说明、如何查看学习画像、如何禁用记忆。
-
-## 接口契约
-
-### 1. MemoryExtractor
-
-```python
-class MemoryExtractor:
-    def __init__(
-        self,
-        runtime: ResolvedProviderRuntime,
-        settings: EduSettings,
-    ) -> None: ...
-    
-    def extract_facts_from_session(
-        self,
-        user_id: str,
-        session_id: str,
-        messages: list[Message],
-    ) -> list[Fact]: ...
+对应 Python `prompt_builder.py`，负责将学习者画像和课程信息注入 system prompt：
+```typescript
+class PromptBuilder {
+  // 从 MemoryCoordinator.buildRetrievedMemoryBlock() + LearnerProfile 构建完整 system prompt
+  buildSystemPrompt(
+    basePrompt: string,
+    memoryBlock: string,
+    profile: LearnerProfile | null,
+    ctx: TurnContext,
+  ): string
+}
 ```
 
-### 2. MemoryConsolidator
+集成到 `react-loop.ts`：每轮循环开始前调用 `buildSystemPrompt()` 生成动态 system 消息。
 
-```python
-class MemoryConsolidator:
-    def __init__(
-        self,
-        store: MemoryStore,
-        extractor: MemoryExtractor,
-        settings: EduSettings,
-    ) -> None: ...
-    
-    def consolidate_session(
-        self,
-        user_id: str,
-        session_id: str,
-        messages: list[Message],
-    ) -> None: ...
-    
-    def aggregate_facts_to_concepts(
-        self,
-        user_id: str,
-        days_lookback: int = 7,
-    ) -> list[Concept]: ...
-    
-    def aggregate_concepts_to_profile(
-        self,
-        user_id: str,
-    ) -> LearnerProfile: ...
+#### 3B.5 `lib/agent/context-manager.ts`
+
+对应 Python `context/calculator.py` + `context/compressor.py`：
+```typescript
+class ContextManager {
+  // token 估算（基于字符数 / GPT-4 简化公式就开，有需要再引入 tiktoken WASM）
+  estimateTokens(messages: Message[]): number
+
+  // 嵌入初提示 + 最新 K 条 + 中间应用摨要压缩
+  compress(
+    messages: Message[],
+    maxTokens: number,
+  ): Promise<Message[]>
+}
 ```
 
-### 3. MemoryRetriever
+集成到 `react-loop.ts`：每次 LLM 调用前检查 token 上限，超限时自动压缩历史。
 
-```python
-class MemoryRetriever:
-    def __init__(self, store: MemoryStore) -> None: ...
-    
-    def get_relevant_concepts(
-        self,
-        user_id: str,
-        session_context: dict,  # {topic, keywords, ...}
-    ) -> list[Concept]: ...
-    
-    def search_concepts(
-        self,
-        user_id: str,
-        keyword: str,
-    ) -> list[Concept]: ...
+#### 3B.6 `lib/agent/session-store.ts`
+```typescript
+class SessionStore {
+  // 使用 Redis（复用现有连接）存储 Message[]
+  // key: `agent:session:{sessionId}`，TTL 24h
+  async get(sessionId: string): Promise<Message[]>
+  async append(sessionId: string, messages: Message[]): Promise<void>
+  async reset(sessionId: string): Promise<void>
+}
 ```
 
-## 实施顺序
+#### 3B.7 `lib/agent/skills-loader.ts`
+读取 `skills/*.md` 文件，注册为特殊 tool（调用时注入 skill prompt 作为 system 上下文）
 
-1. 定义数据模型，创建存储目录与序列化。
-2. 实现 MemoryStore 的 CRUD。
-3. 实现 MemoryExtractor。
-4. 实现 MemoryConsolidator 的聚合与冲突协整逻辑。
-5. 实现 MemoryRetriever 的检索。
-6. 集成到 CLI（会话结束、可选 token 阈值经 Agent 轻量触发）与 Agent（`memory_enabled`、工具、可选 prompt 记忆块）。
-7. 补充测试与 CLI 命令。
+#### 3B.8 `lib/agent/memory/` — A3 Memory Stack TS 实现
 
-## 注意事项
+对应 Python 的 `src/edu_agent/memory/` 目录，包含以下模块：
 
-### 1. Memory Extraction 的 LLM 成本
+**`lib/agent/memory/types.ts`**
+```typescript
+type FactCategory = "concept_mastery"|"concept_confusion"|"preference"|"difficulty"|"question"|"achievement"
+type Fact = { id, userId, sessionId, timestamp, category: FactCategory, content, confidence, sourceJson, metadata }
+type Concept = { id, userId, name, description, masteryLevel, lastUpdated, supportingFactIds, relatedConcepts }
+type LearnerProfile = { userId, profile: Record<string, unknown>, updatedAt }
+```
 
-每次会话结束都要调用 LLM 提取事实，这增加 API 开销。建议：
+**`lib/agent/memory/memory-store.ts`**
+直接使用 Prisma 读写 Phase 2 新增的三张表：
+```typescript
+class MemoryStore {
+  async addFact(fact: Omit<Fact, "id">): Promise<void>
+    // → prisma.userMemoryFact.create()
 
-- 仅在会话 token 数达到某个阈值（如 > 1000 tokens）时才提取。
-- 提供配置 `extraction_enabled: bool`。
-- 后续 A4 可优化为"只在关键 tool_call 时提取"。
+  async listFacts(userId: string, since?: Date): Promise<Fact[]>
+    // → prisma.userMemoryFact.findMany({ where: { userId, timestamp: { gte: since } } })
 
-### 2. 数据隐私
+  async saveConcept(concept: Omit<Concept, "id">): Promise<void>
+    // → prisma.userMemoryConcept.upsert({ where: { userId_name } })
 
-如果项目后期涉及真实教学数据，应考虑：
+  async listConcepts(userId: string): Promise<Concept[]>
+    // → prisma.userMemoryConcept.findMany({ where: { userId } })
 
-- 加密存储 facts（包含用户对话内容）。
-- 提供数据导出与删除接口。
+  async saveProfile(userId: string, profile: Record<string, unknown>): Promise<void>
+    // → prisma.userLearningProfile.upsert()
+}
+```
 
-A3 暂不实现，标记为未来要点。
+**`lib/agent/memory/memory-retriever.ts`**
+对应 Python `retriever.py`（TF-IDF 关键词匹配，无 embedding）：
+```typescript
+class MemoryRetriever {
+  // 从 listConcepts() 结果中按 TF-IDF 排序，返回最相关的 N 个 Concept
+  getRelevantConcepts(userId: string, query: string, maxResults?: number): Promise<Concept[]>
+}
+```
 
-### 3. 概念库的管理
+**`lib/agent/memory/memory-extractor.ts`**
+对应 Python `extractor.py`（LLM 从会话记录提取 Fact 数组）：
+```typescript
+class MemoryExtractor {
+  // 将 Message[] 转为 transcript 文本，调用 LLM 返回 Fact[]
+  extractFactsFromSession(userId: string, sessionId: string, messages: Message[]): Promise<Fact[]>
+}
+```
 
-系统自动从 facts 生成 concepts，但概念库的"规范化"需要人工维护。例如：
+**`lib/agent/memory/memory-consolidator.ts`**
+对应 Python `consolidator.py`（Fact → Concept → Profile 聚合，含冲突处理）：
+```typescript
+class MemoryConsolidator {
+  // 读取 Facts → 聚合更新 Concepts（conflict: concept_mastery vs concept_confusion 取 recency-weighted）
+  // → 更新 LearnerProfile snapshot
+  consolidateSession(userId: string, sessionId: string, messages: Message[], opts): Promise<void>
+}
+```
 
-- "解一元二次方程"与"求解二次方程"应该合并为同一概念。
-- 新概念的定义与名词应该标准化。
+**`lib/agent/memory/memory-coordinator.ts`**
+对应 Python `coordinator.py`（供 ReAct 循环调用的入口）：
+```typescript
+class MemoryCoordinator {
+  // 每轮 ReAct 开始前调用，返回注入 system prompt 的记忆上下文文本
+  buildRetrievedMemoryBlock(userId: string, userHint: string): Promise<string>
 
-A3 不处理这个，假设概念库由教师/管理员维护。
+  // 判断是否达到 consolidation 阈值（token 数 >= extraction_min_session_tokens）
+  shouldRunConsolidation(messages: Message[]): boolean
 
-### 4. Profile 的版本化
+  // 触发 extractor + consolidator 流水线（异步，不阻塞主循环）
+  consolidateSession(userId: string, sessionId: string, messages: Message[]): Promise<void>
+}
+```
 
-Profile 每次更新前应保存快照（snapshot），用于后续的学习趋势分析。当前代码中已预留 `snapshots` 字段。
+**与 `react-loop.ts` 的集成点**：
+1. 每轮循环开始：`coordinator.buildRetrievedMemoryBlock()` → 追加到 system prompt
+2. 每轮循环结束后：检查 `coordinator.shouldRunConsolidation()` → 异步触发 `consolidateSession()`（不 await，不阻塞 SSE 流）
 
-### 5. 跨课程记忆隔离
+#### 3B.9 `lib/agent/subagent.ts`
+SubAgent：独立 ToolRegistry 白名单 + 独立 ReAct 循环 + 不共享父会话历史
 
-> **A3 当前不实现**：课程级过滤与跨课程引用规则延后；待引入 `course_id` 或等价维度并更新检索层后再启用原文所述策略。
+---
 
-## 验收标准
+### Sub-Phase 3C：工具迁移（逐个迁移，可分 PR）
 
-### 记忆提取
+每个工具迁移到 `lib/agent/tools/`：
 
-- 会话结束后，自动从对话中提取出 3~10 条 facts，写入 storage。
-- 每条 fact 都附带 confidence 和 source 信息。
+| Python 工具 | TS 文件 | 依赖 |
+|---|---|---|
+| `rag.py` → knowledge_query | `tools/rag.ts` | 调用 RAG Service HTTP API |
+| `search.py` → web_search | `tools/search.ts` | Tavily SDK（有 Node.js 版本）|
+| `memory.py` → read/write_profile | `tools/memory.ts` | `MemoryStore`（Prisma，直接读写三张记忆表）|
+| `eval.py` → evaluate_answer | `tools/eval.ts` | 调用 RAG Service `/rag/eval` |
+| `scheduling.py` → schedule_task | `tools/scheduling.ts` | 复用现有 Redis cron |
+| `delegation.py` → delegate | `tools/delegation.ts` | 调用 SubAgent |
+| `skills.py` → invoke_skill | `tools/skills.ts` | SkillsLoader |
+| `ocr.py` → ocr_image | `tools/ocr.ts` | 调用 LLM vision API |
+| `files.py` → file_ops | `tools/files.ts` | MinIO SDK |
+| generate_quiz（rag_mvp）| `tools/quiz.ts` | 调用 RAG Service `/rag/generate-quiz` |
+| build_mindmap（rag_mvp）| `tools/mindmap.ts` | 调用 RAG Service `/rag/build-mindmap` |
 
-### 概念聚合
+> `memory.py` 的工具层（`read_profile` / `write_profile`）直接调用 `MemoryStore`，
+> 记忆的**自动提取和聚合**（`MemoryExtractor` + `MemoryConsolidator`）由 `react-loop.ts` 在每轮结束后异步触发，不需要额外工具调用。
 
-- 定期（或手工触发）将过去 7 天的 facts 聚合成 concepts。
-- 同一概念的多条事实合并为单条 concept record，confidence 值累积更新。
+**迁移顺序**：rag → memory → eval → search → 其余（按使用频率排序）
 
-### 画像更新
+---
 
-- 学习者画像定期从 concepts 更新，包含 mastered、struggling、preferences 等字段。
-- 可通过 `edu show-profile` 查看当前用户的画像。
+### Sub-Phase 3C-bis：Cron 迁移
 
-### 冲突解决
+将 Python `src/edu_agent/tools/scheduling.py`（定时任务管理）完全迁移到 Next.js：
 
-- 新事实与现有画像有矛盾时，根据 confidence、recency 规则自动协整，不报错。
-- 测试中验证"旧概念被否定后被标记为 deprecated"。
+#### 新增 `lib/agent/cron-scheduler.ts`
+```typescript
+// 复用现有 Redis cron 表（已有 data/cron_jobs.json 了解现有结构）
+class CronScheduler {
+  async schedule(userId: string, task: CronJob): Promise<string>  // 返回 job_id
+  async cancel(jobId: string): Promise<void>
+  async list(userId: string): Promise<CronJob[]>
+}
+```
 
-### 记忆检索
+#### 新增 `app/api/v1/internal/cron/route.ts`
+```typescript
+// Vercel cron 回调端点（也可用 internal key 保护）
+// 请求头必须包含： Authorization: Bearer {CRON_INTERNAL_KEY}
+GET /api/v1/internal/cron   → 计算到期任务 → 触发 agent 执行
+```
 
-- Agent 可通过 `search_memory` 工具查询相关记忆。
-- 检索结果按相关度排序。
+`CRON_INTERNAL_KEY` 新增到环境变量列表。
 
-## 本阶段不做
+---
 
-- 不做向量化 embedding 与语义搜索（ANN），使用简单关键词匹配。后续 A4 可升级。
-- 不做记忆的多租户隔离或权限控制。
-- 不做 facts 的全文搜索索引，JSON 扫描足够。
-- 不做 fact 的加密存储。
+### Sub-Phase 3D：切换 Chat API Route
 
-## 与 Hermes Memory 分层对照（延伸阅读）
+修改 `app/api/v1/.../chat/route.ts`：
+- 删除对 `agentClient.ts`（旧的 Python agent HTTP 调用）的依赖
+- 改为直接调用 `lib/agent/react-loop.ts`
+- TurnContext 从 JWT + `getAccessibleCourseIds()` 构建（复用 Phase 1 的函数）
 
-NousResearch **hermes-agent** 将 `MemoryManager` / `MemoryProvider` 与上下文压缩分层；EduAgent A3 在编排上与之对齐的说明与差距矩阵见仓库内 **[review_docs/hermes_memory_gap.md](../review_docs/hermes_memory_gap.md)**（含 P0/P1/P2 优先级与刻意不对标项）。
+#### 修改 `lib/services/chatService.ts` 的 SSE 转发逻辑
 
-## 确认的开放点
+`courseChatSseResponse` 和 `qaCenterSseResponse` 的内部实现替换：
+```typescript
+// 旧：调用 Python agent HTTP SSE
+// const agentStream = await postChatCompletionsStream(...)
 
-### 1. 记忆提取的 prompt 复杂度
+// 新：直接运行 TS ReAct 循环
+// const agentStream = reactLoop.run(messages, config)
+```
 
-当前方案是："给定会话的消息列表，提取结构化 facts"。
+`createB3SseTransformFromAgent` 已运作于 B3 SSE 格式，无需修改，但必须确保 TS 循环输出的事件序列与 3B.3 中定义的 B3 协议一致。
+输出格式保持不变，前端不需任何改动。
 
-是否需要提供多个 extraction prompt，根据不同教学场景（数学、语言、编程）定制化提取？
+---
 
-> A3 先用通用 prompt（识别所有教学场景的通用 fact 类型），后续按需定制。
+### Sub-Phase 3E：退役 Python Agent
 
-### 2. 概念 ID 的标准化
+确认所有工具已迁移到 TS 后：
+- 删除 `src/edu_agent/` 目录（或归档到 `src/edu_agent_deprecated/`）
+- 保留 `src/rag_mvp/`（仍被 rag-service 使用）
+- 更新 `docker-compose.yml`：删除 `edu-agent` 服务，保留 `rag-service`
+- 删除 `edu-platform/lib/agentClient.ts`
 
-当前方案中概念 ID 如 "math.quadratic_eq.solving" 需要手工定义或从某个知识本体导入。
+## 执行后验证方法
 
-是否需要在 A3 中提供"自动生成概念 ID"的机制，或依赖教师手工维护概念库？
+### 验证 3A：RAG Service 独立运行
+```bash
+uv run rag-service
+curl -X POST http://localhost:8001/rag/query \
+  -H "X-Internal-Key: test" \
+  -d '{"source":"course","user_id":"...","course_id":"...","question":"测试"}'
+# 应返回 { hits: [...] }
+```
 
-> A3 允许系统自动生成无规范化的 concept_id（如 hash(concept_name)），后期 B2 再引入标准概念库。
+### 验证 3B：TS Agent 单元测试
+```bash
+cd edu-platform
+npx vitest run lib/agent/
+# react-loop 测试：mock LLM + mock tools → 验证工具调用和循环终止
+# session-store 测试：Redis mock → 读写验证
+# memory-store 测试：Prisma mock → Fact append-only、Concept upsert
+# memory-coordinator 测试：mock store → buildRetrievedMemoryBlock 返回正确文本块
+```
+
+### 验证 3C：逐工具集成测试
+每迁移一个工具，新增对应 `__tests__/agent-tool-*.test.ts`
+
+### 验证 3D：E2E Chat 流程
+1. 启动 edu-platform（含 TS agent）+ rag-service（Python）
+2. 登录学生 → 课程页 → 发送问题 → 触发 knowledge_query
+3. 确认 SSE 流正常输出，工具调用在 UI 中可见
+4. 确认 Python edu-agent 进程已**不再启动**
+5. 发送多轮对话后确认 `user_memory_facts` 表有新增记录（记忆自动提取触发）
+6. 再次发送消息，确认 system prompt 中包含上轮提取的知识点（记忆注入生效）
+
+### 验证 3E：Python Agent 已完全退役
+```bash
+# docker-compose up 后确认无 edu-agent 容器
+docker-compose ps
+# 应只有: postgres, redis, minio, edu-platform, rag-service
+```

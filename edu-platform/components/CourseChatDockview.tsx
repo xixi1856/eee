@@ -20,6 +20,12 @@ import {
   type IDockviewPanelProps,
 } from "dockview";
 import "dockview/dist/styles/dockview.css";
+import { cn } from "@/lib/utils";
+import { X, FileText } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import Image from "next/image";
 import ChatComponent from "@/components/ChatComponent";
 import CourseMaterialList from "@/components/CourseMaterialList";
 import CourseMaterialViewer from "@/components/CourseMaterialViewer";
@@ -28,6 +34,8 @@ type CitationPreview = {
   materialId: string;
   chunkId?: string;
   sourceLabel?: string;
+  chunkText?: string;
+  image_urls?: Array<{ page_idx: number; url: string }>;
 };
 
 type CourseChatCtx = {
@@ -127,6 +135,7 @@ export default function CourseChatDockview({ courseId }: Props) {
     null,
   );
   const [citation, setCitation] = useState<CitationPreview | null>(null);
+  const [citationTextPanel, setCitationTextPanel] = useState<CitationPreview | null>(null);
   const [hydrateSessionId, setHydrateSessionId] = useState<string | null>(null);
   const { resolvedTheme } = useTheme();
 
@@ -182,6 +191,7 @@ export default function CourseChatDockview({ courseId }: Props) {
       if (ce.detail?.materialId) {
         setCitation(ce.detail);
         setSelectedMaterialId(ce.detail.materialId);
+        setCitationTextPanel(ce.detail);
       }
     };
     window.addEventListener("edu:open-material-preview", h as EventListener);
@@ -333,13 +343,85 @@ export default function CourseChatDockview({ courseId }: Props) {
   return (
     <CourseChatCtx.Provider value={ctxValue}>
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-        <DockviewReact
-          key={courseId}
-          className="h-full min-h-0 w-full flex-1"
-          theme={dockTheme}
-          components={dockviewComponents}
-          onReady={onReady}
-        />
+        <div className="flex flex-1 min-h-0 min-w-0">
+          <DockviewReact
+            key={courseId}
+            className="h-full min-h-0 flex-1"
+            theme={dockTheme}
+            components={dockviewComponents}
+            onReady={onReady}
+          />
+
+          {/* Citation text panel — slides in from right alongside dockview */}
+          <aside
+            className={cn(
+              "flex flex-col border-l border-border bg-background transition-[width,opacity] duration-200 ease-out shrink-0 overflow-hidden",
+              citationTextPanel
+                ? "w-[min(420px,44vw)] min-w-[280px] opacity-100"
+                : "w-0 min-w-0 opacity-0",
+            )}
+          >
+            {citationTextPanel && (
+              <>
+                <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0 bg-muted/30">
+                  <span className="text-xs font-medium text-muted-foreground truncate flex-1">
+                    {citationTextPanel.sourceLabel ?? "引用资料"}
+                  </span>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="h-7 w-7 shrink-0"
+                    aria-label="关闭引用面板"
+                    onClick={() => setCitationTextPanel(null)}
+                  >
+                    <X size={15} />
+                  </Button>
+                </div>
+                <div className="flex-1 min-h-0 overflow-y-auto">
+                  {citationTextPanel.chunkText ? (
+                    <div className="p-4 space-y-4">
+                      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                        <FileText size={13} />
+                        <span>检索文本块</span>
+                      </div>
+                      <div className="prose prose-sm dark:prose-invert max-w-none rounded-lg bg-muted/40 border border-border p-3 text-xs leading-relaxed">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {citationTextPanel.chunkText}
+                        </ReactMarkdown>
+                      </div>
+                      {(citationTextPanel.image_urls?.length ?? 0) > 0 && (
+                        <div className="space-y-2">
+                          <p className="text-xs text-muted-foreground">相关图片</p>
+                          <div className="flex flex-col gap-3">
+                            {citationTextPanel.image_urls!.map((img, idx) => (
+                              <div key={idx} className="space-y-1">
+                                <p className="text-[10px] text-muted-foreground">第 {img.page_idx + 1} 页</p>
+                                <Image
+                                  src={img.url}
+                                  alt={`第 ${img.page_idx + 1} 页`}
+                                  width={0}
+                                  height={0}
+                                  unoptimized
+                                  style={{ width: "100%", height: "auto" }}
+                                  className="rounded border border-border object-contain"
+                                />
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="flex flex-col items-center justify-center h-full min-h-[120px] text-muted-foreground text-xs gap-2 p-6 text-center">
+                      <FileText size={24} className="opacity-40" />
+                      <span>暂无文本块内容</span>
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </aside>
+        </div>
       </div>
     </CourseChatCtx.Provider>
   );

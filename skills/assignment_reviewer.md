@@ -20,7 +20,7 @@ always_inject: false
 |------|------|---------|
 | 清晰度 (clarity) | 30% | 题目表述是否无歧义，选项是否独立不交叉 |
 | 准确性 (accuracy) | 30% | 答案是否正确，解析是否合理 |
-| 难度匹配 (difficulty_match) | 20% | 实际难度是否符合蓝图中的 difficulty 设置 |
+| 难度匹配 (difficulty_match) | 20% | 题目 `reasoning_steps` 字段是否与蓝图 difficulty 期望步骤一致（easy→1步, medium→2步, hard→3步+）；偏差1步扣0.3，偏差2步+扣0.6 |
 | 课程相关性 (relevance) | 20% | 是否考查课程核心知识点，而非文档结构信息 |
 
 ## 必须标记为失败（score < 0.5）的情况
@@ -30,6 +30,7 @@ always_inject: false
 3. 题目涉及教学管理场景（教师编制大纲、学生填写目标等）
 4. 答案明显错误或无法从课程内容中找到依据
 5. 选择题选项中有明显干扰项或答案不唯一
+6. 题目 `reasoning_steps` 与蓝图 difficulty 期望值偏差超过 2 步（easy期望1步，medium期望2步，hard期望3+步）
 
 ## 工具使用策略
 

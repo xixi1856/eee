@@ -1,6 +1,6 @@
 import { prisma } from "@/lib/db";
 import { ApiError } from "@/lib/http/api-error";
-import { createAgentSession } from "@/lib/agentClient";
+import { randomUUID } from "crypto";
 
 /** Prisma client may lag schema until ``npx prisma generate`` succeeds on Windows. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -269,9 +269,8 @@ export async function softDeleteThread(
 
 export async function createEmptyGlobalThread(
   studentId: string,
-  agentUserId: string,
 ): Promise<{ session_id: string }> {
-  const agentSessionId = await createAgentSession(agentUserId, "问答中心");
+  const agentSessionId = randomUUID();
   await px.qaCenterSession.create({
     data: { studentId, agentSessionId },
   });

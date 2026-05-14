@@ -78,7 +78,6 @@ export function RetryMaterialIndexPopover({
             triggerClassName,
           )}
           onClick={(e) => {
-            e.preventDefault();
             e.stopPropagation();
           }}
         >

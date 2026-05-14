@@ -49,3 +49,7 @@ export type UpdateLessonBody = {
   description?: string | null;
   order_index?: number;
 };
+
+export type ReorderLessonsBody = {
+  orders: { id: string; order_index: number }[];
+};

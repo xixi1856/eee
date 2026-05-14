@@ -2,8 +2,19 @@ import { prisma } from "@/lib/db";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const px = prisma as any;
-import { createAgentSession, postChatCompletionsStream } from "@/lib/agentClient";
 import { ApiError } from "@/lib/http/api-error";
+import { randomUUID } from "crypto";
+import { createReActStream } from "@/lib/agent/react-loop";
+import { sessionStore } from "@/lib/agent/session-store";
+import type { Message } from "@/lib/agent/types";
+import {
+  getMemoryCoordinator,
+  getSkillsLoader,
+  buildAgentConfig,
+} from "@/lib/agent/setup";
+import { promptBuilder } from "@/lib/agent/prompt-builder";
+import { memoryStore } from "@/lib/agent/memory/memory-store";
+import { toolRegistry } from "@/lib/agent/tools/index";
 
 type ToolCallRecord = {
   name: string;
@@ -17,6 +28,7 @@ type PersistedCitation = {
   material_id?: string;
   source_label?: string;
   chunk_text?: string;
+  image_urls?: Array<{ page_idx: number; url: string }>;
 };
 
 export type B3SseEvent =
@@ -27,6 +39,7 @@ export type B3SseEvent =
       material_id?: string;
       source_label?: string;
       chunk_text?: string;
+      image_urls?: Array<{ page_idx: number; url: string }>;
     }
   | {
       type: "tool_call";
@@ -144,7 +157,6 @@ function traceEventFromAgentFrame(
 export async function getOrCreateCourseChatSession(
   courseId: string,
   platformStudentId: string,
-  agentUserId: string,
 ): Promise<string> {
   const row = await prisma.courseChatSession.findUnique({
     where: {
@@ -152,10 +164,7 @@ export async function getOrCreateCourseChatSession(
     },
   });
   if (row) return row.agentSessionId;
-  const agentSessionId = await createAgentSession(
-    agentUserId,
-    `course:${courseId}`,
-  );
+  const agentSessionId = randomUUID();
   try {
     await prisma.courseChatSession.create({
       data: {
@@ -376,15 +385,130 @@ export type AttachmentParam = {
   name: string;
 };
 
+// ---- B3 persist transform (for TS ReAct loop output) -----------------------
+
+type PersistTransformOpts = {
+  courseId: string | null;
+  platformStudentId: string;
+  lessonId: string | null;
+  sessionId: string;
+  question: string;
+  persist: boolean;
+  /** Snapshot of session history at request-start time (after any trimming). Used by flush() to avoid re-reading Redis. */
+  baseHistory: Message[];
+};
+
+function createB3PersistTransform(
+  opts: PersistTransformOpts,
+): TransformStream<Uint8Array, Uint8Array> {
+  const dec = new TextDecoder();
+  let buf = "";
+  let fullAnswer = "";
+  const collectedToolCalls: ToolCallRecord[] = [];
+  const collectedCitations: PersistedCitation[] = [];
+  let totalTokens: number | null = null;
+  let execTimeMs: number | null = null;
+
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      controller.enqueue(chunk); // pass-through unchanged
+      buf += dec.decode(chunk, { stream: true });
+      for (;;) {
+        const idx = buf.indexOf("\n\n");
+        if (idx === -1) break;
+        const block = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const dataLine = block.split("\n").find((l) => l.startsWith("data: "));
+        if (!dataLine) continue;
+        const jsonStr = dataLine.slice("data: ".length);
+        let ev: { type: string; [k: string]: unknown };
+        try {
+          ev = JSON.parse(jsonStr) as typeof ev;
+        } catch {
+          continue;
+        }
+        if (ev.type === "text") {
+          fullAnswer += (ev.content as string) ?? "";
+        } else if (ev.type === "tool_result") {
+          collectedToolCalls.push({
+            name: ev.name as string,
+            status: "done",
+            success: ev.success as boolean | undefined,
+            durationMs: ev.duration_ms as number | undefined,
+          });
+        } else if (ev.type === "citation") {
+          collectedCitations.push({
+            chunk_id: ev.chunk_id as string | undefined,
+            material_id: ev.material_id as string | undefined,
+            source_label: ev.source_label as string | undefined,
+            chunk_text: ev.chunk_text as string | undefined,
+            image_urls: ev.image_urls as Array<{ page_idx: number; url: string }> | undefined,
+          });
+        } else if (ev.type === "done") {
+          totalTokens = typeof ev.tokens === "number" ? ev.tokens : null;
+          execTimeMs = typeof ev.exec_time_ms === "number" ? ev.exec_time_ms : null;
+        }
+      }
+    },
+    async flush() {
+      if (opts.persist) {
+        try {
+          const model = (process.env.LLM_MODEL ?? "unknown").slice(0, 100);
+          await prisma.qaLog.create({
+            data: {
+              courseId: opts.courseId,
+              studentId: opts.platformStudentId,
+              lessonId: opts.lessonId,
+              sessionId: opts.sessionId,
+              question: opts.question,
+              questionTokens: null,
+              answer: fullAnswer,
+              answerTokens: null,
+              totalTokens,
+              executionTimeMs: execTimeMs ?? 0,
+              modelUsed: model,
+              hitChunks: [],
+              hitMaterials: [],
+              hitSources: [],
+              toolCalls: collectedToolCalls,
+              citations: collectedCitations,
+            } as Parameters<typeof prisma.qaLog.create>[0]["data"],
+          });
+        } catch (err) {
+          console.error("[chatService] QaLog persist failed:", err);
+        }
+      }
+      // Update session history in Redis using the snapshot captured at request-start.
+      // This avoids a race condition where a concurrent request could corrupt the history
+      // if we re-read Redis here, and ensures trim_history_to is respected on write-back.
+      try {
+        const updated = [
+          ...opts.baseHistory,
+          { role: "user" as const, content: opts.question },
+          { role: "assistant" as const, content: fullAnswer },
+        ];
+        await sessionStore.set(opts.sessionId, updated);
+      } catch (err) {
+        console.error("[chatService] session store update failed:", err);
+      }
+    },
+  });
+}
+
+// ---- Course chat -----------------------------------------------------------
+
 export type CourseChatParams = {
   courseId: string;
   platformStudentId: string;
-  agentUserId: string;
+  userId: string;
   message: string;
+  accessibleCourseIds: string[];
   lessonId?: string | null;
   attachments?: AttachmentParam[];
   traceId?: string | null;
   debugTrace?: boolean;
+  /** When set, truncate session history to this many messages before processing (used for regenerate/edit). */
+  trimHistoryTo?: number;
 };
 
 /**
@@ -400,70 +524,91 @@ export async function courseChatSseResponse(
   if (!user) {
     throw new ApiError(404, "NOT_FOUND", "User not found");
   }
-  const sessionId = await getOrCreateCourseChatSession(
-    p.courseId,
-    p.platformStudentId,
-    p.agentUserId,
+  const sessionId = await getOrCreateCourseChatSession(p.courseId, p.platformStudentId);
+
+  // Load session history + memory
+  const [history, profile] = await Promise.all([
+    sessionStore.get(sessionId).catch(() => []),
+    memoryStore.loadProfile(p.platformStudentId).catch(() => null),
+  ]);
+
+  // Apply trim: when regenerating or editing, discard history beyond the branch point.
+  const effectiveHistory: Message[] =
+    p.trimHistoryTo !== undefined ? history.slice(0, p.trimHistoryTo) : history;
+
+  const coordinator = getMemoryCoordinator();
+  const memoryBlock = await coordinator
+    .buildRetrievedMemoryBlock(p.platformStudentId, p.message)
+    .catch(() => "");
+
+  const skills = getSkillsLoader().load();
+  const config = buildAgentConfig(
+    p.attachments?.map((a) => ({
+      id: a.id,
+      presigned_url: a.presigned_url,
+      mime_type: a.mime_type,
+      name: a.name,
+    })),
   );
-  const agentRes = await postChatCompletionsStream({
-    agentUserId: p.agentUserId,
-    courseId: p.courseId,
-    lessonId: p.lessonId ?? null,
-    sessionId,
+
+  const stream = createReActStream({
     userMessage: p.message,
-    stream: true,
-    attachments: p.attachments,
-    traceId: p.traceId ?? null,
-    debugTrace: p.debugTrace ?? false,
+    config,
+    toolRegistry,
+    ctx: {
+      userId: p.platformStudentId,
+      sessionId,
+      accessibleCourseIds: p.accessibleCourseIds,
+      courseId: p.courseId,
+      lessonId: p.lessonId ?? null,
+      traceId: p.traceId ?? null,
+      debugTrace: p.debugTrace ?? false,
+    },
+    coordinator,
+    promptBuilder,
+    skills,
+    profile,
+    memoryBlock,
+    history: effectiveHistory,
   });
-  if (!agentRes.ok) {
-    const t = await agentRes.text();
-    throw new ApiError(
-      502,
-      "AGENT_CHAT_FAILED",
-      `Agent chat failed: ${agentRes.status} ${t.slice(0, 400)}`,
-    );
-  }
-  if (!agentRes.body) {
-    throw new ApiError(502, "AGENT_CHAT_FAILED", "Agent returned empty body");
-  }
-  const persist = user.qaCollectionEnabled;
-  const transform = createB3SseTransformFromAgent({
-    courseId: p.courseId,
-    platformStudentId: p.platformStudentId,
-    lessonId: p.lessonId ?? null,
-    sessionId,
-    question: p.message,
-    answer: "",
-    persist,
-  });
-  const out = agentRes.body.pipeThrough(transform);
+
+  const out = stream.pipeThrough(
+    createB3PersistTransform({
+      courseId: p.courseId,
+      platformStudentId: p.platformStudentId,
+      lessonId: p.lessonId ?? null,
+      sessionId,
+      question: p.message,
+      persist: user.qaCollectionEnabled,
+      baseHistory: effectiveHistory,
+    }),
+  );
+
   return new Response(out, {
     status: 200,
     headers: {
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
-      ...(agentRes.headers.get("x-trace-id")
-        ? { "X-Trace-Id": agentRes.headers.get("x-trace-id") as string }
-        : {}),
     },
   });
 }
 
 export type QaCenterChatParams = {
   platformStudentId: string;
-  agentUserId: string;
+  userId: string;
   message: string;
+  accessibleCourseIds: string[];
   sessionId?: string | null;
   attachments?: AttachmentParam[];
   traceId?: string | null;
   debugTrace?: boolean;
+  /** When set, truncate session history to this many messages before processing (used for regenerate/edit). */
+  trimHistoryTo?: number;
 };
 
 async function getOrCreateQaCenterAgentSession(
   platformStudentId: string,
-  agentUserId: string,
   existingSessionId?: string | null,
 ): Promise<string> {
   const sid = existingSessionId?.trim();
@@ -480,7 +625,7 @@ async function getOrCreateQaCenterAgentSession(
     }
     return row.agentSessionId;
   }
-  const agentSessionId = await createAgentSession(agentUserId, "问答中心");
+  const agentSessionId = randomUUID();
   try {
     await px.qaCenterSession.create({
       data: {
@@ -515,42 +660,66 @@ export async function qaCenterChatSseResponse(
   }
   const sessionId = await getOrCreateQaCenterAgentSession(
     p.platformStudentId,
-    p.agentUserId,
     p.sessionId,
   );
-  const agentRes = await postChatCompletionsStream({
-    agentUserId: p.agentUserId,
-    courseId: null,
-    lessonId: null,
-    sessionId,
+
+  const [history, profile] = await Promise.all([
+    sessionStore.get(sessionId).catch(() => []),
+    memoryStore.loadProfile(p.platformStudentId).catch(() => null),
+  ]);
+
+  // Apply trim: when regenerating or editing, discard history beyond the branch point.
+  const effectiveHistory: Message[] =
+    p.trimHistoryTo !== undefined ? history.slice(0, p.trimHistoryTo) : history;
+
+  const coordinator = getMemoryCoordinator();
+  const memoryBlock = await coordinator
+    .buildRetrievedMemoryBlock(p.platformStudentId, p.message)
+    .catch(() => "");
+
+  const skills = getSkillsLoader().load();
+  const config = buildAgentConfig(
+    p.attachments?.map((a) => ({
+      id: a.id,
+      presigned_url: a.presigned_url,
+      mime_type: a.mime_type,
+      name: a.name,
+    })),
+  );
+
+  const stream = createReActStream({
     userMessage: p.message,
-    stream: true,
-    attachments: p.attachments,
-    traceId: p.traceId ?? null,
-    debugTrace: p.debugTrace ?? false,
+    config,
+    toolRegistry,
+    ctx: {
+      userId: p.platformStudentId,
+      sessionId,
+      accessibleCourseIds: p.accessibleCourseIds,
+      courseId: null,
+      lessonId: null,
+      traceId: p.traceId ?? null,
+      debugTrace: p.debugTrace ?? false,
+    },
+    coordinator,
+    promptBuilder,
+    skills,
+    profile,
+    memoryBlock,
+    history: effectiveHistory,
   });
-  if (!agentRes.ok) {
-    const t = await agentRes.text();
-    throw new ApiError(
-      502,
-      "AGENT_CHAT_FAILED",
-      `Agent chat failed: ${agentRes.status} ${t.slice(0, 400)}`,
-    );
-  }
-  if (!agentRes.body) {
-    throw new ApiError(502, "AGENT_CHAT_FAILED", "Agent returned empty body");
-  }
-  const persist = user.qaCollectionEnabled;
-  const transform = createB3SseTransformFromAgent({
-    courseId: null,
-    platformStudentId: p.platformStudentId,
-    lessonId: null,
-    sessionId,
-    question: p.message,
-    answer: "",
-    persist,
-  });
-  const out = agentRes.body.pipeThrough(transform);
+
+  const out = stream.pipeThrough(
+    createB3PersistTransform({
+      courseId: null,
+      platformStudentId: p.platformStudentId,
+      lessonId: null,
+      sessionId,
+      question: p.message,
+      persist: user.qaCollectionEnabled,
+      baseHistory: effectiveHistory,
+    }),
+  );
+
   return new Response(out, {
     status: 200,
     headers: {
@@ -558,9 +727,6 @@ export async function qaCenterChatSseResponse(
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
       "X-Qa-Center-Session-Id": sessionId,
-      ...(agentRes.headers.get("x-trace-id")
-        ? { "X-Trace-Id": agentRes.headers.get("x-trace-id") as string }
-        : {}),
     },
   });
 }

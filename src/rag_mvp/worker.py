@@ -19,7 +19,6 @@ from rag_mvp.material_processor import (
     process_parse_and_index,
     process_repair_preview,
     process_transcribe_and_index,
-    update_material_status,
 )
 from rag_mvp.worker_async_loop import start_worker_async_loop, stop_worker_async_loop
 
@@ -218,12 +217,21 @@ def main() -> None:
     _ensure_group(r, stream, group)
     _mark_stale_jobs_failed(conn)
     start_worker_async_loop()
+    from .config import settings as _s
     logger.info(
         "edu-rag-worker stream={} group={} consumer={} claim_idle_ms={} persistent_async_loop=on",
         stream,
         group,
         consumer,
         idle_ms,
+    )
+    logger.info(
+        "config | llm_model={} embedding_mode={} embedding_model={} embedding_dim={} rerank_model={}",
+        _s.llm_model,
+        _s.embedding_mode,
+        _s.embedding_model,
+        _s.embedding_dim,
+        _s.rerank_model or "(none)",
     )
     try:
         while not stop:
@@ -241,7 +249,7 @@ def main() -> None:
                 claimed = _parse_autoclaim_messages(resp)
                 if claimed:
                     _handle_entries(conn, r, stream, group, claimed)
-                msgs = r.xreadgroup(
+                msgs: Any = r.xreadgroup(
                     groupname=group,
                     consumername=consumer,
                     streams={stream: ">"},

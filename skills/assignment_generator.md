@@ -20,8 +20,8 @@ always_inject: false
 
 1. **需求分析**：理解教师的需求，识别课程主题、难度要求和题目类型偏好
 2. **调用生成**：使用 `generate_assignment` 工具启动作业生成管线
-3. **质量检查**：生成完成后，调用 `assignment_reviewer` 技能评审题目质量
-4. **修复循环**：若整体分数 < 0.85，移交 `assignment_fixer` 修复不良题目（最多3轮）
+3. **质量检查**：生成完成后，调用 `assignment_reviewer` 技能评审全部题目
+4. **修复循环**：若 Reviewer 返回 `passed: false` 且轮次 < 3，移交 `assignment_fixer` 修复；Fixer 完成后**必须重新调用 `assignment_reviewer`** 对全部题目评审（不接受 Fixer 自评）；循环直至 `passed: true` 或达到3轮上限
 5. **输出结果**：最终向教师汇报作业生成情况，包括题目数量、整体质量分数和题型分布
 
 ## 约束

@@ -1,15 +1,57 @@
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
+import { Pool } from "pg";
 import { UserRole } from "@prisma/client";
 import { ApiError } from "@/lib/http/api-error";
 import { requireAuthenticated } from "@/lib/admin";
 import { getAuthFromRequest } from "@/lib/request-auth";
 import { getCourseIfMember } from "@/lib/course-access";
-import { prisma } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
 type Ctx = { params: Promise<{ courseId: string }> };
+
+const globalForLightRagPool = globalThis as unknown as {
+  lightRagPool?: Pool;
+  lightRagPoolDsn?: string;
+};
+
+function getLightRagPool(): Pool {
+  const dsn = process.env.LIGHTRAG_PG_DSN?.trim();
+  if (!dsn) {
+    throw new ApiError(500, "INTERNAL_ERROR", "LIGHTRAG_PG_DSN is required for knowledge graph queries");
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(dsn);
+  } catch {
+    throw new ApiError(500, "INTERNAL_ERROR", "LIGHTRAG_PG_DSN is invalid");
+  }
+
+  if (parsed.protocol !== "postgresql:" && parsed.protocol !== "postgres:") {
+    throw new ApiError(500, "INTERNAL_ERROR", "LIGHTRAG_PG_DSN must use postgres protocol");
+  }
+  if (!parsed.pathname || parsed.pathname === "/") {
+    throw new ApiError(500, "INTERNAL_ERROR", "LIGHTRAG_PG_DSN must include database name");
+  }
+
+  const existingPool = globalForLightRagPool.lightRagPool;
+  const existingDsn = globalForLightRagPool.lightRagPoolDsn;
+  if (existingPool && existingDsn === dsn) {
+    return existingPool;
+  }
+
+  const nextPool = new Pool({ connectionString: dsn, max: 5 });
+  if (process.env.NODE_ENV !== "production") {
+    if (existingPool && existingDsn && existingDsn !== dsn) {
+      void existingPool.end().catch(() => undefined);
+    }
+    globalForLightRagPool.lightRagPool = nextPool;
+    globalForLightRagPool.lightRagPoolDsn = dsn;
+  }
+  return nextPool;
+}
 
 /** Only allow lowercase letters, digits and underscores (max 63 chars) in table names. */
 const TABLE_NAME_RE = /^[a-z][a-z0-9_]{1,62}$/;
@@ -199,19 +241,22 @@ export async function GET(_req: NextRequest, ctx: Ctx) {
 
     // Resolve table names — configurable via env, validated by regex before interpolation
     const entityTable = validateTableName(
-      process.env.LIGHTRAG_ENTITY_TABLE ?? "lightrag_vdb_entity_bge_m3_1024d",
+      process.env.LIGHTRAG_ENTITY_TABLE ?? "lightrag_vdb_entity",
     );
     const relationTable = validateTableName(
-      process.env.LIGHTRAG_RELATION_TABLE ?? "lightrag_vdb_relation_bge_m3_1024d",
+      process.env.LIGHTRAG_RELATION_TABLE ?? "lightrag_vdb_relation",
     );
 
+    const lightRagPool = getLightRagPool();
+
     // Fetch entities for this course workspace
-    const entityRows = await prisma.$queryRawUnsafe<
-      { entity_name: string; content: string }[]
+    const entityRowsResult = await lightRagPool.query<
+      { entity_name: string; content: string }
     >(
       `SELECT entity_name, content FROM "${entityTable}" WHERE workspace = $1 LIMIT 500`,
-      workspace,
+      [workspace],
     );
+    const entityRows = entityRowsResult.rows;
 
     if (entityRows.length === 0) {
       return new NextResponse(null, { status: 204 });
@@ -221,12 +266,13 @@ export async function GET(_req: NextRequest, ctx: Ctx) {
     const nodeSet = new Set<string>(entityRows.map((r) => r.entity_name));
 
     // Fetch relations
-    const relationRows = await prisma.$queryRawUnsafe<
-      { source_id: string; target_id: string; content: string }[]
+    const relationRowsResult = await lightRagPool.query<
+      { source_id: string; target_id: string; content: string }
     >(
       `SELECT source_id, target_id, content FROM "${relationTable}" WHERE workspace = $1 LIMIT 2000`,
-      workspace,
+      [workspace],
     );
+    const relationRows = relationRowsResult.rows;
 
     // Build nodes: extract description from content (format: "{name}\n{description}<SEP>...")
     const nodes = entityRows.map((r) => {

@@ -36,6 +36,7 @@ dependencies = [
     "boto3>=1.35.0",
     "faster-whisper>=1.2.1",
     "respx>=0.23.1",
+    "neo4j>=6.2.0",
 ]
 
 [project.optional-dependencies]
@@ -50,13 +51,14 @@ mindmap = "rag_mvp.mindmap_cli:cli"
 edu = "edu_agent.cli:cli"
 edu-gateway = "edu_agent.main:main"
 edu-rag-worker = "rag_mvp.worker:main"
+rag-service = "rag_service.main:run"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/rag_mvp", "src/edu_agent"]
+packages = ["src/rag_mvp", "src/edu_agent", "src/rag_service"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

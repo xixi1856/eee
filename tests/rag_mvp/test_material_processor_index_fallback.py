@@ -140,10 +140,14 @@ def test_index_only_fallback_failed_when_cannot_move_to_parsing(monkeypatch) -> 
 
 
 def test_upload_preview_pdf_with_verify_retries_until_visible(monkeypatch) -> None:
-    upload_calls: list[tuple[Path, str]] = []
+    upload_calls: list[tuple[Path, str, str | None]] = []
     exists_checks = iter([False, True])
 
-    monkeypatch.setattr(mp, "_upload_object", lambda p, k: upload_calls.append((p, k)))
+    monkeypatch.setattr(
+        mp,
+        "_upload_object",
+        lambda p, k, *, content_type=None: upload_calls.append((p, k, content_type)),
+    )
     monkeypatch.setattr(mp, "_object_exists", lambda _k: next(exists_checks))
     monkeypatch.setattr(mp.time, "sleep", lambda _s: None)
 
@@ -151,13 +155,20 @@ def test_upload_preview_pdf_with_verify_retries_until_visible(monkeypatch) -> No
     preview_key = "materials/course/material/preview.pdf"
     mp._upload_preview_pdf_with_verify(pdf_file, preview_key, max_attempts=3)
 
-    assert upload_calls == [(pdf_file, preview_key), (pdf_file, preview_key)]
+    assert upload_calls == [
+        (pdf_file, preview_key, "application/pdf"),
+        (pdf_file, preview_key, "application/pdf"),
+    ]
 
 
 def test_upload_preview_pdf_with_verify_raises_after_max_attempts(monkeypatch) -> None:
-    upload_calls: list[tuple[Path, str]] = []
+    upload_calls: list[tuple[Path, str, str | None]] = []
 
-    monkeypatch.setattr(mp, "_upload_object", lambda p, k: upload_calls.append((p, k)))
+    monkeypatch.setattr(
+        mp,
+        "_upload_object",
+        lambda p, k, *, content_type=None: upload_calls.append((p, k, content_type)),
+    )
     monkeypatch.setattr(mp, "_object_exists", lambda _k: False)
     monkeypatch.setattr(mp.time, "sleep", lambda _s: None)
 
@@ -170,7 +181,10 @@ def test_upload_preview_pdf_with_verify_raises_after_max_attempts(monkeypatch) -
     else:
         raise AssertionError("expected RuntimeError")
 
-    assert upload_calls == [(pdf_file, preview_key), (pdf_file, preview_key)]
+    assert upload_calls == [
+        (pdf_file, preview_key, "application/pdf"),
+        (pdf_file, preview_key, "application/pdf"),
+    ]
 
 
 def test_maybe_enqueue_convert_preview_reconciles_when_preview_exists(monkeypatch) -> None:

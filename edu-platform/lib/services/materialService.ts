@@ -819,7 +819,8 @@ export async function openMaterialContentStream(
         await markOfficePreviewReadyAndMaybeQueueParse(m);
         return {
           body: preview.body,
-          contentType: preview.contentType || "application/pdf",
+          // Office preview contract is always a PDF (preview.pdf).
+          contentType: "application/pdf",
           contentDisposition: "inline",
         };
       } catch (e) {
@@ -843,10 +844,11 @@ export async function openMaterialContentStream(
         repair_queue_error: repairQueueError ? repairQueueError.slice(0, 500) : undefined,
       });
     }
-    const { body, contentType } = await readOfficePreviewStreamWithFallback(m);
+    const { body } = await readOfficePreviewStreamWithFallback(m);
     return {
       body,
-      contentType: contentType || "application/pdf",
+      // Office preview contract is always a PDF (preview.pdf).
+      contentType: "application/pdf",
       contentDisposition: "inline",
     };
   }

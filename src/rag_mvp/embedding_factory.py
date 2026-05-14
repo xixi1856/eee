@@ -47,11 +47,15 @@ async def _openai_compatible_embedding_func_with_label(texts: list[str], **kwarg
     key = _effective_embedding_api_key() or None
     token = _llm_role.set(f"embedding/{settings.embedding_model}")
     try:
+        # Explicitly request EMBEDDING_DIM dimensions so the API output always matches the
+        # configured vector size (e.g. text-embedding-v4 defaults to 1536d but we need 1024d).
+        # openai_embed.func accepts `embedding_dim` and internally passes it as `dimensions` to the API.
         return await openai_embed.func(
             texts,
             model=settings.embedding_model,
             base_url=base or None,
             api_key=key,
+            embedding_dim=settings.embedding_dim,
             **kwargs,
         )
     finally:
@@ -68,6 +72,5 @@ def build_embedding_func() -> EmbeddingFunc:
         embedding_dim=settings.embedding_dim,
         max_token_size=settings.embedding_max_tokens,
         func=fn,
-        model_name=settings.embedding_model,
         send_dimensions=False,
     )

@@ -7,7 +7,7 @@ import {
   hashRefreshToken,
   signAccessToken,
 } from "@/lib/auth";
-import { getRefreshTtlSec, getSelfCredentialMaxExpiresMinutes } from "@/lib/config";
+import { getRefreshTtlSec } from "@/lib/config";
 import type {
   ChangePasswordBody,
   LoginBody,
@@ -19,17 +19,6 @@ import type {
 } from "@/lib/dto/auth.dto";
 import { assertPasswordPolicy } from "@/lib/validation/password-policy";
 import { toPublicUser } from "@/lib/services/userService";
-import { allocateRegistrationCredentialInTransaction } from "@/lib/services/credentialService";
-
-async function loadAgentUserIdForUser(
-  platformUserId: string,
-): Promise<string | undefined> {
-  const m = await prisma.agentIdentityMapping.findUnique({
-    where: { platformUserId },
-    select: { agentUserId: true },
-  });
-  return m?.agentUserId;
-}
 
 export async function registerUser(
   body: RegisterBody,
@@ -50,20 +39,7 @@ export async function registerUser(
           isActive: true,
         },
       });
-      let credential: RegisterResponseDto["credential"];
-      if (
-        body.role === UserRole.STUDENT ||
-        body.role === UserRole.TEACHER
-      ) {
-        const maxMin = getSelfCredentialMaxExpiresMinutes();
-        const expiresAt = new Date(Date.now() + maxMin * 60 * 1000);
-        credential = await allocateRegistrationCredentialInTransaction(
-          tx,
-          user.id,
-          expiresAt,
-        );
-      }
-      return { user: toPublicUser(user), credential };
+      return { user: toPublicUser(user) };
     });
   } catch {
     throw new ApiError(
@@ -85,12 +61,10 @@ export async function loginUser(body: LoginBody): Promise<LoginResponseDto> {
   if (!ok) {
     throw new ApiError(401, "UNAUTHORIZED", "Invalid username or password");
   }
-  const agentUserId = await loadAgentUserIdForUser(user.id);
   const token = await signAccessToken({
     sub: user.id,
     username: user.username,
     role: user.role,
-    agent_user_id: agentUserId,
   });
   const refreshPlain = generateRefreshTokenPlain();
   const refreshHash = hashRefreshToken(refreshPlain);
@@ -138,12 +112,10 @@ export async function refreshSession(
     if (!user) {
       throw new ApiError(401, "UNAUTHORIZED", "User no longer active");
     }
-    const agentUserId = await loadAgentUserIdForUser(user.id);
     const token = await signAccessToken({
       sub: user.id,
       username: user.username,
       role: user.role,
-      agent_user_id: agentUserId,
     });
     const refreshPlain = generateRefreshTokenPlain();
     const refreshHash = hashRefreshToken(refreshPlain);

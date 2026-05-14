@@ -6,9 +6,6 @@ export { hashPassword, verifyPassword } from "@/lib/password";
 export {
   signAccessToken,
   verifyAccessToken,
-  signChannelToken,
-  verifyChannelToken,
   type AccessJwtPayload,
-  type ChannelJwtPayload,
 } from "@/lib/jwt";
 export { generateRefreshTokenPlain, hashRefreshToken } from "@/lib/refresh-token";

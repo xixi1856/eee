@@ -48,7 +48,6 @@ const STATUS_LABELS: Record<string, string> = {
 
 export default function AssignmentDetailPage() {
   const { courseId, assignmentId } = useParams<{ courseId: string; assignmentId: string }>();
-  const router = useRouter();
   const { notification, notify } = useNotify();
 
   const [loading, setLoading] = useState(true);
@@ -119,7 +118,7 @@ export default function AssignmentDetailPage() {
         qId,
         qType: q.type,
         objective: q.objective,
-        entityName: q.entity ?? "",
+        entityNames: q.entities ?? [],
         extraRequirements: extraRequirements || undefined,
         currentQuestion: q.question || undefined,
       };
@@ -281,7 +280,7 @@ export default function AssignmentDetailPage() {
         <div className="flex flex-col items-center justify-center py-16 gap-3 text-muted-foreground">
           <Loader2 size={36} className="animate-spin text-primary" />
           <p className="text-sm font-medium">AI 正在生成作业，请稍候…</p>
-          <p className="text-xs">通常需要 30–120 秒，页面将自动刷新</p>
+          <p className="text-xs"> 生成成功后页面将自动刷新</p>
         </div>
       )}
 

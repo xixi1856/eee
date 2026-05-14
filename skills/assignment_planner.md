@@ -20,7 +20,12 @@ always_inject: false
 |------|------|------|
 | title | 作业标题 | 第3章 传输层协议作业 |
 | topic_hint | RAG检索关键词（5-20字） | TCP可靠传输 流量控制 拥塞控制 |
-| difficulty | 难度 easy/medium/hard | medium |
+| difficulty | 推理步骤数 easy/medium/hard | medium |
+
+> **difficulty 含义说明**：difficulty 代表学生答题所需的推理步骤数，而非主观感受：
+> - **easy**：1 步 — 直接回忆或识别单一知识点，无需推导
+> - **medium**：2 步 — 理解后推导，或将知识应用到给定场景
+> - **hard**：3 步+ — 多跳推理，需连接多个中间结论或跨概念综合
 | count | 题目数量（1-20） | 10 |
 | type_weights | 题型权重（总和=1） | {"single_choice": 0.4, ...} |
 | objective_weights | 认知层次权重（总和=1） | {"knowledge": 0.3, ...} |

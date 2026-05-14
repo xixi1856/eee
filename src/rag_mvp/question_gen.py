@@ -218,10 +218,10 @@ def _pick_multi_entity_context(
     text_chunks: dict,
     graphml_path: Path,
     objective: str,
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[str], list[str]]:
     """Build context aggregating multiple entities based on *objective*.
 
-    Returns (context_text, all_chunk_ids_used).
+    Returns (context_text, all_chunk_ids_used, entity_names_used).
 
     Context size and entity count depend on *objective*:
       - knowledge / comprehension / innovation: single entity, max 1500-2000 chars
@@ -240,7 +240,7 @@ def _pick_multi_entity_context(
 
     if objective in ("knowledge", "comprehension", "innovation"):
         context = _pick_context(primary_chunk_ids, text_chunks, max_chars)
-        return context, primary_chunk_ids[:3]
+        return context, primary_chunk_ids[:3], [entity_name]
 
     # application: find entities sharing chunks with the primary entity
     if objective == "application":
@@ -274,7 +274,7 @@ def _pick_multi_entity_context(
             parts.append(f'\u300c\u5173\u4e8e“{name}”\u300d\n{chunk_text}')
 
     combined = "\n\n".join(parts)[:max_chars]
-    return combined, all_chunk_ids[:6]
+    return combined, all_chunk_ids[:6], all_names
 
 
 # ---------------------------------------------------------------------------
@@ -393,9 +393,13 @@ async def _call_question_llm(
     return parsed
 
 
-def _build_prompt(entity: str, context: str, q_type: str, objective: str = "knowledge") -> str:
+_DIFFICULTY_STEPS: dict[str, int] = {"easy": 1, "medium": 2, "hard": 3}
+
+
+def _build_prompt(entity: str, context: str, q_type: str, objective: str = "knowledge", difficulty: str = "medium") -> str:
     label = _TYPE_LABELS[q_type]
     obj_instruction = _OBJECTIVE_INSTRUCTIONS.get(objective, "")
+    expected_steps = _DIFFICULTY_STEPS.get(difficulty, 2)
 
     prompt = (
         f'请根据以下原文内容，以"{entity}"为核心知识点，出一道{label}。\n\n'
@@ -405,8 +409,13 @@ def _build_prompt(entity: str, context: str, q_type: str, objective: str = "know
         f"- 核心知识点：{entity}\n"
         f"- 题目类型：{label}\n"
         f"- 考查方向：{OBJECTIVE_TYPES.get(objective, '')}\n"
+        f"- 目标难度：{difficulty}（期望推理步骤数：{expected_steps} 步）\n"
+        f"  · easy = 1步：直接回忆/识别单一概念\n"
+        f"  · medium = 2步：理解后推导，或将知识应用到给定场景\n"
+        f"  · hard = 3步+：多跳推理，需连接多个中间结论或跨概念综合\n"
         f"- 题干必须自洽：禁止用「原文/上文/下图/见表/该材料」等指代而未给出具体信息；"
         f"需要的事实请用简短陈述直接写在题干中\n"
+        f"- 请在 JSON 输出中如实填写 reasoning_steps 字段（你实际用了几步推理）\n"
     )
 
     if q_type == "single_choice":
@@ -415,6 +424,7 @@ def _build_prompt(entity: str, context: str, q_type: str, objective: str = "know
             '{"question": "题目内容（不含选项）", '
             '"options": ["A. ...", "B. ...", "C. ...", "D. ..."], '
             '"answer": "A", '
+            '"reasoning_steps": 2, '
             '"explanation": "解析，引用原文说明为什么选A"}'
         )
     elif q_type == "multi_choice":
@@ -423,6 +433,7 @@ def _build_prompt(entity: str, context: str, q_type: str, objective: str = "know
             '{"question": "题目内容（不含选项）", '
             '"options": ["A. ...", "B. ...", "C. ...", "D. ..."], '
             '"answer": "A,C", '
+            '"reasoning_steps": 2, '
             '"explanation": "解析，引用原文说明为什么选这几项"}'
         )
     elif q_type == "fill_blank":
@@ -431,6 +442,7 @@ def _build_prompt(entity: str, context: str, q_type: str, objective: str = "know
             '{"question": "题目内容，用______表示空白处", '
             '"options": [], '
             '"answer": "填入空白处的正确答案", '
+            '"reasoning_steps": 1, '
             '"explanation": "解析，引用原文说明答案依据"}'
         )
     else:  # short_answer
@@ -439,6 +451,7 @@ def _build_prompt(entity: str, context: str, q_type: str, objective: str = "know
             '{"question": "简答题问题内容", '
             '"options": [], '
             '"answer": "完整参考答案", '
+            '"reasoning_steps": 2, '
             '"explanation": "评分要点，引用原文关键句"}'
         )
 
@@ -479,6 +492,8 @@ async def _generate_one(
     score: float,
     chunk_ids: list[str],
     objective: str = "knowledge",
+    entity_names: list[str] | None = None,
+    difficulty: str = "medium",
 ) -> dict[str, Any] | None:
     """Call LLM and parse one question. Returns None on any failure.
 
@@ -493,7 +508,7 @@ async def _generate_one(
     else:
         enriched_context = context
 
-    prompt = _build_prompt(entity_name, enriched_context, q_type, objective)
+    prompt = _build_prompt(entity_name, enriched_context, q_type, objective, difficulty)
     parsed = await _call_question_llm(entity_name, q_type, prompt, _SYSTEM_PROMPT)
     if parsed is None:
         return None
@@ -520,9 +535,10 @@ async def _generate_one(
         "id":               q_id,
         "type":             q_type,
         "objective":        objective,
-        "entity":           entity_name,
-        "tags":             [entity_name],
+        "entities":         entity_names if entity_names is not None else [entity_name],
+        "tags":             entity_names if entity_names is not None else [entity_name],
         "importance_score": round(score, 2),
+        "reasoning_steps":  int(parsed.get("reasoning_steps") or _DIFFICULTY_STEPS.get(difficulty, 2)),
         "question":         question_text,
         "options":          parsed.get("options", []),
         "answer":           parsed.get("answer", ""),
@@ -673,7 +689,7 @@ def generate(
 
         async def _guarded(entity: dict, q_objective: str, q_type: str, idx: int) -> dict[str, Any] | None:
             async with sem:
-                context, ctx_chunk_ids = _pick_multi_entity_context(
+                context, ctx_chunk_ids, ctx_entity_names = _pick_multi_entity_context(
                     entity_name=entity["name"],
                     entity_chunks=entity_chunks,
                     text_chunks=text_chunks,
@@ -691,6 +707,7 @@ def generate(
                     score=entity["score"],
                     chunk_ids=ctx_chunk_ids,
                     objective=q_objective,
+                    entity_names=ctx_entity_names,
                 )
 
         tasks = [
@@ -748,7 +765,7 @@ def save_output(result: dict[str, Any], output_dir: Path) -> tuple[Path, Path]:
             f"## 第 {q['id']} 题  [{type_label}]"
         )
         lines.append(header)
-        lines.append(f"\n*核心知识点：{q['entity']}（重要性分：{q['importance_score']}）*\n")
+        lines.append(f"\n*核心知识点：{', '.join(q.get('entities', [q.get('entity', '')]))}（重要性分：{q['importance_score']}）*\n")
         lines.append(f"**{q['question']}**\n")
         if q.get("options"):
             for opt in q["options"]:

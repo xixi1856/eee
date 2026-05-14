@@ -22,6 +22,7 @@ import type {
   CreateCourseBody,
   CreateLessonBody,
   LessonDto,
+  ReorderLessonsBody,
   UpdateCourseBody,
   UpdateLessonBody,
 } from "@/lib/dto/course.dto";
@@ -400,6 +401,36 @@ export async function updateLesson(
     data,
   });
   return toLessonDto(l);
+}
+
+export async function reorderLessons(
+  userId: string,
+  role: UserRole,
+  courseId: string,
+  body: ReorderLessonsBody,
+): Promise<void> {
+  await assertTeacherOfCourse(userId, role, courseId);
+  if (!Array.isArray(body.orders) || body.orders.length === 0) return;
+  // Verify all lessons belong to this course (prevent cross-course order tampering)
+  const ids = body.orders.map((o) => o.id);
+  const existing = await prisma.lesson.findMany({
+    where: { id: { in: ids }, courseId, isDeleted: false },
+    select: { id: true },
+  });
+  const existingIds = new Set(existing.map((l) => l.id));
+  for (const o of body.orders) {
+    if (!existingIds.has(o.id)) {
+      throw new ApiError(404, "NOT_FOUND", `Lesson ${o.id} not found in this course`);
+    }
+  }
+  await prisma.$transaction(
+    body.orders.map((o) =>
+      prisma.lesson.update({
+        where: { id: o.id },
+        data: { orderIndex: o.order_index },
+      }),
+    ),
+  );
 }
 
 export async function deleteLesson(

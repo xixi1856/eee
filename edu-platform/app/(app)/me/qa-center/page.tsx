@@ -11,6 +11,9 @@ import {
   X,
   FileText,
 } from "lucide-react";
+import Image from "next/image";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Input } from "@/components/ui/input";
@@ -22,6 +25,7 @@ type CitationPanel = {
   chunkId?: string;
   sourceLabel?: string;
   chunkText?: string;
+  image_urls?: Array<{ page_idx: number; url: string }>;
 };
 
 type ThreadRow = {
@@ -328,14 +332,37 @@ export default function QaCenterPage() {
                 </div>
                 <div className="flex-1 min-h-0 overflow-y-auto">
                   {citationPanel.chunkText ? (
-                    <div className="p-4 space-y-3">
+                    <div className="p-4 space-y-4">
                       <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
                         <FileText size={13} />
                         <span>检索文本块</span>
                       </div>
-                      <pre className="whitespace-pre-wrap text-xs leading-relaxed font-mono bg-muted/40 rounded-lg p-3 border border-border text-foreground">
-                        {citationPanel.chunkText}
-                      </pre>
+                      <div className="prose prose-sm dark:prose-invert max-w-none rounded-lg bg-muted/40 border border-border p-3 text-xs leading-relaxed">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {citationPanel.chunkText}
+                        </ReactMarkdown>
+                      </div>
+                      {(citationPanel.image_urls?.length ?? 0) > 0 && (
+                        <div className="space-y-2">
+                          <p className="text-xs text-muted-foreground">相关图片</p>
+                          <div className="flex flex-col gap-3">
+                            {citationPanel.image_urls!.map((img, idx) => (
+                              <div key={idx} className="space-y-1">
+                                <p className="text-[10px] text-muted-foreground">第 {img.page_idx + 1} 页</p>
+                                <Image
+                                  src={img.url}
+                                  alt={`第 ${img.page_idx + 1} 页`}
+                                  width={0}
+                                  height={0}
+                                  unoptimized
+                                  style={{ width: "100%", height: "auto" }}
+                                  className="rounded border border-border object-contain"
+                                />
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   ) : (
                     <div className="flex flex-col items-center justify-center h-full min-h-[120px] text-muted-foreground text-xs gap-2 p-6 text-center">

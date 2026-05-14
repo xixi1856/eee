@@ -134,7 +134,7 @@ export function AddQuestionDialog({
       const result = await onPreview({
         qType,
         objective,
-        entityName: entityName.trim(),
+        entityNames: [entityName.trim()].filter(Boolean),
         questionStem: questionStem.trim(),
         answerHint: answerHint.trim(),
       });

@@ -355,10 +355,18 @@ def _convert_to_pdf(local_file: Path, out_dir: Path) -> Path:
     return pdf_path
 
 
-def _upload_object(local_path: Path, minio_path: str) -> None:
+def _upload_object(
+    local_path: Path,
+    minio_path: str,
+    *,
+    content_type: str | None = None,
+) -> None:
     """Upload a local file to MinIO at the given object key."""
     client = _s3_client()
-    client.upload_file(str(local_path), _bucket(), minio_path)
+    kwargs: dict[str, Any] = {}
+    if content_type:
+        kwargs["ExtraArgs"] = {"ContentType": content_type}
+    client.upload_file(str(local_path), _bucket(), minio_path, **kwargs)
 
 
 def _object_exists(minio_path: str) -> bool:
@@ -385,7 +393,7 @@ def _upload_preview_pdf_with_verify(
     last_error: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            _upload_object(pdf_file, preview_key)
+            _upload_object(pdf_file, preview_key, content_type="application/pdf")
             if _object_exists(preview_key):
                 return
             raise RuntimeError(
@@ -723,6 +731,61 @@ def _upload_material_images_to_minio(
     logger.info("Uploaded {} images to MinIO for material {}", len(uploaded), material_id)
 
 
+def _record_chunk_page_mappings(
+    material_id: str,
+    conn: psycopg.Connection,
+    scan_dir: Path,
+) -> None:
+    """Record chunk_id → page_idx for multimodal content items (image, table, equation, chart).
+
+    Text items are concatenated before chunking so their per-page boundaries are
+    difficult to recover; only multimodal surrogate chunks are tracked here since
+    those are the items paired with visual images in the citation panel.
+    chunk_id = compute_mdhash_id(surrogate_text, prefix="chunk-") — same formula
+    LightRAG uses when storing chunks in lightrag_vdb_chunks.
+    """
+    from lightrag.utils import compute_mdhash_id
+    from rag_mvp.multimodal_surrogate_chunks import content_item_to_surrogate_text
+
+    _VISUAL_TYPES = frozenset({"image", "table", "equation", "chart"})
+
+    mappings: list[tuple[str, str, int]] = []  # (material_id, chunk_id, page_idx)
+    for json_path in scan_dir.rglob("*_content_list.json"):
+        if "_content_list_v2" in json_path.name:
+            continue
+        try:
+            raw: list = json.loads(json_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for item in raw:
+            if str(item.get("type", "")).strip() not in _VISUAL_TYPES:
+                continue
+            page_idx = item.get("page_idx")
+            if page_idx is None:
+                continue
+            surrogate = content_item_to_surrogate_text(item).strip()
+            if not surrogate:
+                continue
+            chunk_id = compute_mdhash_id(surrogate, prefix="chunk-")
+            mappings.append((material_id, chunk_id, int(page_idx)))
+
+    if not mappings:
+        logger.debug("No visual chunk-page mappings found for material {}", material_id)
+        return
+
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO chunk_page_mappings (material_id, chunk_id, page_idx)
+                VALUES (%s::uuid, %s, %s)
+                ON CONFLICT (material_id, chunk_id) DO UPDATE SET page_idx = EXCLUDED.page_idx
+                """,
+                mappings,
+            )
+    logger.info("Recorded {} chunk-page mappings for material {}", len(mappings), material_id)
+
+
 def _run_material_download_parse_and_ingest(
     conn: psycopg.Connection,
     material_id: str,
@@ -817,6 +880,12 @@ def _run_material_download_parse_and_ingest(
             text_only,
             skip_kg,
         )
+
+        # Record chunk→page_idx mappings (best-effort; used for per-page image filtering).
+        try:
+            _record_chunk_page_mappings(material_id, conn, settings.output_dir / local_file.stem)
+        except Exception as cpm_exc:
+            logger.warning("chunk_page_mappings recording failed for {} (non-fatal): {}", material_id, cpm_exc)
 
         with conn.transaction():
             ok = update_material_status(

@@ -1,4 +1,4 @@
-# Local PostgreSQL for edu-platform (optional).
+# Local services for edu-platform.
 # Usage: docker compose up -d
 # Then set DATABASE_URL in .env to match POSTGRES_* below.
 
@@ -15,34 +15,29 @@ services:
       - "5432:5432"
     volumes:
       - edu_platform_pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U edu -d edu_platform"]
       interval: 5s
       timeout: 5s
       retries: 5
-# services:
-#   postgres:
-#     build:
-#       context: ./postgres
-#       dockerfile: Dockerfile
-#     image: edu-platform-postgres:pg16-age-pgvector
-#     container_name: edu-platform-postgres
-#     restart: unless-stopped
-#     environment:
-#       POSTGRES_USER: edu
-#       POSTGRES_PASSWORD: edu
-#       POSTGRES_DB: edu_platform
-#     ports:
-#       - "5432:5432"
-#     volumes:
-#       - edu_platform_pgdata:/var/lib/postgresql/data
-#       # 可选：挂载自定义初始化脚本
-#       # - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
-#     healthcheck:
-#       test: ["CMD-SHELL", "pg_isready -U edu -d edu_platform"]
-#       interval: 5s
-#       timeout: 5s
-#       retries: 5
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: edu-platform-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/edu_neo4j_password
+    ports:
+      - "7474:7474"   # 浏览器管理界面
+      - "7687:7687"   # Bolt 协议（LightRAG 使用）
+    volumes:
+      - edu_platform_neo4jdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -O /dev/null -q http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis:
     image: redis:7-alpine
@@ -68,7 +63,62 @@ services:
     volumes:
       - edu_platform_minio:/data
 
+  rag-service:
+    build:
+      context: ..
+      dockerfile: edu-platform/Dockerfile.rag-service
+    container_name: edu-platform-rag-service
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      # Keep rag-service container-safe defaults (service names on compose network).
+      # This avoids .env localhost values accidentally breaking in-container connections.
+      DATABASE_URL: ${RAG_SERVICE_DATABASE_URL:-postgresql://edu:edu@postgres:5432/edu_platform?schema=public}
+      LIGHTRAG_PG_DSN: ${RAG_SERVICE_LIGHTRAG_PG_DSN:-}
+      RAG_SERVICE_API_KEY: ${RAG_SERVICE_API_KEY}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      EMBEDDING_MODE: ${EMBEDDING_MODE:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  cron-worker:
+    image: node:22-alpine
+    container_name: edu-platform-cron-worker
+    restart: unless-stopped
+    working_dir: /app/edu-platform
+    command: ["sh", "-c", "npm ci && npx tsx scripts/cron-worker.ts"]
+    volumes:
+      - ..:/app
+      - edu_platform_cron_node_modules:/app/edu-platform/node_modules
+    environment:
+      # Keep cron-worker container-safe defaults (service names on compose network).
+      # This avoids .env localhost values accidentally breaking in-container connections.
+      DATABASE_URL: ${CRON_WORKER_DATABASE_URL:-postgresql://edu:edu@postgres:5432/edu_platform?schema=public}
+      REDIS_URL: ${CRON_WORKER_REDIS_URL:-redis://redis:6379}
+      CRON_STREAM_NAME: ${CRON_STREAM_NAME:-edu:cron:stream}
+      CRON_STREAM_GROUP: ${CRON_STREAM_GROUP:-edu-cron-workers}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o}
+      RAG_SERVICE_URL: ${CRON_WORKER_RAG_SERVICE_URL:-http://rag-service:8001}
+      RAG_SERVICE_API_KEY: ${RAG_SERVICE_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
 volumes:
   edu_platform_pgdata:
   edu_platform_redisdata:
   edu_platform_minio:
+  edu_platform_neo4jdata:
+  edu_platform_cron_node_modules:

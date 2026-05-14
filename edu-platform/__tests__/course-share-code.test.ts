@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   normalizeCourseShareCode,
   randomCourseShareCode,
-} from "@/lib/course-share-code";
+} from "../lib/course-share-code";
 
 const ALPHABET = /^[0-9A-Z]+$/;
 

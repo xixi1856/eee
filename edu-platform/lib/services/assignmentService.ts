@@ -2,7 +2,7 @@ import { prisma } from "@/lib/db";
 import { getRedis } from "@/lib/redis";
 import { ApiError } from "@/lib/http/api-error";
 import { assertTeacherOfCourse, assertUuid } from "@/lib/course-access";
-import { getEduAgentBaseUrl, getEduAgentApiKey } from "@/lib/config";
+
 import { AssignmentStatus, UserRole } from "@prisma/client";
 import type {
   AssignmentDetailDto,
@@ -151,6 +151,7 @@ export async function triggerAssignmentGeneration(
       teacher_request: body.teacherRequest.trim(),
       structured_params: body.structuredParams ? JSON.stringify(body.structuredParams) : "",
     });
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   } catch (err) {
     // Roll back DB record if we can't push to Redis
     await prisma.assignment.delete({ where: { id: assignment.id } }).catch(() => {});
@@ -233,20 +234,17 @@ export async function regenerateQuestion(
   if (assignment.status !== AssignmentStatus.DRAFT)
     throw new ApiError(409, "CONFLICT", "Can only regenerate questions for DRAFT assignments");
 
-  const agentBase = getEduAgentBaseUrl();
-  if (!agentBase)
-    throw new ApiError(503, "AGENT_UNAVAILABLE", "EDU_AGENT_BASE_URL is not configured");
-
+  const ragBase = (process.env.RAG_SERVICE_URL ?? "http://localhost:8001").replace(/\/+$/, "");
+  const ragKey = process.env.RAG_SERVICE_API_KEY?.trim();
   const headers = new Headers({ "Content-Type": "application/json" });
-  const apiKey = getEduAgentApiKey();
-  if (apiKey) headers.set("Authorization", `Bearer ${apiKey}`);
+  if (ragKey) headers.set("x-internal-key", ragKey);
 
-  const res = await fetch(`${agentBase}/v1/assignment/regenerate-question`, {
+  const res = await fetch(`${ragBase}/rag/assignment/regenerate-question`, {
     method: "POST",
     headers,
     body: JSON.stringify({
       course_id: courseId,
-      entity_name: body.entityName,
+      entity_names: body.entityNames,
       q_type: body.qType,
       objective: body.objective,
       q_id: body.qId,
@@ -268,9 +266,9 @@ export async function regenerateQuestion(
   // If question id not found (new question), append it
   if (!updated.find((q) => q.id === body.qId)) updated.push({ ...newQuestion, score: 5 });
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   await prisma.assignment.update({
     where: { id: assignmentId },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     data: { questions: updated as any },
   });
 
@@ -289,20 +287,17 @@ export async function previewTeacherQuestion(
   if (assignment.status !== AssignmentStatus.DRAFT)
     throw new ApiError(409, "CONFLICT", "Can only preview questions for DRAFT assignments");
 
-  const agentBase = getEduAgentBaseUrl();
-  if (!agentBase)
-    throw new ApiError(503, "AGENT_UNAVAILABLE", "EDU_AGENT_BASE_URL is not configured");
-
+  const ragBase = (process.env.RAG_SERVICE_URL ?? "http://localhost:8001").replace(/\/+$/, "");
+  const ragKey = process.env.RAG_SERVICE_API_KEY?.trim();
   const headers = new Headers({ "Content-Type": "application/json" });
-  const apiKey = getEduAgentApiKey();
-  if (apiKey) headers.set("Authorization", `Bearer ${apiKey}`);
+  if (ragKey) headers.set("x-internal-key", ragKey);
 
-  const res = await fetch(`${agentBase}/v1/assignment/complete-question`, {
+  const res = await fetch(`${ragBase}/rag/assignment/complete-question`, {
     method: "POST",
     headers,
     body: JSON.stringify({
       course_id: courseId,
-      entity_name: body.entityName,
+      entity_names: body.entityNames,
       question_stem: body.questionStem,
       answer_hint: body.answerHint ?? "",
       q_type: body.qType,
@@ -330,24 +325,21 @@ export async function completeTeacherQuestion(
   if (assignment.status !== AssignmentStatus.DRAFT)
     throw new ApiError(409, "CONFLICT", "Can only add questions to DRAFT assignments");
 
-  const agentBase = getEduAgentBaseUrl();
-  if (!agentBase)
-    throw new ApiError(503, "AGENT_UNAVAILABLE", "EDU_AGENT_BASE_URL is not configured");
-
+  const ragBase = (process.env.RAG_SERVICE_URL ?? "http://localhost:8001").replace(/\/+$/, "");
+  const ragKey = process.env.RAG_SERVICE_API_KEY?.trim();
   const headers = new Headers({ "Content-Type": "application/json" });
-  const apiKey = getEduAgentApiKey();
-  if (apiKey) headers.set("Authorization", `Bearer ${apiKey}`);
+  if (ragKey) headers.set("x-internal-key", ragKey);
 
   // Allocate a new question ID (max existing + 1)
   const questions = (assignment.questions ?? []) as QuestionItem[];
   const newQId = questions.length > 0 ? Math.max(...questions.map((q) => q.id)) + 1 : 1;
 
-  const res = await fetch(`${agentBase}/v1/assignment/complete-question`, {
+  const res = await fetch(`${ragBase}/rag/assignment/complete-question`, {
     method: "POST",
     headers,
     body: JSON.stringify({
       course_id: courseId,
-      entity_name: body.entityName,
+      entity_names: body.entityNames,
       question_stem: body.questionStem,
       answer_hint: body.answerHint ?? "",
       q_type: body.qType,
@@ -365,9 +357,9 @@ export async function completeTeacherQuestion(
   const score = body.score ?? 5;
   const appended = [...questions, { ...newQuestion, score }];
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   await prisma.assignment.update({
     where: { id: assignmentId },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     data: { questions: appended as any },
   });
 

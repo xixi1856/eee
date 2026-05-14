@@ -217,17 +217,18 @@ model RefreshToken {
 
 /// One Agent HTTP session per platform user per course (B3 isolation).
 model CourseChatSession {
-  id             String   @id @default(uuid()) @db.Uuid
-  courseId       String   @map("course_id") @db.Uuid
-  studentId      String   @map("student_id") @db.Uuid
-  agentSessionId String   @unique @map("agent_session_id") @db.VarChar(255)
-  createdAt      DateTime @default(now()) @map("created_at")
-  updatedAt      DateTime @updatedAt @map("updated_at")
+  id             String    @id @default(uuid()) @db.Uuid
+  courseId       String    @map("course_id") @db.Uuid
+  studentId      String    @map("student_id") @db.Uuid
+  agentSessionId String    @unique @map("agent_session_id") @db.VarChar(255)
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+  deletedAt      DateTime? @map("deleted_at")
 
   course  Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
   student User   @relation(fields: [studentId], references: [id], onDelete: Cascade)
 
-  @@unique([courseId, studentId])
+  @@index([courseId, studentId])
   @@index([studentId])
   @@map("course_chat_sessions")
 }

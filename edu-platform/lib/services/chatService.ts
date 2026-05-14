@@ -4,6 +4,8 @@ import { prisma } from "@/lib/db";
 const px = prisma as any;
 import { ApiError } from "@/lib/http/api-error";
 import { randomUUID } from "crypto";
+import OpenAI from "openai";
+import { getLLMClient, getTitleModel, getVisionModel, getChatModel, getRoleExtraBody } from "@/lib/agent/llm-registry";
 import { createReActStream } from "@/lib/agent/react-loop";
 import { sessionStore } from "@/lib/agent/session-store";
 import type { Message } from "@/lib/agent/types";
@@ -158,31 +160,36 @@ export async function getOrCreateCourseChatSession(
   courseId: string,
   platformStudentId: string,
 ): Promise<string> {
-  const row = await prisma.courseChatSession.findUnique({
-    where: {
-      courseId_studentId: { courseId, studentId: platformStudentId },
-    },
+  const row = await prisma.courseChatSession.findFirst({
+    where: { courseId, studentId: platformStudentId, deletedAt: null },
+    orderBy: { createdAt: "asc" },
   });
   if (row) return row.agentSessionId;
   const agentSessionId = randomUUID();
   try {
     await prisma.courseChatSession.create({
-      data: {
-        courseId,
-        studentId: platformStudentId,
-        agentSessionId,
-      },
+      data: { courseId, studentId: platformStudentId, agentSessionId },
     });
   } catch {
     // concurrent create — fetch again
-    const again = await prisma.courseChatSession.findUnique({
-      where: {
-        courseId_studentId: { courseId, studentId: platformStudentId },
-      },
+    const again = await prisma.courseChatSession.findFirst({
+      where: { courseId, studentId: platformStudentId, deletedAt: null },
+      orderBy: { createdAt: "asc" },
     });
     if (again) return again.agentSessionId;
     throw new ApiError(500, "INTERNAL_ERROR", "Failed to persist chat session");
   }
+  return agentSessionId;
+}
+
+export async function createNewCourseChatSession(
+  courseId: string,
+  platformStudentId: string,
+): Promise<string> {
+  const agentSessionId = randomUUID();
+  await prisma.courseChatSession.create({
+    data: { courseId, studentId: platformStudentId, agentSessionId },
+  });
   return agentSessionId;
 }
 
@@ -453,7 +460,7 @@ function createB3PersistTransform(
     async flush() {
       if (opts.persist) {
         try {
-          const model = (process.env.LLM_MODEL ?? "unknown").slice(0, 100);
+          const model = getChatModel().slice(0, 100);
           await prisma.qaLog.create({
             data: {
               courseId: opts.courseId,
@@ -474,6 +481,12 @@ function createB3PersistTransform(
               citations: collectedCitations,
             } as Parameters<typeof prisma.qaLog.create>[0]["data"],
           });
+          // Fire-and-forget: set session title on the first message
+          void maybeAutoTitleSession(
+            opts.sessionId,
+            opts.platformStudentId,
+            opts.question,
+          );
         } catch (err) {
           console.error("[chatService] QaLog persist failed:", err);
         }
@@ -495,6 +508,114 @@ function createB3PersistTransform(
   });
 }
 
+// ---- Vision pre-processing ------------------------------------------------
+
+/**
+ * If there are image attachments, call the vision model (e.g. qwen3.6-plus) first
+ * to generate a text description, then prepend it to the user message.
+ * Falls back to the original message on any error.
+ */
+async function describeImageAttachments(
+  attachments: AttachmentParam[] | undefined,
+  userMessage: string,
+): Promise<string> {
+  const imageAtts = attachments?.filter((a) => a.mime_type.startsWith("image/")) ?? [];
+  if (imageAtts.length === 0) return userMessage;
+
+  try {
+    const client = getLLMClient("vision");
+    const model = getVisionModel();
+
+    const contentParts: OpenAI.Chat.ChatCompletionContentPart[] = [
+      { type: "text", text: "请详细描述以下图片的内容，包括文字、图表、示意图、公式等所有可见信息：" },
+      ...imageAtts.map((a) => ({
+        type: "image_url" as const,
+        image_url: { url: a.presigned_url },
+      })),
+    ];
+
+    const resp = await client.chat.completions.create({
+      model,
+      messages: [{ role: "user", content: contentParts }],
+      max_tokens: 1000,
+    });
+
+    const description = resp.choices[0]?.message?.content?.trim();
+    if (!description) return userMessage;
+
+    return `[图片内容理解]\n${description}\n\n${userMessage}`;
+  } catch (err) {
+    console.error("[chatService] vision pre-process failed:", err);
+    return userMessage;
+  }
+}
+
+// ---- Auto-title for new sessions -----------------------------------------
+
+async function generateChatTitle(question: string): Promise<string | null> {
+  try {
+    const client = getLLMClient("title");
+    const model = getTitleModel();
+    const titleExtraBody = getRoleExtraBody("title");
+    const resp = await client.chat.completions.create({
+      model,
+      messages: [
+        {
+          role: "user",
+          content: `根据下面这条用户消息，生成一个简洁的对话标题（不超过20字，不要加引号，不要加标点在开头结尾）：\n\n${question.slice(0, 500)}`,
+        },
+      ],
+      max_tokens: 50,
+      temperature: 0.3,
+      stream: false,
+      // Disable DeepSeek thinking mode
+      ...titleExtraBody,
+    } as OpenAI.Chat.ChatCompletionCreateParamsNonStreaming);
+    const title = resp.choices[0]?.message?.content?.trim();
+    return title ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function maybeAutoTitleSession(
+  sessionId: string,
+  studentId: string,
+  question: string,
+): Promise<void> {
+  try {
+    const count = await prisma.qaLog.count({
+      where: { sessionId, studentId, deletedAt: null, answer: { not: null } },
+    });
+    if (count !== 1) return; // Only title the first completed message
+    const existing = await px.chatThreadTitleOverride.findFirst({
+      where: { studentId, sessionId },
+    });
+    if (existing) return;
+    const qcs = await px.qaCenterSession.findFirst({
+      where: { agentSessionId: sessionId, studentId, deletedAt: null },
+    });
+    if (qcs?.title) return;
+    const title = await generateChatTitle(question);
+    if (!title) return;
+    // For QaCenterSession: update title directly; for course sessions: upsert override.
+    if (qcs) {
+      await px.qaCenterSession.update({
+        where: { id: qcs.id },
+        data: { title },
+      });
+    } else {
+      await px.chatThreadTitleOverride.upsert({
+        where: { studentId_sessionId: { studentId, sessionId } },
+        create: { studentId, sessionId, title },
+        update: { title },
+      });
+    }
+  } catch (err) {
+    console.error("[chatService] auto-title failed:", err);
+  }
+}
+
 // ---- Course chat -----------------------------------------------------------
 
 export type CourseChatParams = {
@@ -509,6 +630,8 @@ export type CourseChatParams = {
   debugTrace?: boolean;
   /** When set, truncate session history to this many messages before processing (used for regenerate/edit). */
   trimHistoryTo?: number;
+  /** When set, route message to this specific session instead of the default get-or-create session. */
+  sessionId?: string | null;
 };
 
 /**
@@ -524,7 +647,16 @@ export async function courseChatSseResponse(
   if (!user) {
     throw new ApiError(404, "NOT_FOUND", "User not found");
   }
-  const sessionId = await getOrCreateCourseChatSession(p.courseId, p.platformStudentId);
+  let sessionId: string;
+  if (p.sessionId) {
+    const row = await prisma.courseChatSession.findFirst({
+      where: { agentSessionId: p.sessionId, studentId: p.platformStudentId, courseId: p.courseId, deletedAt: null },
+    });
+    if (!row) throw new ApiError(403, "FORBIDDEN", "Invalid session_id");
+    sessionId = p.sessionId;
+  } else {
+    sessionId = await getOrCreateCourseChatSession(p.courseId, p.platformStudentId);
+  }
 
   // Load session history + memory
   const [history, profile] = await Promise.all([
@@ -542,6 +674,7 @@ export async function courseChatSseResponse(
     .catch(() => "");
 
   const skills = getSkillsLoader().load();
+  const userMessage = await describeImageAttachments(p.attachments, p.message);
   const config = buildAgentConfig(
     p.attachments?.map((a) => ({
       id: a.id,
@@ -552,7 +685,7 @@ export async function courseChatSseResponse(
   );
 
   const stream = createReActStream({
-    userMessage: p.message,
+    userMessage,
     config,
     toolRegistry,
     ctx: {
@@ -678,6 +811,7 @@ export async function qaCenterChatSseResponse(
     .catch(() => "");
 
   const skills = getSkillsLoader().load();
+  const userMessage = await describeImageAttachments(p.attachments, p.message);
   const config = buildAgentConfig(
     p.attachments?.map((a) => ({
       id: a.id,
@@ -688,7 +822,7 @@ export async function qaCenterChatSseResponse(
   );
 
   const stream = createReActStream({
-    userMessage: p.message,
+    userMessage,
     config,
     toolRegistry,
     ctx: {

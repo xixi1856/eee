@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { ChevronLeft, LayoutGrid } from "lucide-react";
+import { ChevronLeft, LayoutGrid, MessageSquarePlus } from "lucide-react";
 import CourseChatDockview from "@/components/CourseChatDockview";
 import { Button } from "@/components/ui/button";
 
@@ -29,23 +29,42 @@ export default function CourseChatPage() {
           返回课程
         </Link>
         <h2 className="font-display text-sm font-semibold text-foreground">课程问答</h2>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="h-8 gap-1.5 text-xs shrink-0"
-          title="若三栏都被关闭或布局异常，点此恢复资料列表、预览与问答"
-          onClick={() =>
-            window.dispatchEvent(
-              new CustomEvent("edu:reset-course-chat-dockview", {
-                detail: { courseId },
-              }),
-            )
-          }
-        >
-          <LayoutGrid size={14} />
-          恢复三栏
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-8 gap-1.5 text-xs shrink-0"
+            title="新建一个独立的课程对话窗口（标签页形式）"
+            onClick={() =>
+              window.dispatchEvent(
+                new CustomEvent("edu:new-course-chat-window", {
+                  detail: { courseId },
+                }),
+              )
+            }
+          >
+            <MessageSquarePlus size={14} />
+            新建对话窗口
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-8 gap-1.5 text-xs shrink-0"
+            title="若三栏都被关闭或布局异常，点此恢复资料列表、预览与问答"
+            onClick={() =>
+              window.dispatchEvent(
+                new CustomEvent("edu:reset-course-chat-dockview", {
+                  detail: { courseId },
+                }),
+              )
+            }
+          >
+            <LayoutGrid size={14} />
+            恢复三栏
+          </Button>
+        </div>
       </div>
 
       <CourseChatDockview courseId={courseId} />

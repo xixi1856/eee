@@ -15,14 +15,20 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # LLM API (DashScope / Qwen)
+    # LLM API (DashScope / Qwen) — default provider (vision, memory, LightRAG indexing)
     llm_api_key: str = ""
     llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
     # Model names
     llm_model: str = "qwen-plus-2025-04-28"
     refine_model: str = "qwen-long"   # long-context model for structure-refine phase
-    vision_model: str = "qwen-vl-max"
+    vision_model: str = "qwen3.6-plus"  # vision model for image understanding / LightRAG multimodal
+
+    # Chat / assignment model — separate provider (e.g. DeepSeek) with own API key.
+    # Falls back to default LLM settings when unset.
+    llm_chat_api_key: str = ""      # LLM_CHAT_API_KEY; empty → use llm_api_key
+    llm_chat_base_url: str = ""     # LLM_CHAT_BASE_URL; empty → use llm_base_url
+    llm_chat_model: str = ""        # LLM_CHAT_MODEL; empty → use llm_model
     # Embedding backend: ollama (local) | openai_compatible (OpenAI /v1/embeddings API, incl. DashScope compatible-mode)
     embedding_mode: str = "openai_compatible"
     # Optional overrides for openai_compatible; empty → use LLM_BASE_URL / LLM_API_KEY
@@ -79,6 +85,21 @@ class Settings(BaseSettings):
                 "or use an Ollama tag such as bge-m3."
             )
         return self
+
+    @property
+    def effective_chat_api_key(self) -> str:
+        """API key for chat/assignment LLM (falls back to default llm_api_key)."""
+        return self.llm_chat_api_key.strip() or self.llm_api_key
+
+    @property
+    def effective_chat_base_url(self) -> str:
+        """Base URL for chat/assignment LLM (falls back to default llm_base_url)."""
+        return self.llm_chat_base_url.strip() or self.llm_base_url
+
+    @property
+    def effective_chat_model(self) -> str:
+        """Model name for chat/assignment LLM (falls back to default llm_model)."""
+        return self.llm_chat_model.strip() or self.llm_model
 
     # LLM generation
     llm_max_tokens: int = 4096

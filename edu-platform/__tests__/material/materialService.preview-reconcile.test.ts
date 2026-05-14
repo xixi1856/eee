@@ -176,5 +176,100 @@ describe("materialService preview reconcile", () => {
 
     expect(out.contentType).toBe("application/pdf");
     expect(out.contentDisposition).toBe("inline");
+    expect(getObjectStreamMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        objectKey: "materials/c1/a25e17dd-63cc-4075-9e07-0fd8bd3f43ee/preview.pdf",
+      }),
+    );
+  });
+
+  it("openMaterialContentStream forwards range for native pdf and returns partial metadata", async () => {
+    const now = new Date("2026-05-14T00:00:00.000Z");
+    findFirstMock.mockResolvedValue({
+      id: "a25e17dd-63cc-4075-9e07-0fd8bd3f43ee",
+      courseId: "c1",
+      lessonId: null,
+      originalFilename: "chapter.pdf",
+      fileType: "pdf",
+      fileSize: 123,
+      minioPath: "materials/c1/a25e17dd-63cc-4075-9e07-0fd8bd3f43ee/chapter.pdf",
+      previewPdfStatus: MaterialPreviewPdfStatus.NA,
+      status: MaterialStatus.READY,
+      statusMessage: null,
+      indexedChunkCount: 0,
+      createdAt: now,
+      updatedAt: now,
+      isDeleted: false,
+    });
+    getObjectStreamMock.mockResolvedValue({
+      body: "PDF_BYTES",
+      contentType: "application/pdf",
+      contentLength: 1024,
+      contentRange: "bytes 0-1023/8192",
+      isPartial: true,
+    });
+
+    const { openMaterialContentStream } = await import("@/lib/services/materialService");
+    const out = await openMaterialContentStream({
+      userId: "teacher-1",
+      role: UserRole.TEACHER,
+      materialId: "a25e17dd-63cc-4075-9e07-0fd8bd3f43ee",
+      variant: "inline",
+      range: "bytes=0-1023",
+    });
+
+    expect(getObjectStreamMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        objectKey: "materials/c1/a25e17dd-63cc-4075-9e07-0fd8bd3f43ee/chapter.pdf",
+        range: "bytes=0-1023",
+      }),
+    );
+    expect(out.contentRange).toBe("bytes 0-1023/8192");
+    expect(out.isPartial).toBe(true);
+  });
+
+  it("openMaterialContentStream forwards range for office preview object", async () => {
+    const now = new Date("2026-05-14T00:00:00.000Z");
+    findFirstMock.mockResolvedValue({
+      id: "a25e17dd-63cc-4075-9e07-0fd8bd3f43ee",
+      courseId: "c1",
+      lessonId: null,
+      originalFilename: "slides.ppt",
+      fileType: "ppt",
+      fileSize: 123,
+      minioPath: "materials/c1/a25e17dd-63cc-4075-9e07-0fd8bd3f43ee/slides.ppt",
+      previewPdfStatus: MaterialPreviewPdfStatus.READY,
+      status: MaterialStatus.READY,
+      statusMessage: null,
+      indexedChunkCount: 0,
+      createdAt: now,
+      updatedAt: now,
+      isDeleted: false,
+    });
+    getObjectStreamMock.mockResolvedValue({
+      body: "PDF_BYTES",
+      contentType: "application/pdf",
+      contentLength: 1024,
+      contentRange: "bytes 0-1023/8192",
+      isPartial: true,
+    });
+
+    const { openMaterialContentStream } = await import("@/lib/services/materialService");
+    const out = await openMaterialContentStream({
+      userId: "teacher-1",
+      role: UserRole.TEACHER,
+      materialId: "a25e17dd-63cc-4075-9e07-0fd8bd3f43ee",
+      variant: "inline",
+      range: "bytes=0-1023",
+    });
+
+    expect(getObjectStreamMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        objectKey: "materials/c1/a25e17dd-63cc-4075-9e07-0fd8bd3f43ee/preview.pdf",
+        range: "bytes=0-1023",
+      }),
+    );
+    expect(out.contentRange).toBe("bytes 0-1023/8192");
+    expect(out.isPartial).toBe(true);
   });
 });

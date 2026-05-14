@@ -1,12 +1,21 @@
 import {
+  AbortMultipartUploadCommand,
+  CompleteMultipartUploadCommand,
+  CreateMultipartUploadCommand,
   DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
   PutObjectCommand,
   S3Client,
+  UploadPartCommand,
 } from "@aws-sdk/client-s3";
+import { NodeHttpHandler } from "@smithy/node-http-handler";
+import { Buffer } from "node:buffer";
 import type { Readable } from "node:stream";
 import { getMinioConfig } from "@/lib/config";
+
+const MAX_SINGLE_PUT_BYTES = 16 * 1024 * 1024;
+const MULTIPART_PART_SIZE_BYTES = 8 * 1024 * 1024;
 
 function buildClient(): S3Client {
   const c = getMinioConfig();
@@ -23,6 +32,11 @@ function buildClient(): S3Client {
       accessKeyId: c.accessKeyId,
       secretAccessKey: c.secretAccessKey,
     },
+    // 大文件（视频/音频）上传耗时较长，设置宽松的 socket 超时避免 ECONNRESET
+    requestHandler: new NodeHttpHandler({
+      socketTimeout: 10 * 60 * 1000, // 10 分钟
+      connectionTimeout: 10_000,      // 10 秒建连超时
+    }),
   });
 }
 
@@ -41,15 +55,122 @@ export async function putObjectStream(params: {
 }): Promise<void> {
   const c = getMinioConfig();
   const client = getS3Client();
-  await client.send(
-    new PutObjectCommand({
+
+  if (
+    typeof params.contentLength === "number" &&
+    params.contentLength <= MAX_SINGLE_PUT_BYTES
+  ) {
+    await client.send(
+      new PutObjectCommand({
+        Bucket: c.bucket,
+        Key: params.objectKey,
+        Body: params.body,
+        ContentLength: params.contentLength,
+        ContentType: params.contentType,
+      }),
+    );
+    return;
+  }
+
+  const created = await client.send(
+    new CreateMultipartUploadCommand({
       Bucket: c.bucket,
       Key: params.objectKey,
-      Body: params.body,
-      ContentLength: params.contentLength,
       ContentType: params.contentType,
     }),
   );
+  const uploadId = created.UploadId;
+  if (!uploadId) {
+    throw new Error("S3 multipart upload initialization returned empty UploadId");
+  }
+
+  const completedParts: { ETag?: string; PartNumber?: number }[] = [];
+  let partNumber = 1;
+
+  try {
+    for await (const part of splitReadableToParts(
+      params.body,
+      MULTIPART_PART_SIZE_BYTES,
+    )) {
+      const uploaded = await client.send(
+        new UploadPartCommand({
+          Bucket: c.bucket,
+          Key: params.objectKey,
+          UploadId: uploadId,
+          PartNumber: partNumber,
+          Body: part,
+          ContentLength: part.length,
+        }),
+      );
+      if (!uploaded.ETag) {
+        throw new Error(`S3 multipart upload part ${partNumber} missing ETag`);
+      }
+      completedParts.push({ ETag: uploaded.ETag, PartNumber: partNumber });
+      partNumber += 1;
+    }
+
+    if (completedParts.length === 0) {
+      throw new Error("S3 multipart upload got empty body stream");
+    }
+
+    await client.send(
+      new CompleteMultipartUploadCommand({
+        Bucket: c.bucket,
+        Key: params.objectKey,
+        UploadId: uploadId,
+        MultipartUpload: {
+          Parts: completedParts,
+        },
+      }),
+    );
+  } catch (e) {
+    await client
+      .send(
+        new AbortMultipartUploadCommand({
+          Bucket: c.bucket,
+          Key: params.objectKey,
+          UploadId: uploadId,
+        }),
+      )
+      .catch(() => {});
+    throw e;
+  }
+}
+
+async function* splitReadableToParts(
+  stream: Readable,
+  partSizeBytes: number,
+): AsyncGenerator<Uint8Array<ArrayBufferLike>> {
+  let pending: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+  for await (const rawChunk of stream) {
+    const chunk: Uint8Array<ArrayBufferLike> =
+      typeof rawChunk === "string"
+        ? Buffer.from(rawChunk)
+        : Buffer.isBuffer(rawChunk)
+          ? rawChunk
+          : rawChunk instanceof Uint8Array
+            ? rawChunk
+            : Buffer.from(rawChunk as ArrayBufferLike);
+    pending = concatBytes(pending, chunk);
+    while (pending.length >= partSizeBytes) {
+      yield pending.subarray(0, partSizeBytes);
+      pending = pending.subarray(partSizeBytes);
+    }
+  }
+  if (pending.length > 0) {
+    yield pending;
+  }
+}
+
+function concatBytes(
+  a: Uint8Array<ArrayBufferLike>,
+  b: Uint8Array<ArrayBufferLike>,
+): Uint8Array<ArrayBufferLike> {
+  if (a.length === 0) return b;
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
 }
 
 export async function deleteObject(objectKey: string): Promise<void> {

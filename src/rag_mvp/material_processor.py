@@ -777,8 +777,8 @@ def _record_chunk_page_mappings(
         with conn.cursor() as cur:
             cur.executemany(
                 """
-                INSERT INTO chunk_page_mappings (material_id, chunk_id, page_idx)
-                VALUES (%s::uuid, %s, %s)
+                INSERT INTO chunk_page_mappings (id, material_id, chunk_id, page_idx)
+                VALUES (gen_random_uuid(), %s::uuid, %s, %s)
                 ON CONFLICT (material_id, chunk_id) DO UPDATE SET page_idx = EXCLUDED.page_idx
                 """,
                 mappings,

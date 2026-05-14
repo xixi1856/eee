@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useState, useRef } from "react";
 import Image from "next/image";
 import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -31,6 +30,11 @@ import {
 } from "@/lib/hooks/useChatStream";
 import { toolEmoji } from "@/lib/chatToolEmoji";
 import { EDU_CHAT_ADD_ATTACHMENT_EVENT } from "@/lib/captureElementToPngFile";
+import {
+  markdownRehypePlugins,
+  markdownRemarkPlugins,
+  normalizeMathDelimiters,
+} from "@/lib/markdownMath";
 
 type UserMe = {
   qa_collection_enabled?: boolean;
@@ -324,7 +328,12 @@ export default function ChatComponent(props: ChatComponentProps) {
                         {msg.role === "user" ? (
                           <div className="whitespace-pre-wrap">{msg.text}</div>
                         ) : (
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.text}</ReactMarkdown>
+                          <ReactMarkdown
+                            remarkPlugins={markdownRemarkPlugins}
+                            rehypePlugins={markdownRehypePlugins}
+                          >
+                            {normalizeMathDelimiters(msg.text)}
+                          </ReactMarkdown>
                         )}
                       </div>
                     )}
@@ -504,7 +513,12 @@ export default function ChatComponent(props: ChatComponentProps) {
                 <div className="flex w-full justify-start">
                   <div className="flex min-w-0 w-full flex-col items-start">
                     <div className="rounded-none px-4 py-3 bg-transparent text-foreground prose prose-sm dark:prose-invert max-w-none [&_pre]:border-0">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{streaming}</ReactMarkdown>
+                      <ReactMarkdown
+                        remarkPlugins={markdownRemarkPlugins}
+                        rehypePlugins={markdownRehypePlugins}
+                      >
+                        {normalizeMathDelimiters(streaming)}
+                      </ReactMarkdown>
                       <span className="inline-block w-2 h-4 bg-primary animate-pulse ml-1 align-middle" />
                     </div>
                     <div className="mt-1 flex opacity-100 sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100">
@@ -700,7 +714,7 @@ export default function ChatComponent(props: ChatComponentProps) {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="消息 Eduardo..."
+              placeholder="请输入..."
               className="min-h-[52px] max-h-48 resize-none border-0 shadow-none bg-transparent py-4 text-sm focus-visible:ring-0 flex-1"
               disabled={busy}
               rows={1}

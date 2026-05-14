@@ -10,6 +10,7 @@ import { rememberFactTool, searchMemoryTool } from "./memory";
 import { webSearchTool, wikipediaSearchTool } from "./search";
 import { listSkillsTool, viewSkillTool } from "./skills";
 import { parseDocumentTool } from "./ocr";
+import { analyzeImageTool } from "./vision";
 
 // RAG tools
 toolRegistry.register(knowledgeQueryTool);
@@ -36,6 +37,9 @@ toolRegistry.register(viewSkillTool);
 // OCR / document parsing
 toolRegistry.register(parseDocumentTool);
 
+// Vision tool — image understanding via dedicated vision model
+toolRegistry.register(analyzeImageTool);
+
 // delegation tool — imported after other tools to avoid circular import issue
 import { delegateTaskTool } from "./delegation";
 toolRegistry.register(delegateTaskTool);
@@ -47,3 +51,4 @@ export { webSearchTool, wikipediaSearchTool };
 export { listSkillsTool, viewSkillTool };
 export { parseDocumentTool };
 export { delegateTaskTool };
+export { analyzeImageTool };

@@ -369,6 +369,9 @@ export function useChatStream(config: UseChatStreamConfig) {
         if (isQaGlobal && config.sessionId) {
           body.session_id = config.sessionId;
         }
+        if (config.kind === "course" && config.hydrateSessionId) {
+          body.session_id = config.hydrateSessionId;
+        }
 
         const res = await fetch(url, {
           method: "POST",

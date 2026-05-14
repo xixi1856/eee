@@ -22,6 +22,7 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     const body = (await req.json()) as {
       message?: string;
       lesson_id?: string;
+      session_id?: string;
       trim_history_to?: number;
       attachments?: { id: string; key: string; presigned_url: string; mime_type: string; name: string }[];
     };
@@ -53,6 +54,11 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     const traceId = req.headers.get("x-trace-id")?.trim() || null;
     const debugTraceRaw = req.headers.get("x-debug-trace")?.trim().toLowerCase() || "";
     const debugTrace = ["1", "true", "yes", "on"].includes(debugTraceRaw);
+    let sessionId: string | null = null;
+    if (typeof body.session_id === "string" && body.session_id.trim()) {
+      assertUuid(body.session_id, "session_id");
+      sessionId = body.session_id.trim();
+    }
     return await courseChatSseResponse({
       courseId,
       platformStudentId: auth.sub,
@@ -64,6 +70,7 @@ export async function POST(req: NextRequest, ctx: Ctx) {
       traceId,
       debugTrace,
       trimHistoryTo,
+      sessionId,
     });
   } catch (e) {
     if (e instanceof ApiError) return jsonError(e);

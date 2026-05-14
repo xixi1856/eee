@@ -663,9 +663,10 @@ export async function getMaterialDetailDto(
 
 async function readObjectStreamForMaterial(
   objectKey: string,
+  range?: string,
 ): Promise<Awaited<ReturnType<typeof getObjectStream>>> {
   try {
-    return await getObjectStream({ objectKey });
+    return await getObjectStream({ objectKey, range });
   } catch (e) {
     throw mapStorageReadError(e);
   }
@@ -717,11 +718,12 @@ async function enqueuePreviewRepairIfFailed(materialId: string): Promise<boolean
 /** Office inline preview: try `preview.pdf`, then legacy `{materialId}.pdf`. */
 async function readOfficePreviewStreamWithFallback(
   m: Material,
+  range?: string,
 ): Promise<Awaited<ReturnType<typeof getObjectStream>>> {
   const keys = officePreviewKeys(m);
   for (const objectKey of keys) {
     try {
-      return await readObjectStreamForMaterial(objectKey);
+      return await readObjectStreamForMaterial(objectKey, range);
     } catch (e) {
       const err = e instanceof ApiError ? e : mapStorageReadError(e);
       if (err.status === 404 && err.code === "NOT_FOUND") {
@@ -799,7 +801,10 @@ export async function openMaterialContentStream(
   const ft = m.fileType.toLowerCase();
 
   if (params.variant === "original") {
-    const { body, contentType, contentLength } = await readObjectStreamForMaterial(m.minioPath);
+    const { body, contentType, contentLength } = await readObjectStreamForMaterial(
+      m.minioPath,
+      params.range,
+    );
     const ct = contentType || guessContentTypeByFileType(ft);
     const name = encodeURIComponent(m.originalFilename);
     return {
@@ -815,13 +820,16 @@ export async function openMaterialContentStream(
     if (ps !== MaterialPreviewPdfStatus.READY) {
       // Self-heal stale state: preview object may already exist while DB still says PENDING/FAILED.
       try {
-        const preview = await readOfficePreviewStreamWithFallback(m);
+        const preview = await readOfficePreviewStreamWithFallback(m, params.range);
         await markOfficePreviewReadyAndMaybeQueueParse(m);
         return {
           body: preview.body,
           // Office preview contract is always a PDF (preview.pdf).
           contentType: "application/pdf",
           contentDisposition: "inline",
+          contentLength: preview.contentLength,
+          contentRange: preview.contentRange,
+          isPartial: preview.isPartial,
         };
       } catch (e) {
         if (!(e instanceof ApiError) || e.code !== "PREVIEW_NOT_READY") {
@@ -844,22 +852,29 @@ export async function openMaterialContentStream(
         repair_queue_error: repairQueueError ? repairQueueError.slice(0, 500) : undefined,
       });
     }
-    const { body } = await readOfficePreviewStreamWithFallback(m);
+    const { body, contentLength, contentRange, isPartial } =
+      await readOfficePreviewStreamWithFallback(m, params.range);
     return {
       body,
       // Office preview contract is always a PDF (preview.pdf).
       contentType: "application/pdf",
       contentDisposition: "inline",
+      contentLength,
+      contentRange,
+      isPartial,
     };
   }
 
   if (ft === "pdf" || ft === "md" || ft === "txt") {
-    const { body, contentType, contentLength } = await readObjectStreamForMaterial(m.minioPath);
+    const { body, contentType, contentLength, contentRange, isPartial } =
+      await readObjectStreamForMaterial(m.minioPath, params.range);
     return {
       body,
       contentType: contentType || guessContentTypeByFileType(ft),
       contentDisposition: "inline",
       contentLength,
+      contentRange,
+      isPartial,
     };
   }
 

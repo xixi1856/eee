@@ -3,11 +3,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FileText, Hash, Loader2, AlertCircle, Download, ChevronLeft, ChevronRight } from "lucide-react";
 import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
 import { isOfficeMaterialFileType } from "@/lib/material-office";
 import { captureScrollViewportToPngFile, EDU_CHAT_ADD_ATTACHMENT_EVENT } from "@/lib/captureElementToPngFile";
+import {
+  markdownRehypePlugins,
+  markdownRemarkPlugins,
+  normalizeMathDelimiters,
+} from "@/lib/markdownMath";
 
 type MaterialDetail = {
   id: string;
@@ -45,11 +49,13 @@ export default function CourseMaterialViewer({
   const [loading, setLoading] = useState(false);
   const [captureBusy, setCaptureBusy] = useState(false);
   const [pdfViewportReady, setPdfViewportReady] = useState(false);
+  const [pdfLoadError, setPdfLoadError] = useState<string | null>(null);
 
   // PDF canvas renderer state
   const [pdfPageNum, setPdfPageNum] = useState(1);
   const [pdfTotalPages, setPdfTotalPages] = useState(0);
   const [pdfRenderBusy, setPdfRenderBusy] = useState(false);
+  const [pdfLoadProgress, setPdfLoadProgress] = useState<number | null>(null);
   const pdfCanvasRef = useRef<HTMLCanvasElement>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const pdfDocRef = useRef<any>(null);
@@ -123,6 +129,8 @@ export default function CourseMaterialViewer({
     setPdfViewportReady(false);
     setPdfPageNum(1);
     setPdfTotalPages(0);
+    setPdfLoadProgress(null);
+    setPdfLoadError(null);
     pdfDocRef.current = null;
   }, [materialId]);
 
@@ -156,22 +164,40 @@ export default function CourseMaterialViewer({
     let cancelled = false;
     void (async () => {
       try {
+        setPdfLoadError(null);
         // Dynamic import to avoid SSR issues
-        const pdfjsLib = await import("pdfjs-dist");
-        pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+        const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
+        pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs?v=legacy-5.7.284";
+        setPdfLoadProgress(0);
         const loadingTask = pdfjsLib.getDocument({
           url: `/api/v1/materials/${materialId}/content`,
           withCredentials: true,
+          rangeChunkSize: 65536,
+          disableStream: false,
+          disableRange: false,
         });
+        loadingTask.onProgress = (data: { loaded: number; total: number }) => {
+          if (data.total > 0 && !cancelled) {
+            setPdfLoadProgress(Math.round((data.loaded / data.total) * 100));
+          }
+        };
         const doc = await loadingTask.promise;
         if (cancelled) { doc.destroy(); return; }
         pdfDocRef.current = doc;
         setPdfTotalPages(doc.numPages);
         setPdfPageNum(1);
         await renderPdfPage(doc, 1);
-        setPdfViewportReady(true);
-      } catch {
-        if (!cancelled) setPdfViewportReady(false);
+        if (!cancelled) {
+          setPdfLoadProgress(null);
+          setPdfViewportReady(true);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setPdfLoadProgress(null);
+          setPdfViewportReady(false);
+          const msg = e instanceof Error ? e.message : "未知错误";
+          setPdfLoadError(`PDF 预览加载失败: ${msg}`);
+        }
       }
     })();
     return () => { cancelled = true; };
@@ -441,10 +467,28 @@ export default function CourseMaterialViewer({
         {/* Native PDF → pdfjs-dist canvas */}
         {showPdfCanvas && (
           <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+            {pdfLoadError && (
+              <div className="m-3 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-2 text-[11px] text-destructive">
+                <AlertCircle size={14} className="shrink-0 mt-0.5" />
+                <span>{pdfLoadError}</span>
+              </div>
+            )}
             {!pdfViewportReady && (
-              <div className="flex items-center gap-2 m-3 text-xs text-muted-foreground">
-                <Loader2 size={14} className="animate-spin" />
-                正在加载 PDF…
+              <div className="flex flex-col gap-2 m-3">
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Loader2 size={14} className="animate-spin" />
+                  {pdfLoadProgress !== null
+                    ? `正在加载 PDF… ${pdfLoadProgress}%`
+                    : "正在加载 PDF…"}
+                </div>
+                {pdfLoadProgress !== null && pdfLoadProgress < 100 && (
+                  <div className="h-1 w-full rounded-full bg-muted overflow-hidden">
+                    <div
+                      className="h-full bg-primary rounded-full transition-all duration-200"
+                      style={{ width: `${pdfLoadProgress}%` }}
+                    />
+                  </div>
+                )}
               </div>
             )}
             {pdfViewportReady && pdfTotalPages > 1 && (
@@ -494,7 +538,6 @@ export default function CourseMaterialViewer({
         {/* Video player */}
         {isVideo && (
           <div className="flex-1 min-h-0 flex flex-col items-center justify-center p-3 gap-2">
-            {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
             <video
               ref={videoRef}
               src={`/api/v1/materials/${materialId}/content`}
@@ -510,7 +553,6 @@ export default function CourseMaterialViewer({
         {/* Audio player */}
         {isAudio && (
           <div className="flex items-center justify-center p-4">
-            {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
             <audio
               src={`/api/v1/materials/${materialId}/content`}
               controls
@@ -523,7 +565,12 @@ export default function CourseMaterialViewer({
         {(ft === "md" || ft === "txt") && textBody !== null && (
           <div className="p-3 prose prose-sm dark:prose-invert max-w-none">
             {ft === "md" ? (
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{textBody}</ReactMarkdown>
+              <ReactMarkdown
+                remarkPlugins={markdownRemarkPlugins}
+                rehypePlugins={markdownRehypePlugins}
+              >
+                {normalizeMathDelimiters(textBody)}
+              </ReactMarkdown>
             ) : (
               <pre className="whitespace-pre-wrap text-xs font-mono bg-muted/30 p-3 rounded-lg">
                 {textBody}

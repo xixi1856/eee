@@ -4,6 +4,7 @@
  */
 
 import OpenAI from "openai";
+import { getLLMClient, getRoleExtraBody } from "./llm-registry";
 import { getRedis } from "@/lib/redis";
 import type { Message, TurnContext, AgentConfig, ToolCitation } from "./types";
 import type { ToolRegistry } from "./tool-registry";
@@ -140,9 +141,8 @@ async function _runLoop(
   const { config, toolRegistry, ctx, coordinator, promptBuilder, skills, profile, memoryBlock } =
     opts;
 
-  const apiKey = process.env.OPENAI_API_KEY ?? process.env.LLM_API_KEY ?? "";
-  const baseURL = process.env.LLM_BASE_URL || undefined;
-  const client = new OpenAI({ apiKey, baseURL });
+  const client = getLLMClient("chat");
+  const chatExtraBody = getRoleExtraBody("chat");
 
   // Build system prompt
   const systemPrompt = promptBuilder.buildSystemPrompt(
@@ -188,7 +188,9 @@ async function _runLoop(
         tool_choice: schemas.length > 0 ? "auto" : undefined,
         stream: true,
         stream_options: { include_usage: true },
-      });
+        // Disable DeepSeek thinking mode: prevents 400 when reasoning_content not echoed back
+        ...chatExtraBody,
+      } as OpenAI.Chat.ChatCompletionCreateParamsStreaming);
 
       for await (const chunk of stream) {
         const delta = chunk.choices[0]?.delta;
@@ -373,25 +375,17 @@ function _toOpenAIParam(m: Message): OpenAI.Chat.ChatCompletionMessageParam {
   return { role: m.role as "user" | "assistant" | "system", content: m.content };
 }
 
-function _buildUserContent(
-  opts: ReactLoopOptions,
-): string | OpenAI.Chat.ChatCompletionContentPart[] {
+function _buildUserContent(opts: ReactLoopOptions): string {
   const attachments = opts.config.attachments;
-  if (!attachments || attachments.length === 0) {
+  const imageAtts = attachments?.filter((a) => a.mime_type.startsWith("image/")) ?? [];
+
+  if (imageAtts.length === 0) {
     return opts.userMessage;
   }
 
-  const parts: OpenAI.Chat.ChatCompletionContentPart[] = [
-    { type: "text", text: opts.userMessage },
-  ];
-
-  for (const att of attachments) {
-    if (att.mime_type.startsWith("image/")) {
-      parts.push({
-        type: "image_url",
-        image_url: { url: att.presigned_url },
-      });
-    }
-  }
-  return parts.length > 1 ? parts : opts.userMessage;
+  // Include image URLs as text references so the Agent can pass them to the analyzeImage tool.
+  const refs = imageAtts
+    .map((a, i) => `  [图片${i + 1}] ${a.name} — ${a.presigned_url}`)
+    .join("\n");
+  return `${opts.userMessage}\n\n可用图片（可通过 analyzeImage 工具对图片提问）：\n${refs}`;
 }

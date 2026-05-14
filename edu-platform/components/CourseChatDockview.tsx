@@ -24,11 +24,15 @@ import { cn } from "@/lib/utils";
 import { X, FileText } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import Image from "next/image";
 import ChatComponent from "@/components/ChatComponent";
 import CourseMaterialList from "@/components/CourseMaterialList";
 import CourseMaterialViewer from "@/components/CourseMaterialViewer";
+import {
+  markdownRehypePlugins,
+  markdownRemarkPlugins,
+  normalizeMathDelimiters,
+} from "@/lib/markdownMath";
 
 type CitationPreview = {
   materialId: string;
@@ -43,8 +47,6 @@ type CourseChatCtx = {
   activeMaterialId: string | null;
   onPickMaterial: (id: string) => void;
   citation: CitationPreview | null;
-  /** When set, ChatComponent hydrates transcript from QA thread API. */
-  hydrateSessionId: string | null;
 };
 
 const CourseChatCtx = createContext<CourseChatCtx | null>(null);
@@ -59,7 +61,7 @@ function dockviewLayoutKey(courseId: string): string {
   return `edu:course-chat:dockview:${courseId}`;
 }
 
-function defaultThreeColumnLayout(api: DockviewApi): void {
+function defaultThreeColumnLayout(api: DockviewApi, defaultSessionId: string | null = null): void {
   const list = api.addPanel({
     id: "materialList",
     component: "materialList",
@@ -75,6 +77,7 @@ function defaultThreeColumnLayout(api: DockviewApi): void {
     id: "chat",
     component: "chat",
     title: "课程问答",
+    params: { sessionId: defaultSessionId },
     position: { referencePanel: preview, direction: "right" },
   });
 }
@@ -92,7 +95,7 @@ function isPersistedDockviewLayout(
   );
 }
 
-function MaterialListPanel(_props: IDockviewPanelProps) {
+function MaterialListPanel() {
   const { courseId, activeMaterialId, onPickMaterial } = useCourseChatCtx();
   return (
     <CourseMaterialList
@@ -103,7 +106,7 @@ function MaterialListPanel(_props: IDockviewPanelProps) {
   );
 }
 
-function MaterialPreviewPanel(_props: IDockviewPanelProps) {
+function MaterialPreviewPanel() {
   const { courseId, activeMaterialId, citation } = useCourseChatCtx();
   return (
     <CourseMaterialViewer
@@ -115,10 +118,10 @@ function MaterialPreviewPanel(_props: IDockviewPanelProps) {
   );
 }
 
-function ChatPanel(_props: IDockviewPanelProps) {
-  const { courseId, hydrateSessionId } = useCourseChatCtx();
+function ChatPanel(props: IDockviewPanelProps<{ sessionId?: string | null }>) {
+  const { courseId } = useCourseChatCtx();
   return (
-    <ChatComponent courseId={courseId} hydrateSessionId={hydrateSessionId} />
+    <ChatComponent courseId={courseId} hydrateSessionId={props.params?.sessionId ?? null} />
   );
 }
 
@@ -136,11 +139,14 @@ export default function CourseChatDockview({ courseId }: Props) {
   );
   const [citation, setCitation] = useState<CitationPreview | null>(null);
   const [citationTextPanel, setCitationTextPanel] = useState<CitationPreview | null>(null);
-  const [hydrateSessionId, setHydrateSessionId] = useState<string | null>(null);
   const { resolvedTheme } = useTheme();
 
+  // Holds the agentSessionId of the default (oldest) course chat session.
+  // Updated after async fetch; used to inject into the default "chat" panel and re-injected after layout reset.
+  const defaultSessionIdRef = useRef<string | null>(null);
+
   useEffect(() => {
-    setHydrateSessionId(null);
+    defaultSessionIdRef.current = null;
     let cancelled = false;
     void (async () => {
       try {
@@ -149,14 +155,14 @@ export default function CourseChatDockview({ courseId }: Props) {
           { credentials: "include" },
         );
         if (!res.ok || cancelled) return;
-        const body = (await res.json()) as { session_id?: string | null };
-        const sid =
-          typeof body.session_id === "string" && body.session_id.trim()
-            ? body.session_id.trim()
-            : null;
-        if (!cancelled) setHydrateSessionId(sid);
+        const body = (await res.json()) as { sessions?: { session_id: string }[] };
+        const sid = body.sessions?.[0]?.session_id ?? null;
+        if (cancelled) return;
+        defaultSessionIdRef.current = sid;
+        // Inject sessionId into the default "chat" panel (may not exist yet if dockview hasn't mounted)
+        apiRef.current?.getPanel("chat")?.api.updateParameters({ sessionId: sid });
       } catch {
-        if (!cancelled) setHydrateSessionId(null);
+        /* ignore */
       }
     })();
     return () => {
@@ -180,10 +186,53 @@ export default function CourseChatDockview({ courseId }: Props) {
     try {
       api.clear();
       defaultThreeColumnLayout(api);
+      // Re-inject the default session ID into the freshly-created chat panel
+      const sid = defaultSessionIdRef.current;
+      if (sid) {
+        api.getPanel("chat")?.api.updateParameters({ sessionId: sid });
+      }
     } finally {
       resettingLayoutRef.current = false;
     }
   }, [courseId]);
+
+  const handleAddChatWindow = useCallback(async () => {
+    const api = apiRef.current;
+    if (!api) return;
+    try {
+      const res = await fetch(
+        `/api/v1/courses/${encodeURIComponent(courseId)}/chat/session`,
+        { method: "POST", credentials: "include" },
+      );
+      if (!res.ok) return;
+      const body = (await res.json()) as { session_id?: string };
+      const newSessionId = body.session_id;
+      if (!newSessionId) return;
+      const chatPanels = api.panels.filter((p) => p.id.startsWith("chat"));
+      const refPanelId = chatPanels[chatPanels.length - 1]?.id ?? "chat";
+      const shortId = newSessionId.replace(/-/g, "").slice(0, 8);
+      api.addPanel({
+        id: `chat_${shortId}`,
+        component: "chat",
+        title: "新对话",
+        params: { sessionId: newSessionId },
+        position: { referencePanel: refPanelId, direction: "within" },
+      });
+    } catch {
+      /* ignore */
+    }
+  }, [courseId]);
+
+  useEffect(() => {
+    const h = (ev: Event) => {
+      const ce = ev as CustomEvent<{ courseId?: string }>;
+      if (ce.detail?.courseId !== courseId) return;
+      void handleAddChatWindow();
+    };
+    window.addEventListener("edu:new-course-chat-window", h as EventListener);
+    return () =>
+      window.removeEventListener("edu:new-course-chat-window", h as EventListener);
+  }, [courseId, handleAddChatWindow]);
 
   useEffect(() => {
     const h = (ev: Event) => {
@@ -231,9 +280,8 @@ export default function CourseChatDockview({ courseId }: Props) {
       activeMaterialId,
       onPickMaterial,
       citation,
-      hydrateSessionId,
     }),
-    [courseId, activeMaterialId, onPickMaterial, citation, hydrateSessionId],
+    [courseId, activeMaterialId, onPickMaterial, citation],
   );
 
   const dockTheme = resolvedTheme === "dark" ? themeDark : themeLight;
@@ -385,8 +433,11 @@ export default function CourseChatDockview({ courseId }: Props) {
                         <span>检索文本块</span>
                       </div>
                       <div className="prose prose-sm dark:prose-invert max-w-none rounded-lg bg-muted/40 border border-border p-3 text-xs leading-relaxed">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {citationTextPanel.chunkText}
+                        <ReactMarkdown
+                          remarkPlugins={markdownRemarkPlugins}
+                          rehypePlugins={markdownRehypePlugins}
+                        >
+                          {normalizeMathDelimiters(citationTextPanel.chunkText)}
                         </ReactMarkdown>
                       </div>
                       {(citationTextPanel.image_urls?.length ?? 0) > 0 && (

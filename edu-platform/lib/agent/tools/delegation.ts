@@ -3,8 +3,8 @@
  * Spins up an isolated SubAgent to handle a sub-task.
  */
 
-import OpenAI from "openai";
 import type { Tool, TurnContext } from "../types";
+import { getLLMClient, getChatModel } from "../llm-registry";
 import { runSubAgent } from "../subagent";
 import { toolRegistry } from "./registry";
 
@@ -45,10 +45,8 @@ export const delegateTaskTool: Tool = {
       .map((n) => toolRegistry.get(n))
       .filter(Boolean) as NonNullable<ReturnType<typeof toolRegistry.get>>[];
 
-    const apiKey = process.env.OPENAI_API_KEY ?? process.env.LLM_API_KEY ?? "";
-    const baseURL = process.env.LLM_BASE_URL || undefined;
-    const model = process.env.LLM_MODEL ?? "gpt-4o-mini";
-    const client = new OpenAI({ apiKey, baseURL });
+    const client = getLLMClient("chat");
+    const model = getChatModel();
 
     const result = await runSubAgent(client, model, { task, allowedTools, ctx }, 0);
 

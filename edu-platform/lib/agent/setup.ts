@@ -6,6 +6,7 @@
 import * as path from "path";
 import OpenAI from "openai";
 
+import { getLLMClient, getChatModel, getMemoryModel } from "./llm-registry";
 import { SessionStore } from "./session-store";
 import { ContextManager } from "./context-manager";
 import { PromptBuilder, promptBuilder } from "./prompt-builder";
@@ -31,12 +32,11 @@ const DEFAULT_PERSONA = `# 角色：智能教学助手
 - **及时反馈**：对学习者的回答给予具体、积极的反馈，指出不足时保持鼓励性语气。
 - **学科准确性**：确保所有知识性内容准确；不确定时如实说明并提示查阅权威来源。`;
 
-// ---- Singleton OpenAI client -----------------------------------------------
+// ---- OpenAI client (delegates to llm-registry) ----------------------------
 
+/** @deprecated Use getLLMClient(role) from llm-registry instead. */
 export function buildOpenAIClient(): OpenAI {
-  const apiKey = process.env.OPENAI_API_KEY ?? process.env.LLM_API_KEY ?? "";
-  const baseURL = process.env.LLM_BASE_URL || undefined;
-  return new OpenAI({ apiKey, baseURL });
+  return getLLMClient("chat");
 }
 
 // ---- Singleton agent components --------------------------------------------
@@ -47,9 +47,8 @@ let _openaiClient: OpenAI | null = null;
 export function getMemoryCoordinator(): MemoryCoordinator {
   if (_coordinator) return _coordinator;
 
-  _openaiClient = _openaiClient ?? buildOpenAIClient();
-  const model =
-    process.env.LLM_AUXILIARY_MODEL ?? process.env.LLM_MODEL ?? "gpt-4o-mini";
+  _openaiClient = _openaiClient ?? getLLMClient("memory");
+  const model = getMemoryModel();
 
   const retriever = new MemoryRetriever(memoryStore);
   const extractor = new MemoryExtractor(_openaiClient, model);
@@ -76,7 +75,7 @@ export function buildAgentConfig(
   attachments?: AgentConfig["attachments"],
 ): AgentConfig {
   return {
-    model: process.env.LLM_MODEL ?? "gpt-4o",
+    model: getChatModel(),
     systemPrompt: DEFAULT_PERSONA,
     maxIterations: parseInt(process.env.AGENT_MAX_ITERATIONS ?? "8", 10),
     ragServiceUrl: process.env.RAG_SERVICE_URL ?? "http://localhost:8001",

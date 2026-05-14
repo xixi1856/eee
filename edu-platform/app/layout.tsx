@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Lora, DM_Sans } from "next/font/google";
 import { ThemeProvider } from "next-themes";
 import "./globals.css";
+import "katex/dist/katex.min.css";
 
 const lora = Lora({
   subsets: ["latin"],

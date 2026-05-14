@@ -23,7 +23,7 @@ from typing import Any
 from loguru import logger
 
 from .config import settings
-from .llm import llm_model_func
+from .llm import llm_chat_model_func
 
 _GRAPHML_NS = "http://graphml.graphdrawing.org/xmlns"
 
@@ -369,7 +369,7 @@ async def _call_question_llm(
     """Single LLM round: return parsed question dict or None."""
     try:
         logger.debug("LLM prompt for '{}' ({}): {}...", entity_name, q_type, user_prompt[:2000])
-        raw = await llm_model_func(user_prompt, system_prompt=system_prompt)
+        raw = await llm_chat_model_func(user_prompt, system_prompt=system_prompt)
         logger.debug("LLM response for '{}': {}...", entity_name, raw[:1000])
     except Exception as exc:
         logger.warning(f"LLM call failed for '{entity_name}': {exc}")
@@ -476,7 +476,7 @@ async def _generate_scenario(entity_name: str, context: str, objective: str) -> 
             f"该分析将用于后续综合题命题。"
         )
     try:
-        scenario = await llm_model_func(user_msg, system_prompt=_SCENARIO_SYSTEM_PROMPT)
+        scenario = await llm_chat_model_func(user_msg, system_prompt=_SCENARIO_SYSTEM_PROMPT)
         logger.debug(f"Scenario generated for '{entity_name}' ({objective}): {len(scenario)} chars")
         return scenario
     except Exception as exc:

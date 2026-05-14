@@ -4,6 +4,7 @@
  */
 
 import OpenAI from "openai";
+import { getRoleExtraBody } from "./llm-registry";
 import type { Tool, TurnContext } from "./types";
 
 const MAX_ITERATIONS = 6;
@@ -60,12 +61,19 @@ export async function runSubAgent(
   ];
 
   for (let i = 0; i < MAX_ITERATIONS; i++) {
+    const subModel = config.model ?? model;
+    // Detect DeepSeek by model name when role context isn't available here
+    const subExtraBody = subModel.toLowerCase().startsWith("deepseek")
+      ? getRoleExtraBody("chat")
+      : undefined;
     const resp = await client.chat.completions.create({
-      model: config.model ?? model,
+      model: subModel,
       messages,
       tools: openaiTools.length > 0 ? openaiTools : undefined,
       tool_choice: openaiTools.length > 0 ? "auto" : undefined,
-    });
+      // Disable DeepSeek thinking mode
+      ...subExtraBody,
+    } as OpenAI.Chat.ChatCompletionCreateParamsNonStreaming);
 
     const msg = resp.choices[0]?.message;
     if (!msg) break;

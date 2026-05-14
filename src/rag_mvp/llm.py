@@ -175,6 +175,41 @@ async def llm_model_func(
         _llm_role.reset(token)
 
 
+async def llm_chat_model_func(
+    prompt: str,
+    system_prompt: str | None = None,
+    history_messages: list = [],
+    **kwargs,
+) -> str:
+    """Chat / assignment LLM backed by the chat provider (e.g. DeepSeek deepseek-v4-pro).
+
+    Falls back to ``llm_model_func`` settings when LLM_CHAT_* env vars are not set.
+    Used by assignment_gen and question_gen; LightRAG indexing continues to use
+    ``llm_model_func`` to avoid disrupting RAG internals.
+    """
+    kwargs.setdefault("max_tokens", settings.llm_max_tokens)
+    kwargs.setdefault("temperature", settings.llm_temperature)
+    model = settings.effective_chat_model
+    # Disable DeepSeek thinking mode to prevent 400 errors when tool calls are present
+    # (thinking mode requires reasoning_content to be echoed back in multi-turn tool calls)
+    base_url = settings.effective_chat_base_url or ""
+    if "deepseek.com" in base_url or model.lower().startswith("deepseek"):
+        kwargs.setdefault("extra_body", {"thinking": {"type": "disabled"}})
+    token = _llm_role.set(f"chat/{model}")
+    try:
+        return await openai_complete_if_cache(
+            model,
+            prompt,
+            system_prompt=system_prompt,
+            history_messages=history_messages,
+            api_key=settings.effective_chat_api_key,
+            base_url=settings.effective_chat_base_url,
+            **kwargs,
+        )
+    finally:
+        _llm_role.reset(token)
+
+
 async def vision_model_func(
     prompt: str,
     system_prompt: str | None = None,

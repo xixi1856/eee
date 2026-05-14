@@ -25,7 +25,7 @@ from loguru import logger
 
 from .config import settings
 from .engine import course_aquery_data
-from .llm import llm_model_func
+from .llm import llm_model_func, llm_chat_model_func
 from .worker_async_loop import is_worker_async_loop_started, run_worker_coroutine
 from .question_gen import (
     DEFAULT_OBJECTIVE_WEIGHTS,
@@ -146,7 +146,7 @@ async def _run_planner(
         candidates_text=candidates_text,
         difficulty_weights_json=dw_json,
     )
-    raw = await llm_model_func(prompt, system_prompt=_PLANNER_SYSTEM)
+    raw = await llm_chat_model_func(prompt, system_prompt=_PLANNER_SYSTEM)
     raw = re.sub(r"```(?:json)?", "", raw).strip()
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if not m:
@@ -362,7 +362,7 @@ async def _run_reviewer(questions: list[dict], blueprint: dict) -> dict[str, Any
         questions_text=questions_text[:4000],
     )
 
-    raw = await llm_model_func(prompt, system_prompt=_REVIEWER_SYSTEM)
+    raw = await llm_chat_model_func(prompt, system_prompt=_REVIEWER_SYSTEM)
     raw = re.sub(r"```(?:json)?", "", raw).strip()
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if not m:
@@ -451,7 +451,7 @@ async def _run_fixer(
         failed_items="\n\n".join(failed_items_parts),
     )
     try:
-        raw = await llm_model_func(prompt, system_prompt=_FIXER_SYSTEM)
+        raw = await llm_chat_model_func(prompt, system_prompt=_FIXER_SYSTEM)
     except Exception as exc:
         logger.warning("FixerAgent LLM call failed: {}", exc)
         return questions
